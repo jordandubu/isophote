@@ -219,6 +219,41 @@ def canvas_relief(stroke_alpha, img_size, scale=12, strength=0.35):
 
 # ---------------------------------------------------------------- pipeline
 
+def paint_bytes(data_bgra, height, width, brush_len=26, brush_w=7, layers=2,
+                relief=0.35, base_radius=6, flow_smooth=8, seed=42,
+                max_size=1400):
+    """In-memory entry used by the browser (pyodide).
+
+    data_bgra: contiguous uint8 ndarray (height, width, 4) of the decoded
+    source at FULL size — browser canvas gives BGRA order via pyodide buffers.
+    Returns (painted_png_bytes, seconds).
+    """
+    import time
+    t0 = time.time()
+    img_bgr = cv2.cvtColor(data_bgra, cv2.COLOR_BGRA2BGR)
+    h, w = img_bgr.shape[:2]
+    scale = max(h, w) / max_size
+    if scale > 1.0:
+        img_bgr = cv2.resize(img_bgr, (int(w / scale), int(h / scale)),
+                             interpolation=cv2.INTER_AREA)
+    np.random.seed(seed)
+
+    base = painterly_base(img_bgr, radius=base_radius)
+
+    angle, coh = flow_field(img_bgr, sigma=2.5)
+    angle, coh = smooth_flow(angle, coh, r=flow_smooth)
+
+    n_strokes = int(img_bgr.shape[0] * img_bgr.shape[1] / 140)
+    painted = render_strokes(img_bgr, base, angle, n_strokes, brush_len, brush_w,
+                             layers=layers, seed=seed)
+    if relief > 0:
+        shade, _ = canvas_relief(np.zeros_like(coh), painted.shape[:2],
+                                 strength=relief)
+        painted = (painted.astype(np.float32) * shade).astype(np.uint8)
+    ok, buf = cv2.imencode(".png", painted)
+    return buf.tobytes(), round(time.time() - t0, 2)
+
+
 def run(path, out, brush_len=26, brush_w=7, layers=2, canvas=True, relief=0.35,
         base_radius=6, flow_smooth=8, density=None, seed=42, max_size=1600):
     img_bgr = cv2.imread(path, cv2.IMREAD_COLOR)

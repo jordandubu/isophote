@@ -56,7 +56,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path.startswith("/test_photo.jpg"):
+        if self.path.startswith("/client/"):
+            fn = self.path.split("/client/")[1].split("?")[0]
+            ctype = "text/javascript" if fn.endswith(".js") else "text/html"
+            try:
+                with open("client/" + fn, "rb") as f:
+                    self._send(200, f.read(), ctype)
+            except OSError:
+                self._send(404, b"missing", "text/plain")
+        elif self.path.startswith("/test_photo.jpg"):
             try:
                 with open("test_photo.jpg", "rb") as f:
                     self._send(200, f.read(), "image/jpeg")
