@@ -12,10 +12,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8799)
     ap.add_argument("--bridge-port", type=int, default=8778)
-    ap.add_argument("--no-bridge", action="store_true",
-                    help="disable the Blender bridge server")
+    ap.add_argument("--bridge", action="store_true",
+                    help="also start the standalone blender bridge")
     a = ap.parse_args()
-    if not a.no_bridge:
+    if a.bridge:   # optional: only needed for non-Blender consumers
         import blender_bridge
         blender_bridge.start(a.bridge_port)
         print(f"blender bridge       -> http://localhost:{a.bridge_port}")

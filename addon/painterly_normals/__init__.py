@@ -1,30 +1,43 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly > Bake & Paint",
-    "description": "Bake normal map from texture, restyle it into painterly brush strokes with the local isophote engine (no API key), apply to material.",
+    "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
     "category": "Paint",
 }
 
 import bpy
 import os
+import json
+import base64
+import threading
+import http.server
+import webbrowser
 from bpy.props import StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty
+
+
+def _open_url(url):
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------- operator
 class PN_OT_bake_and_paint(bpy.types.Operator):
-    """Bake a normal map from the active material's image, restyle it with the local isophote engine, apply it"""
+    """Push the baked normal to the isophote web app and poll for the painting"""
 
     bl_idname = "painterly.bake_and_paint"
     bl_label = "Paintify"
     bl_options = {'REGISTER', 'UNDO'}
 
     _timer_handle = None
-    _thread = None
+    _timeout = 0.0
 
     def execute(self, context):
+        _bridge_start()   # make sure the embedded relay is up
         obj = context.active_object
         mat = obj.active_material if obj else None
         if mat is None or not mat.use_nodes:
@@ -33,57 +46,29 @@ class PN_OT_bake_and_paint(bpy.types.Operator):
 
         scene = context.scene
         s = scene.painterly_settings
-        # default texture name = mesh name; user-editable afterwards
         if not s.tex_name:
             s.tex_name = obj.name or "Painterly"
         base = s.tex_name.strip() or "Painterly"
 
         import os
         size = int(s.tex_size)
-
-        # true object-space mesh bake (Blender bake API)
         baked_path = os.path.join(bpy.app.tempdir, base + "_normal.png")
         err = _bake_mesh_normal(obj, size, baked_path)
         if err:
             self.report({'ERROR'}, f"Bake failed: {err}")
             s.status = "Bake failed"
             return {'CANCELLED'}
-        self.report({'INFO'}, f"Normal baked: {baked_path}")
 
-        # step 2: isophote restyle on a background thread; UI stays responsive
-        import threading
-        self._result = {"path": None, "error": None}
-        self._thread = threading.Thread(
-            target=_bridge_worker,
-            args=(baked_path, s.renormalize, s.stroke_size, s, self._result, base),
-            daemon=True,
-        )
-        self._thread.start()
-
-        modal_mgr = bpy.context.window_manager
-        self._timer_handle = modal_mgr.event_timer_add(0.4, window=context.window)
-        modal_mgr.modal_handler_add(self)
-        return {'RUNNING_MODAL'}
+        # queue it for the web app
+        with open(baked_path, "rb") as f:
+            _bridge_state["pending_png"] = base64.b64encode(f.read()).decode()
+        _bridge_state["result_png"] = None
+        s.status = "Paint it in isophote, then Send to Blender"
+        _open_url("https://jordandubu.github.io/isophote/")
+        self.report({'INFO'}, "Baked normal sent to isophote — paint it there, then Send to Blender + Apply")
+        return {'FINISHED'}
 
     def modal(self, context, event):
-        if event.type == 'TIMER':
-            if self._thread is not None and not self._thread.is_alive():
-                wm = bpy.context.window_manager
-                wm.event_timer_remove(self._timer_handle)
-                self._timer_handle = None
-                err = self._result.get("error")
-                result_path = self._result.get("path")
-                if err:
-                    self.report({'ERROR'}, f"isophote failed: {err}")
-                    return {'CANCELLED'}
-                if not result_path:
-                    self.report({'ERROR'}, "isophote finished but no result path (internal error).")
-                    return {'CANCELLED'}
-                # step 3: apply to material
-                obj = context.active_object
-                _apply_normal(obj.active_material, result_path)
-                self.report({'INFO'}, f"Painterly normal applied: {result_path}")
-                return {'FINISHED'}
         return {'PASS_THROUGH'}
 
 
@@ -116,21 +101,13 @@ class PN_OT_send_to_isophote(bpy.types.Operator):
             s.status = "Bake failed"
             return {'CANCELLED'}
 
-        # push to the bridge (same endpoint the web app polls)
-        import json, base64, urllib.request
+        # queue it for the web app (embedded relay, in-process)
         with open(baked_path, "rb") as f:
-            png = base64.b64encode(f.read()).decode()
-        try:
-            req = urllib.request.Request(
-                "http://127.0.0.1:8778/queue",
-                data=json.dumps({"png": png}).encode(),
-                headers={"Content-Type": "application/json"}, method="POST")
-            urllib.request.urlopen(req, timeout=30)
-        except Exception as e:
-            self.report({'ERROR'}, f"Bridge offline (run: python3 serve.py in the isophote repo): {e}")
-            return {'CANCELLED'}
+            _bridge_state["pending_png"] = base64.b64encode(f.read()).decode()
+        _bridge_state["result_png"] = None
+        _open_url("https://jordandubu.github.io/isophote/")
         s.status = "Sent to isophote — paint it in the browser, then Apply"
-        self.report({'INFO'}, "Normal sent to isophote (http://jordandubu.github.io/isophote/)")
+        self.report({'INFO'}, "Normal sent to isophote — paint it there, click Send to Blender, then Apply")
         return {'FINISHED'}
 
 
@@ -142,22 +119,17 @@ class PN_OT_apply_from_isophote(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        import json, base64, urllib.request, os
         scene = context.scene
         s = scene.painterly_settings
         base = s.tex_name.strip() or "Painterly"
 
-        try:
-            req = urllib.request.Request("http://127.0.0.1:8778/result", data=b"{}", method="POST")
-            d = json.loads(urllib.request.urlopen(req, timeout=30).read())
-        except Exception as e:
-            self.report({'ERROR'}, f"Bridge offline (run: python3 serve.py): {e}")
-            return {'CANCELLED'}
-        if d.get("kind") != "image" or not d.get("png"):
+        png_b64 = _bridge_state.get("result_png")
+        if not png_b64:
             self.report({'WARNING'}, "No painted result yet — paint it in isophote, click Send to Blender, then Apply.")
             return {'CANCELLED'}
+        _bridge_state["result_png"] = None
 
-        raw = base64.b64decode(d["png"])
+        raw = base64.b64decode(png_b64)
         result_path = os.path.join(bpy.app.tempdir, base + "_ai.png")  # same downstream name
         with open(result_path, "wb") as f:
             f.write(raw)
@@ -353,68 +325,6 @@ def _bake_normal(img, out_path, stroke_size):
     baked.file_format = 'PNG'
     baked.save()
     return out_path
-
-
-def _bridge_worker(baked_path, renormalize, stroke_size, status=None, result=None, base_name="painterly"):
-    """Threaded: paint the baked normal with the local isophote engine.
-
-    Talks to the isophote web app's Blender bridge (blender_bridge.py, started
-    by serve.py on port 8778). No API key, no upload — everything runs on this
-    machine. Replaces the old OpenAI images-API worker."""
-    import json, base64, urllib.request, os
-
-    PORT_DEFAULT = 8778
-
-    def step(msg: str) -> None:
-        if status is not None:
-            status.status = msg
-
-    try:
-        with open(baked_path, "rb") as f:
-            png = f.read()
-        img_b64 = base64.b64encode(png).decode()
-
-        step("Step 2/3 — sending normal map to isophote")
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{PORT_DEFAULT}/paint",
-            data=json.dumps({
-                "image_png": img_b64,
-                "params": {
-                    # chunky strokes for normal-map relief; scale knob follows
-                    # the addon's Stroke Size slider
-                    "brush_len": 16 * int(stroke_size),
-                    "brush_w": 2 + int(stroke_size),
-                    "layers": 3,
-                    "relief": 0.0,          # normal maps: keep flat
-                    "base_radius": 6,
-                    "flow_smooth": 8,
-                    "seed": 42,
-                },
-            }).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        step("Step 3/3 — isophote painting (~1-3 s)")
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            data = json.loads(resp.read())
-        if data.get("error"):
-            raise RuntimeError(data["error"])
-        raw = base64.b64decode(data["png"])
-
-        ai_path = os.path.join(os.path.dirname(baked_path), base_name + "_ai.png")
-        with open(ai_path, "wb") as f:
-            f.write(raw)
-        final = ai_path
-        if renormalize:
-            step("Renormalizing")
-            _renormalize_file(ai_path, result, base_name)
-            final = result["path"]
-        step(f"Done — painting took {data.get('secs', '?')} s")
-
-        result["path"] = final
-        result["error"] = None
-    except Exception as e:
-        result["error"] = str(e) + "  (is isophote running? `python3 serve.py` starts the bridge on port 8778)"
 
 
 def _renormalize_file(path, result, base_name="painterly"):
@@ -626,7 +536,7 @@ class PN_PT_style(bpy.types.Panel):
         s = context.scene.painterly_settings
         layout.prop(s, "stroke_size")
         layout.prop(s, "renormalize")
-        layout.label(text="Engine: local isophote (port 8778)")
+        layout.label(text="Engine: isophote in your browser")
 
 
 class PN_PT_options(bpy.types.Panel):
@@ -657,13 +567,104 @@ classes = (
 )
 
 
+# ------------------------------------------------------------- embedded bridge
+# Tiny HTTP relay living inside the addon (no numpy/cv2 needed — painting
+# happens in the browser). The web app at
+# https://jordandubu.github.io/isophote/ polls it on 127.0.0.1:8778.
+BRIDGE_PORT = 8778
+
+_bridge_state = {"pending_png": None, "result_png": None}
+_bridge_server = None
+
+
+class _BridgeHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def _reply(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            req = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return self._reply({"error": "bad json"}, 400)
+
+        if self.path == "/queue":            # Blender -> app
+            _bridge_state["pending_png"] = req.get("png")
+            _bridge_state["result_png"] = None
+            return self._reply({"ok": True})
+
+        if self.path == "/poll":             # app pulls from Blender
+            png = _bridge_state["pending_png"]
+            _bridge_state["pending_png"] = None
+            return self._reply({"kind": "image", "bgr_png": png} if png
+                               else {"kind": "none"})
+
+        if self.path == "/send_to_blender":  # app result -> Blender
+            _bridge_state["result_png"] = req.get("png")
+            return self._reply({"ok": True})
+
+        if self.path == "/result":           # addon pulls the app's painting
+            png = _bridge_state["result_png"]
+            _bridge_state["result_png"] = None
+            return self._reply({"kind": "image", "png": png} if png
+                               else {"kind": "none"})
+
+        return self._reply({"error": "unknown path"}, 404)
+
+
+def _bridge_start():
+    global _bridge_server
+    if _bridge_server is not None:
+        return True
+    try:
+        _bridge_server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", BRIDGE_PORT), _BridgeHandler)
+        t = threading.Thread(target=_bridge_server.serve_forever, daemon=True)
+        t.start()
+        return True
+    except OSError as e:
+        print(f"[painterly_normals] bridge start failed (port {BRIDGE_PORT}): {e}")
+        _bridge_server = None
+        return False
+
+
+def _bridge_stop():
+    global _bridge_server
+    if _bridge_server is not None:
+        _bridge_server.shutdown()
+        _bridge_server = None
+
+
 def register():
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.painterly_settings = bpy.props.PointerProperty(type=PN_scene_settings)
+    _bridge_start()
 
 
 def unregister():
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
     del bpy.types.Scene.painterly_settings
+    _bridge_stop()
