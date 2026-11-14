@@ -191,11 +191,13 @@ stage.addEventListener("drop", e => { e.preventDefault();
   drop.classList.remove("drag");
   if (e.dataTransfer.files[0]) load(e.dataTransfer.files[0]); });
 $("file").onchange = e => { if (e.target.files[0]) load(e.target.files[0]); };
-/* default sample photo on first open */
+/* default sample: paint silently, show the RESULT immediately on open */
 fetch("test_photo.jpg").then(r => r.ok ? r.blob() : null).then(b => {
-  if (b && !srcBgrBytes) load(b);
+  if (b && !srcBgrBytes) return load(b, {silent: true});
+}).then(() => {
+  if (srcBgrBytes) livePaint();   // paint right away, result view stays live
 });
-async function load(f) {
+async function load(f, opts = {}) {
   const bitmap = await createImageBitmap(f);
   if (srcW || srcH) { /* new image replaces old */ }
   srcW = bitmap.width; srcH = bitmap.height;
@@ -220,6 +222,7 @@ async function load(f) {
   $("imgWrap").style.display = "flex";
   $("viewBtns").style.display = "flex";
   $("export").style.display = "";
+  if (opts.silent) return;   // result view replaces the photo as soon as painted
   showOrig();
   scheduleLive();
 }
