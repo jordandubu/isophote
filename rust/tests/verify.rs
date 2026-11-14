@@ -105,4 +105,61 @@ mod verify {
         assert!(big * 100 <= out.len()); // <1% tie flips acceptable
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
+
+    #[test]
+    fn relief_matches_python() {
+        use isophote_core::pipeline::canvas_relief;
+        let (shade, _) = canvas_relief(135, 180, 12, 0.1);
+        let (_, ref_shade) = read_npy("tests/relief_ref.npy");
+        let mut max = 0i32;
+        for (a, b) in shade.iter().zip(ref_shade.iter()) {
+            let d = (*a * 255.0).round() as i32 - *b as i32;
+            if d.abs() > max {
+                max = d.abs();
+            }
+        }
+        println!("relief max diff: {max}");
+        assert!(max <= 2, "relief drift too strong");
+        let _ = &std::io::Write::flush(&mut std::io::stdout());
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    #[test]
+    fn resize_matches_cv2() {
+        use isophote_core::pipeline::resize_area;
+        let (dims, img) = read_npy("tests/in_full.npy");
+        let (h, w) = (dims[0], dims[1]);
+        let scale = h.max(w) as f64 / 1400.0;
+        let dw = (w as f64 / scale) as usize;
+        let dh = (h as f64 / scale) as usize;
+        let out = resize_area(&img, w, h, dw, dh, 3);
+        let (_, ref_bgr) = read_npy("tests/resize_ref.npy");
+        let diffs: Vec<i32> = out
+            .iter()
+            .zip(ref_bgr.iter())
+            .map(|(a, b)| ((*a as i32) - (*b as i32)).abs())
+            .collect();
+        let max = *diffs.iter().max().unwrap();
+        let mean = diffs.iter().sum::<i32>() as f64 / diffs.len() as f64;
+        println!("resize max diff: {max} mean: {mean:.2}");
+        assert!(max <= 1, "resize drift too strong");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    #[test]
+    fn resize_debug() {
+        use isophote_core::pipeline::resize_area;
+        let (dims, img) = read_npy("tests/in_full.npy");
+        let (h, w) = (dims[0], dims[1]);
+        println!("in_full dims: {}x{}", w, h);
+        let scale = h.max(w) as f64 / 1400.0;
+        let dw = (w as f64 / scale) as usize;
+        let dh = (h as f64 / scale) as usize;
+        let out = resize_area(&img, w, h, dw, dh, 3);
+        let (_, ref_bgr) = read_npy("tests/resize_ref.npy");
+        println!("out len {} ref len {}  dims {}x{}", out.len(), ref_bgr.len(), dw, dh);
+        println!("out[0..6]: {:?}", &out[..6]);
+        println!("ref[0..6]: {:?}", &ref_bgr[..6]);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
 }

@@ -143,7 +143,8 @@ def render_strokes(img_bgr, base, angle_img, strokes_per_layer,
         pts = pts + rng.uniform(-jit, jit, pts.shape)
         # high-gradient areas first (detail gets painted before flats)
         order = np.argsort(-grad[np.clip(pts[:, 1], 0, h - 1).astype(int),
-                                 np.clip(pts[:, 0], 0, w - 1).astype(int)])
+                                 np.clip(pts[:, 0], 0, w - 1).astype(int)],
+                          kind='stable')
         pts = pts[order]
 
         for x, y in pts:

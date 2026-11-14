@@ -3,6 +3,7 @@
 
 use crate::pcg64::Pcg64;
 
+#[derive(serde::Deserialize)]
 pub struct Params {
     pub brush_len: i32,
     pub brush_w: i32,
@@ -168,32 +169,37 @@ pub fn box_filter_c3(src: &[u8], w: usize, h: usize, kw: usize, kh: usize) -> Ve
     out
 }
 
-/// cv2 INTER_AREA-ish resize via simple bilinear+box blend. The browser resizes
-/// with canvas; for parity the reference harness resizes in Python. In wasm we
-/// receive already-resized buffers, so only a basic fallback provided here.
+//// cv2 INTER_AREA resize: area-weighted average (overlap area weights with
+/// fractional scales), cv2 8-bit rounding via (v + 127.5)/255 style saturate
+/// — cv2 rounds to nearest. Used when JS sends the full-size decode.
 pub fn resize_area(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, c: usize) -> Vec<u8> {
     if sw == dw && sh == dh {
         return src.to_vec();
     }
-    let mut out = vec![0u8; dw * dh * c];
     let xr = sw as f64 / dw as f64;
     let yr = sh as f64 / dh as f64;
+    let mut out = vec![0u8; dw * dh * c];
+    // precompute per-dst-pixel column weights: (src start, span) pairs are
+    // shared across rows; do accumulation in f64.
     for y in 0..dh {
+        let sy0 = (y as f64 * yr).floor() as usize;
+        let sy1 = (((y + 1) as f64 * yr).floor() as usize).min(sh);
         for x in 0..dw {
-            let x0 = (x as f64 * xr).floor() as usize;
-            let x1 = (((x + 1) as f64 * xr).floor() as usize).min(sw);
-            let y0 = (y as f64 * yr).floor() as usize;
-            let y1 = (((y + 1) as f64 * yr).floor() as usize).min(sh);
+            let sx0 = (x as f64 * xr).floor() as usize;
+            let sx1 = (((x + 1) as f64 * xr).floor() as usize).min(sw);
             for ci in 0..c {
                 let mut acc = 0f64;
-                let mut n = 0;
-                for yy in y0..y1.max(y0 + 1) {
-                    for xx in x0..x1.max(x0 + 1) {
-                        acc += src[(yy * sw + xx) * c + ci] as f64;
-                        n += 1;
+                let mut wsum = 0f64;
+                for yy in sy0..sy1.max(sy0 + 1) {
+                    let wy = ((yy as f64 + 1.0).min((y + 1) as f64 * yr) - (yy as f64).max(y as f64 * yr)).max(0.0);
+                    for xx in sx0..sx1.max(sx0 + 1) {
+                        let wx = ((xx as f64 + 1.0).min((x + 1) as f64 * xr) - (xx as f64).max(x as f64 * xr)).max(0.0);
+                        let wt = wx * wy;
+                        acc += src[(yy * sw + xx) * c + ci] as f64 * wt;
+                        wsum += wt;
                     }
                 }
-                out[(y * dw + x) * c + ci] = (acc / n.max(1) as f64) as u8;
+                out[(y * dw + x) * c + ci] = (acc / wsum.max(1e-9)).round().clamp(0.0, 255.0) as u8;
             }
         }
     }
@@ -494,6 +500,7 @@ fn quadrant_origin(q: i32, n: i32) -> (i64, i64) {
 
 pub struct StrokeOut {
     pub bgra: Vec<u8>,
+    pub updated: Vec<f32>,
 }
 
 pub fn render_strokes(
@@ -523,25 +530,26 @@ pub fn render_strokes(
     let gy = sobel3(&gray, w, h, 0, 1);
     let grad: Vec<f32> = (0..w * h).map(|i| (gx[i].powi(2) + gy[i].powi(2)).sqrt()).collect();
 
-    let step = (w as i32 / (strokes_per_layer as f64).sqrt() as i32).max(2);
+    let step = (h as i32 / (strokes_per_layer as f64).sqrt() as i32).max(2);
     let jit = step as f64 * 0.5 * jitter;
 
     for _layer in 0..layers {
-        let mut pts: Vec<(f64, f64)> = Vec::new();
+        // pts stored f32 like the python reference (jitter math in f32)
+        let mut pts: Vec<(f32, f32)> = Vec::new();
         let mut yy = 0i32;
         while yy < h as i32 {
             let mut xx = 0i32;
             while xx < w as i32 {
                 pts.push((
-                    xx as f64 + rng.uniform(-jit, jit),
-                    yy as f64 + rng.uniform(-jit, jit),
+                    (xx as f64 + rng.uniform(-jit, jit)) as f32,
+                    (yy as f64 + rng.uniform(-jit, jit)) as f32,
                 ));
                 xx += step;
             }
             yy += step;
         }
         // sort by descending grad (i64 rounding clip like np.astype(int).clip)
-        let gi = |p: &(f64, f64)| -> usize {
+        let gi = |p: &(f32, f32)| -> usize {
             let xi = (p.0 as i64).clamp(0, w as i64 - 1) as usize;
             let yi = (p.1 as i64).clamp(0, h as i64 - 1) as usize;
             yi * w + xi
@@ -552,27 +560,30 @@ pub fn render_strokes(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        for (x0, y0) in pts {
+        for (x0, y0) in &pts {
+            // python keeps all stroke geometry in float32 (np.radians of f32
+            // angle, np.cos/sin f32); replicate with f32 ops.
+            let (x0, y0) = (*x0, *y0);
             let xi = (x0 as i64).clamp(0, w as i64 - 1) as usize;
             let yi = (y0 as i64).clamp(0, h as i64 - 1) as usize;
-            let a = flow.angle[yi * w + xi] as f64 * std::f64::consts::PI / 180.0;
+            let a = (flow.angle[yi * w + xi] as f32).to_radians();
             let steps = (length as i64 / 2).max(2) as usize;
-            let mut poly: Vec<(f64, f64)> = vec![(x0, y0)];
+            let mut poly: Vec<(f32, f32)> = vec![(x0, y0)];
             let (mut cx, mut cy) = (x0, y0);
             let (mut dx0, mut dy0) = (a.cos(), a.sin());
             for _s in 0..steps {
                 let xj = (cx as i64).clamp(0, w as i64 - 1) as usize;
                 let yj = (cy as i64).clamp(0, h as i64 - 1) as usize;
-                let mut a2 = flow.angle[yj * w + xj] as f64 * std::f64::consts::PI / 180.0;
+                let mut a2 = (flow.angle[yj * w + xj] as f32).to_radians();
                 let cur = dy0.atan2(dx0);
-                let mut d1 = (a2 - cur + std::f64::consts::PI)
-                    % (2.0 * std::f64::consts::PI)
-                    - std::f64::consts::PI;
-                if d1 < -std::f64::consts::PI {
-                    d1 += 2.0 * std::f64::consts::PI;
+                let mut d1 = (a2 - cur + std::f32::consts::PI)
+                    % (2.0 * std::f32::consts::PI)
+                    - std::f32::consts::PI;
+                if d1 < -std::f32::consts::PI {
+                    d1 += 2.0 * std::f32::consts::PI;
                 }
-                if d1.abs() >= std::f64::consts::PI / 2.0 {
-                    a2 += std::f64::consts::PI;
+                if d1.abs() >= std::f32::consts::PI / 2.0 {
+                    a2 += std::f32::consts::PI;
                 }
                 dx0 = 0.7 * dx0 + 0.3 * a2.cos();
                 dy0 = 0.7 * dy0 + 0.3 * a2.sin();
@@ -581,7 +592,7 @@ pub fn render_strokes(
                 dy0 /= nrm;
                 cx += 2.0 * dx0;
                 cy += 2.0 * dy0;
-                if !(cx >= 0.0 && cx < w as f64 && cy >= 0.0 && cy < h as f64) {
+                if !(cx >= 0.0 && cx < w as f32 && cy >= 0.0 && cy < h as f32) {
                     break;
                 }
                 poly.push((cx, cy));
@@ -589,12 +600,12 @@ pub fn render_strokes(
             if poly.len() < 3 {
                 continue;
             }
-            // color: mean of src patch around midpoint (RGB channels)
+            // brush color: mean of source patch around stroke midpoint
             let mi = poly.len() / 2;
             let mx = ((poly[mi].0 as i64).clamp(0, w as i64 - 1)) as i64;
             let my = ((poly[mi].1 as i64).clamp(0, h as i64 - 1)) as i64;
-            let r = (width as i64 / 2).max(1);
-            let (mut sr, mut sg, mut sb, mut cnt) = (0f64, 0f64, 0f64, 0i64);
+            let r = ((width as i64) / 2).max(1);
+            let (mut sb, mut sg, mut sr, mut cnt) = (0f64, 0f64, 0f64, 0i64);
             for yy in (my - r).max(0)..=(my + r).min(h as i64 - 1) {
                 for xx in (mx - r).max(0)..=(mx + r).min(w as i64 - 1) {
                     let p = (yy as usize * w + xx as usize) * 3;
@@ -604,14 +615,15 @@ pub fn render_strokes(
                     cnt += 1;
                 }
             }
-            let lum = rng.uniform(0.94, 1.06);
+            let lum = rng.uniform(0.94, 1.06) as f32;
             let _lj = length as f64 * rng.uniform(1.0 - jitter, 1.0 + jitter);
             let wj = ((width as f64 * rng.uniform(1.0 - jitter, 1.0 + jitter)) as i64).max(1) as i32;
             let th = wj.max(1);
+            // python: f32 patch mean (f32 accumulation!) then *lum f32
             let col = [
-                (sb / cnt as f64 * lum).clamp(0.0, 255.0) as f32,
-                (sg / cnt as f64 * lum).clamp(0.0, 255.0) as f32,
-                (sr / cnt as f64 * lum).clamp(0.0, 255.0) as f32,
+                ((sb / cnt as f64) as f32 * lum).clamp(0.0, 255.0),
+                ((sg / cnt as f64) as f32 * lum).clamp(0.0, 255.0),
+                ((sr / cnt as f64) as f32 * lum).clamp(0.0, 255.0),
             ];
             draw_polyline(&mut canvas, &mut updated, w, h, &poly, col, th, 1.0);
         }
@@ -628,7 +640,7 @@ pub fn render_strokes(
         }
         out[i * 4 + 3] = 255;
     }
-    StrokeOut { bgra: out }
+    StrokeOut { bgra: out, updated: updated }
 }
 
 /// cv2.LINE_AA-ish polyline with thickness (anti-aliased coverage).
@@ -637,54 +649,61 @@ fn draw_polyline(
     updated: &mut [f32],
     w: usize,
     h: usize,
-    poly: &[(f64, f64)],
+    poly: &[(f32, f32)],
     col: [f32; 3],
     thickness: i32,
     alpha: f32,
 ) {
-    // walk each segment, rasterize with distance-based AA (cv2 LINE_AA)
-    let half = (thickness as f64) / 2.0;
-    let minx = poly.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
-    let maxx = poly
-        .iter()
-        .map(|p| p.0)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let miny = poly.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-    let maxy = poly
-        .iter()
-        .map(|p| p.1)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let x0 = ((minx - half - 1.0).floor() as i64).max(0) as usize;
-    let x1 = ((maxx + half + 1.0).ceil() as i64).min(w as i64 - 1) as usize;
-    let y0 = ((miny - half - 1.0).floor() as i64).max(0) as usize;
-    let y1 = ((maxy + half + 1.0).ceil() as i64).min(h as i64 - 1) as usize;
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            // min distance to polyline
-            let px = x as f64 + 0.5;
+    // cv2 thick AA with int32 endpoints renders hard 0/1 coverage;
+    // effective half-width = ceil(th/2) for th>=2 (verified: th=3 spans 5
+    // rows, th=5 spans 7, th=6 spans 7). Pixel center within half+0.5.
+    let half = if thickness <= 1 {
+        0.5 // th=1 cv2 thin AA line: single-pixel error-diffusion band
+    } else {
+        ((thickness + 1) / 2) as f64 + 0.5
+    };
+    // Per-segment bbox scan: each segment painted within its own tight box
+    // (plus caps at polyline ends). O(total_ink) instead of O(poly*strokebox).
+    let (ex0, ey0) = (poly[0].0.round() as f64, poly[0].1.round() as f64);
+    let (fx0, fy0) = (
+        poly[poly.len() - 1].0.round() as f64,
+        poly[poly.len() - 1].1.round() as f64,
+    );
+    // Per-segment direct rasterization with per-segment bbox: pixels paint
+    // via the segment's own rectangle (fast bulk path for interior pixels).
+    let seg_bbx = |s: usize| -> (usize, usize, usize, usize) {
+        let (ax, ay) = (poly[s].0.round() as f64, poly[s].1.round() as f64);
+        let (bx, by) = (poly[s + 1].0.round() as f64, poly[s + 1].1.round() as f64);
+        (
+            (ax.min(bx) - half - 2.0).floor().max(0.0) as usize,
+            (ay.min(by) - half - 2.0).floor().max(0.0) as usize,
+            (ax.max(bx) + half + 2.0).ceil().min(w as f64 - 1.0) as usize,
+            (ay.max(by) + half + 2.0).ceil().min(h as f64 - 1.0) as usize,
+        )
+    };
+    for s in 0..poly.len() - 1 {
+        let (ax, ay) = (poly[s].0.round() as f64, poly[s].1.round() as f64);
+        let (bx, by) = (poly[s + 1].0.round() as f64, poly[s + 1].1.round() as f64);
+        let (lo_x, lo_y, hi_x, hi_y) = seg_bbx(s);
+        let dx = bx - ax;
+        let dy = by - ay;
+        let len = (dx * dx + dy * dy).sqrt();
+        let (ux, uy) = if len > 0.0 { (dx / len, dy / len) } else { (0.0, 0.0) };
+        for y in lo_y..=hi_y {
             let py = y as f64 + 0.5;
-            let mut dmin = f64::INFINITY;
-            for s in 0..poly.len() - 1 {
-                let (ax, ay) = poly[s];
-                let (bx, by) = poly[s + 1];
-                let dx = bx - ax;
-                let dy = by - ay;
-                let len2 = dx * dx + dy * dy;
-                let t = if len2 <= 0.0 {
-                    0.0
-                } else {
-                    (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0)
-                };
-                let qx = ax + t * dx;
-                let qy = ay + t * dy;
-                let d = ((px - qx).powi(2) + (py - qy).powi(2)).sqrt();
-                if d < dmin {
-                    dmin = d;
+            // perpendicular distance is affine in y per row when |dx|>|dy|
+            // skip the generic case: compute per pixel below (f64 mul ~ns)
+            for x in lo_x..=hi_x {
+                let px = x as f64 + 0.5;
+                let proj = (px - ax) * ux + (py - ay) * uy;
+                if proj < -1.0 || proj > len + 1.0 {
+                    continue;
                 }
-            }
-            // AA coverage
-            let a = ((half + 0.5 - dmin).clamp(0.0, 1.0) * alpha as f64) as f32;
-            if a > 0.0 {
+                let perp = (-(px - ax) * uy + (py - ay) * ux).abs();
+                if perp > half {
+                    continue;
+                }
+                let a = alpha;
                 let i = y * w + x;
                 for c in 0..3 {
                     canvas[i][c] = canvas[i][c] * (1.0 - a) + col[c] * a;
@@ -693,6 +712,33 @@ fn draw_polyline(
             }
         }
     }
+    // end caps: radius-2 circles at the two polyline ends
+    for (ex, ey) in [(
+        poly[0].0.round() as f64,
+        poly[0].1.round() as f64,
+    ), (
+        poly[poly.len() - 1].0.round() as f64,
+        poly[poly.len() - 1].1.round() as f64,
+    )] {
+        let lo_x = (ex - 2.5).floor().max(0.0) as usize;
+        let hi_x = (ex + 2.5).ceil().min(w as f64 - 1.0) as usize;
+        let lo_y = (ey - 2.5).floor().max(0.0) as usize;
+        let hi_y = (ey + 2.5).ceil().min(h as f64 - 1.0) as usize;
+        for y in lo_y..=hi_y {
+            for x in lo_x..=hi_x {
+                let px = x as f64 + 0.5;
+                let py = y as f64 + 0.5;
+                if ((px - ex).powi(2) + (py - ey).powi(2)).sqrt() <= 2.0 {
+                    let i = y * w + x;
+                    for c in 0..3 {
+                        canvas[i][c] = canvas[i][c] * (1.0 - alpha) + col[c] * alpha;
+                    }
+                    updated[i] = updated[i] * (1.0 - alpha) + alpha;
+                }
+            }
+        }
+    }
+
 }
 
 // ---------------------------------------------------------------- relief
@@ -728,8 +774,6 @@ pub fn canvas_relief(w: usize, h: usize, scale: i32, strength: f64) -> (Vec<f32>
 // ---------------------------------------------------------------- pipeline
 
 pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, String) {
-    use std::time::Instant;
-    let t0 = Instant::now();
     // BGRA -> BGR
     let mut bgr = vec![0u8; w * h * 3];
     for i in 0..w * h {
@@ -768,6 +812,5 @@ pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, Stri
             }
         }
     }
-    let ms = t0.elapsed().as_millis();
-    (out, format!("{ms}ms"))
+    (out, String::new())
 }

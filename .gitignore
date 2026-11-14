@@ -1,3 +1,11 @@
 .venv/
 __pycache__/
 *.log
+.venv/
+__pycache__/
+*.log
+rust/target/
+rust/CACHEDIR.TAG
+rust/tests/*.npy
+rust/tests/node/
+!rust/tests/node/wasm_smoke.mjs
