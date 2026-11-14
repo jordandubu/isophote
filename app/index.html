@@ -296,11 +296,16 @@ stage.addEventListener("drop", e => { e.preventDefault();
   drop.classList.remove("drag");
   if (e.dataTransfer.files[0]) load(e.dataTransfer.files[0]); });
 $("file").onchange = e => { if (e.target.files[0]) load(e.target.files[0]); };
-/* default sample: paint silently, show the RESULT immediately on open */
+/* default sample: paint silently, skip it if the bridge already delivered
+   Blender's image (poll can complete before this fetch resolves) */
+let sampleLoaded = false;
 fetch("test_photo.jpg").then(r => r.ok ? r.blob() : null).then(b => {
-  if (b && !srcBgrBytes) return load(b, {silent: true});
+  if (b && !srcBgrBytes && !bridgeImagePending) {
+    sampleLoaded = true;
+    return load(b, {silent: true});
+  }
 }).then(() => {
-  if (srcBgrBytes) livePaint();   // paint right away, result view stays live
+  if (srcBgrBytes && sampleLoaded) livePaint();   // only paint the sample
 });
 async function load(f, opts = {}) {
   const bitmap = await createImageBitmap(f);
@@ -463,6 +468,7 @@ $("addonBlender").onchange = applyAddonState;
 if (settings.addonBlender) { $("bridgeSend").style.display = ""; }
 /* ============ Blender bridge ============ */
 const bridge = { on: false, inFlight: false };
+let bridgeImagePending = false;   // bridge delivered (or is about to) a Blender image
 function bridgeURL(path) { return `http://127.0.0.1:${BRIDGE_PORT}${path}`; }
 async function bridgePoll() {
   // ask the local bridge whether Blender pushed a new image
@@ -473,12 +479,17 @@ async function bridgePoll() {
     const d = await r.json();
     if (d.status) $("bridgeState").textContent = d.status;
     if (d.kind === "image" && d.bgr_png) {
-      $("bridgeState").textContent = "received image — painting…";
-      const blob = b64ToBlob(d.bgr_png, "image/png");
-      await load(blob);                 // reuse the normal load path
-      await livePaint();                // paint now, don't wait for debounce
-      // painted; user tweaks live, then clicks Send to Blender when done
-      $("bridgeState").textContent = "painted — click Send to Blender when done";
+      bridgeImagePending = true;   // the default sample must not overwrite it
+      try {
+        $("bridgeState").textContent = "received image — painting…";
+        const blob = b64ToBlob(d.bgr_png, "image/png");
+        await load(blob);                 // reuse the normal load path
+        await livePaint();                // paint now, don't wait for debounce
+        // painted; user tweaks live, then clicks Send to Blender when done
+        $("bridgeState").textContent = "painted — click Send to Blender when done";
+      } finally {
+        bridgeImagePending = false;
+      }
     }
   } catch (e) {
     $("bridgeState").textContent = "bridge offline (run: python3 serve.py)";
