@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 3, 1),
+    "version": (0, 3, 2),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -16,6 +16,8 @@ import threading
 import http.server
 import webbrowser
 from bpy.props import StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty
+
+AUTO_NAME = {}   # tracks the last auto-filled Name so user edits are kept
 
 
 def _open_url(url):
@@ -485,9 +487,10 @@ class PN_PT_panel(bpy.types.Panel):
 
         s = context.scene.painterly_settings
         # keep Name synced to the mesh name until the user types their own
-        if obj and (s.tex_name == s._pn_last_auto_name):
+        last = AUTO_NAME.get("last")
+        if obj and (s.tex_name == last or not s.tex_name):
             s.tex_name = obj.name or "Painterly"
-        s._pn_last_auto_name = s.tex_name
+        AUTO_NAME["last"] = s.tex_name
         layout.operator(PN_OT_send_to_isophote.bl_idname, text="Send to Isophote")
         layout.operator(PN_OT_apply_from_isophote.bl_idname, text="Apply from Isophote")
         row = layout.row(align=True)
@@ -498,6 +501,20 @@ class PN_PT_panel(bpy.types.Panel):
 
         layout.prop(s, "tex_name", text="Name")
         layout.prop(s, "tex_size")
+
+
+class PN_PT_misc(bpy.types.Panel):
+    bl_label = "Misc"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Painterly"
+    bl_parent_id = "PN_PT_panel"
+    bl_order = 1
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.painterly_settings
         layout.prop(s, "renormalize")
 
 
@@ -508,6 +525,7 @@ classes = (
     PN_OT_send_to_isophote,
     PN_OT_apply_from_isophote,
     PN_PT_panel,
+    PN_PT_misc,
 )
 
 
