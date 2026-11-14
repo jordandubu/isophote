@@ -87,6 +87,97 @@ class PN_OT_bake_and_paint(bpy.types.Operator):
         return {'PASS_THROUGH'}
 
 
+class PN_OT_send_to_isophote(bpy.types.Operator):
+    """Bake the normal map and send it to the isophote web app for painting"""
+
+    bl_idname = "painterly.send_to_isophote"
+    bl_label = "Send to Isophote"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        obj = context.active_object
+        mat = obj.active_material if obj else None
+        if mat is None or not mat.use_nodes:
+            self.report({'ERROR'}, "Active object needs a material with nodes.")
+            return {'CANCELLED'}
+
+        scene = context.scene
+        s = scene.painterly_settings
+        if not s.tex_name:
+            s.tex_name = obj.name or "Painterly"
+        base = s.tex_name.strip() or "Painterly"
+
+        import os
+        size = int(s.tex_size)
+        baked_path = os.path.join(bpy.app.tempdir, base + "_normal.png")
+        err = _bake_mesh_normal(obj, size, baked_path)
+        if err:
+            self.report({'ERROR'}, f"Bake failed: {err}")
+            s.status = "Bake failed"
+            return {'CANCELLED'}
+
+        # push to the bridge (same endpoint the web app polls)
+        import json, base64, urllib.request
+        with open(baked_path, "rb") as f:
+            png = base64.b64encode(f.read()).decode()
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:8778/queue",
+                data=json.dumps({"png": png}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=30)
+        except Exception as e:
+            self.report({'ERROR'}, f"Bridge offline (run: python3 serve.py in the isophote repo): {e}")
+            return {'CANCELLED'}
+        s.status = "Sent to isophote — paint it in the browser, then Apply"
+        self.report({'INFO'}, "Normal sent to isophote (http://jordandubu.github.io/isophote/)")
+        return {'FINISHED'}
+
+
+class PN_OT_apply_from_isophote(bpy.types.Operator):
+    """Fetch the painting from the isophote web app and apply it to the material"""
+
+    bl_idname = "painterly.apply_from_isophote"
+    bl_label = "Apply from Isophote"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        import json, base64, urllib.request, os
+        scene = context.scene
+        s = scene.painterly_settings
+        base = s.tex_name.strip() or "Painterly"
+
+        try:
+            req = urllib.request.Request("http://127.0.0.1:8778/result", data=b"{}", method="POST")
+            d = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        except Exception as e:
+            self.report({'ERROR'}, f"Bridge offline (run: python3 serve.py): {e}")
+            return {'CANCELLED'}
+        if d.get("kind") != "image" or not d.get("png"):
+            self.report({'WARNING'}, "No painted result yet — paint it in isophote, click Send to Blender, then Apply.")
+            return {'CANCELLED'}
+
+        raw = base64.b64decode(d["png"])
+        result_path = os.path.join(bpy.app.tempdir, base + "_ai.png")  # same downstream name
+        with open(result_path, "wb") as f:
+            f.write(raw)
+
+        final = result_path
+        if s.renormalize:
+            res = {"path": None, "error": None}
+            _renormalize_file(result_path, res, base)
+            if res.get("error"):
+                self.report({'ERROR'}, f"Renormalize failed: {res['error']}")
+                return {'CANCELLED'}
+            final = res["path"]
+
+        obj = context.active_object
+        _apply_normal(obj.active_material, final)
+        s.status = "Applied"
+        self.report({'INFO'}, f"Painterly normal applied: {final}")
+        return {'FINISHED'}
+
+
 # ------------------------------------------------------------- helpers
 def _find_image(mat):
     if not mat or not mat.use_nodes:
@@ -508,7 +599,9 @@ class PN_PT_panel(bpy.types.Panel):
         layout.label(text="Material: " + (mat.name if mat else "none"))
 
         s = context.scene.painterly_settings
-        layout.operator(PN_OT_bake_and_paint.bl_idname, text="Paintify")
+        layout.operator(PN_OT_send_to_isophote.bl_idname, text="Send to Isophote")
+        layout.operator(PN_OT_apply_from_isophote.bl_idname, text="Apply from Isophote")
+        layout.operator(PN_OT_bake_and_paint.bl_idname, text="Paintify (direct)")
         row = layout.row(align=True)
         row.operator(PN_OT_preview_bake.bl_idname, text="👁 Baked")
         row.operator(PN_OT_preview_result.bl_idname, text="👁 Painted")
@@ -556,6 +649,8 @@ classes = (
     PN_OT_preview_result,
     PN_scene_settings,
     PN_OT_bake_and_paint,
+    PN_OT_send_to_isophote,
+    PN_OT_apply_from_isophote,
     PN_PT_panel,
     PN_PT_style,
     PN_PT_options,

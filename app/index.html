@@ -452,9 +452,8 @@ async function bridgePoll() {
       const blob = b64ToBlob(d.bgr_png, "image/png");
       await load(blob);                 // reuse the normal load path
       await livePaint();                // paint now, don't wait for debounce
-      $("bridgeState").textContent = "painted — sending back";
-      await sendToBlender();
-      $("bridgeState").textContent = "sent to Blender";
+      // painted; user tweaks live, then clicks Send to Blender when done
+      $("bridgeState").textContent = "painted — click Send to Blender when done";
     }
   } catch (e) {
     $("bridgeState").textContent = "bridge offline (run: python3 serve.py)";

@@ -71,10 +71,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply({"error": "bad json"}, 400)
 
         if self.path == "/queue":
-            # Blender (addon) pushes the next image for the web app to paint
+            # Blender (addon) pushes the next image for the web app to paint.
+            # Clears any previous result so nothing stale is applied later.
             with _lock:
                 _state["pending_bgr_png"] = req.get("png")
+                _state["last_result_png"] = None
             return self._reply({"ok": True})
+
+        if self.path == "/result":
+            # Blender (addon) fetches the app's finished painting (consumes it)
+            with _lock:
+                png = _state.get("last_result_png")
+                _state["last_result_png"] = None
+            return self._reply({"kind": "image", "png": png} if png
+                               else {"kind": "none"})
 
         if self.path == "/poll":
             with _lock:
