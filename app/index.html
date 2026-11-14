@@ -194,6 +194,10 @@ stage.addEventListener("drop", e => { e.preventDefault();
   drop.classList.remove("drag");
   if (e.dataTransfer.files[0]) load(e.dataTransfer.files[0]); });
 $("file").onchange = e => { if (e.target.files[0]) load(e.target.files[0]); };
+/* default sample photo on first open */
+fetch("test_photo.jpg").then(r => r.ok ? r.blob() : null).then(b => {
+  if (b && !srcBgrBytes) load(b);
+});
 async function load(f) {
   const bitmap = await createImageBitmap(f);
   if (srcW || srcH) { /* new image replaces old */ }
