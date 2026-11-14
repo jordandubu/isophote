@@ -55,9 +55,6 @@ main { flex: 1; display: flex; min-height: 0; }
 .abtn:hover { background: rgba(20,20,22,0.85); color: #fff; transform: scale(1.06); }
 .abtn svg { width: 14px; height: 14px; stroke: currentColor;
   stroke-width: 2; fill: none; stroke-linecap: round; stroke-linejoin: round; }
-#stage.zoomed #imgWrap { max-width: none; max-height: none; }
-#stage.zoomed #imgWrap img { max-width: none; max-height: none;
-  max-width: 96vw; max-height: 96vh; width: auto; height: auto; cursor: move; }
 #drop { position: absolute; inset: 10%; border: 2px dashed var(--txt3);
   border-radius: 12px; display: flex; flex-direction: column; gap: 8px;
   align-items: center; justify-content: center; cursor: pointer;
@@ -113,8 +110,8 @@ input[type=file] { display: none; }
     <div id="imgWrap" style="display:none">
       <img id="solo">
       <div id="imgActions">
-        <button class="abtn" id="enlarge" title="Enlarge">
-          <svg viewBox="0 0 24 24"><path d="M9 3H3v6M15 21h6v-6M3 3l7 7M21 21l-7-7"/></svg>
+        <button class="abtn" id="download" title="Download">
+          <svg viewBox="0 0 24 24"><path d="M12 3v12M6 9l6 6 6-6M4 21h16"/></svg>
         </button>
         <button class="abtn" id="clear" title="Remove image">
           <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
@@ -160,7 +157,7 @@ const PRESETS = {
 };
 const DEFAULTS = {len:45, width:3, layers:4, flow_smooth:8, base_radius:6, relief:0.10, seed:42};
 const KEYS = ["len","width","layers","flow_smooth","base_radius","relief","seed"];
-let srcBgrBytes = null, origURL = null, paintedURL = null, presetOn = "art";
+let srcBgrBytes = null, origURL = null, paintedURL = null, presetOn = "art", srcExt = "png";
 let srcW = 0, srcH = 0;
 const $ = id => document.getElementById(id);
 for (const k of KEYS) {
@@ -203,6 +200,7 @@ async function load(f) {
   if (srcW || srcH) { /* new image replaces old */ }
   srcW = bitmap.width; srcH = bitmap.height;
   origURL = URL.createObjectURL(f);
+  srcExt = (f.type && f.type.includes("jpeg")) ? "jpg" : "png";
   // BGRA pixels at full res (python resizes itself)
   const c = document.createElement("canvas");
   c.width = srcW; c.height = srcH;
@@ -247,32 +245,15 @@ $("clear").onclick = () => {
   drop.style.display = "flex";
   $("status").textContent = "";
 };
-let zoomed = false, panX = 0, panY = 0;
-$("enlarge").onclick = () => {
-  zoomed = !zoomed;
-  panX = panY = 0;
-  stage.classList.toggle("zoomed", zoomed);
-  $("enlarge").innerHTML = zoomed
-    ? '<svg viewBox="0 0 24 24"><path d="M21 9h-6V3M3 15h6v6M21 3l-7 7M3 21l7-7"/></svg>'
-    : '<svg viewBox="0 0 24 24"><path d="M9 3H3v6M15 21h6v-6M3 3l7 7M21 21l-7-7"/></svg>';
-  setTransform();
+/* download current view (original before first paint, result after) */
+$("download").onclick = () => {
+  const onResult = $("viewResult").classList.contains("on");
+  const url = onResult && paintedURL ? paintedURL : origURL;
+  if (!url) return;
+  const a = document.createElement("a");
+  a.href = url; a.download = (url === paintedURL ? "isophote" : "input") + "." + (url === paintedURL ? "png" : srcExt);
+  a.click();
 };
-function setTransform() {
-  $("solo").style.transform =
-    `translate(${panX}px, ${panY}px) scale(${zoomed ? 2 : 1})`;
-}
-let panning = false, px0 = 0, py0 = 0;
-$("solo").onpointerdown = e => {
-  if (!zoomed) return;
-  panning = true; px0 = e.clientX - panX; py0 = e.clientY - panY;
-  $("solo").setPointerCapture(e.pointerId);
-};
-$("solo").onpointermove = e => {
-  if (!panning) return;
-  panX = e.clientX - px0; panY = e.clientY - py0;
-  setTransform();
-};
-$("solo").onpointerup = () => panning = false;
 /* live painting */
 let liveTimer = null, liveQueue = false, liveBusy = false;
 function scheduleLive() {
