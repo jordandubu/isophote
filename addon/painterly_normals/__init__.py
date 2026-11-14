@@ -1,9 +1,9 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 3, 0),
+    "version": (0, 3, 1),
     "blender": (4, 0, 0),
-    "location": "View3D > Sidebar > Painterly > Bake & Paint",
+    "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
     "category": "Paint",
 }
@@ -26,52 +26,6 @@ def _open_url(url):
 
 
 # ------------------------------------------------------------- operator
-class PN_OT_bake_and_paint(bpy.types.Operator):
-    """Push the baked normal to the isophote web app and poll for the painting"""
-
-    bl_idname = "painterly.bake_and_paint"
-    bl_label = "Paintify"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    _timer_handle = None
-    _timeout = 0.0
-
-    def execute(self, context):
-        _bridge_start()   # make sure the embedded relay is up
-        obj = context.active_object
-        mat = obj.active_material if obj else None
-        if mat is None or not mat.use_nodes:
-            self.report({'ERROR'}, "Active object needs a material with nodes.")
-            return {'CANCELLED'}
-
-        scene = context.scene
-        s = scene.painterly_settings
-        if not s.tex_name:
-            s.tex_name = obj.name or "Painterly"
-        base = s.tex_name.strip() or "Painterly"
-
-        import os
-        size = int(s.tex_size)
-        baked_path = os.path.join(bpy.app.tempdir, base + "_normal.png")
-        err = _bake_mesh_normal(obj, size, baked_path)
-        if err:
-            self.report({'ERROR'}, f"Bake failed: {err}")
-            s.status = "Bake failed"
-            return {'CANCELLED'}
-
-        # queue it for the web app
-        with open(baked_path, "rb") as f:
-            _bridge_state["pending_png"] = base64.b64encode(f.read()).decode()
-        _bridge_state["result_png"] = None
-        s.status = "Paint it in isophote, then Send to Blender"
-        _open_url("https://jordandubu.github.io/isophote/")
-        self.report({'INFO'}, "Baked normal sent to isophote — paint it there, then Send to Blender + Apply")
-        return {'FINISHED'}
-
-    def modal(self, context, event):
-        return {'PASS_THROUGH'}
-
-
 class PN_OT_send_to_isophote(bpy.types.Operator):
     """Bake the normal map and send it to the isophote web app for painting"""
 
@@ -258,73 +212,104 @@ def _bake_mesh_normal(obj, size: int, out_path: str):
         return str(e)
 
 
-def _get_or_create_work_image(w: int, h: int):
-    """Create (or reuse) the addon's working texture: procedural blotches that
-    give height structure. No user texture needed."""
-    name = "Painterly_WorkTexture"
-    img = bpy.data.images.get(name)
-    if img is None:
-        img = bpy.data.images.new(name, width=w, height=h, alpha=False)
-    if img.size[0] != w or img.size[1] != h:
-        img.scale(w, h)
+
+def _bake_mesh_normal(obj, size: int, out_path: str):
+    """True object-space normal bake via Blender's bake system.
+    Space=Object, swizzle +X +Y +Z. Returns error string or None."""
+    import os
+    try:
+        if obj.type != 'MESH':
+            return "active object is not a mesh"
+        if not obj.data.uv_layers:
+            obj.data.uv_layers.new(name="UVMap")
+
+        img = bpy.data.images.get("Painterly_BakedNormal")
+        if img is None or img.size[0] != size or img.size[1] != size:
+            if img:
+                bpy.data.images.remove(img)
+            img = bpy.data.images.new("Painterly_BakedNormal", size, size)
+        img.generated_color = (0.5, 0.5, 1.0, 1.0)  # flat normal default
         img.update()
-    import numpy as np, math
-    arr = np.zeros((h, w, 4), dtype=np.float32)
-    yy, xx = np.mgrid[0:h, 0:w]
-    u = xx / w; v = yy / h
-    # big soft blobs + medium noise = painterly height source
-    blobs = (
-        0.5 + 0.5 * np.sin(u * 6.0 + np.sin(v * 4.0) * 2.0) * np.cos(v * 5.0 + np.sin(u * 3.0))
-    )
-    noise = np.mod(np.sin(u * 57.3) * np.cos(v * 41.7) + np.sin((u + v) * 91.0), 1.0)
-    height = np.clip(0.65 * blobs + 0.35 * noise, 0, 1)
-    arr[..., 0] = height
-    arr[..., 1] = height
-    arr[..., 2] = height
-    arr[..., 3] = 1.0
-    img.pixels.foreach_set(arr[::-1].ravel())
-    img.update()
-    return img
 
+        # temp bake material; bake writes into the ACTIVE image node
+        mat = bpy.data.materials.new("Painterly_BakeMat")
+        mat.use_nodes = True
+        nt = mat.node_tree
+        for n in list(nt.nodes):
+            if n.type != 'OUTPUT_MATERIAL':
+                nt.nodes.remove(n)
+        tex = nt.nodes.new('ShaderNodeTexImage')
+        tex.image = img
+        nt.nodes.active = tex
+        tex.select = True
 
-def _bake_normal(img, out_path, stroke_size):
-    """CPU bake: sample the image, gradients -> normal RGB. No GPU needed."""
-    import numpy as np
-    from bpy.types import Image as BImage
+        saved_slots = [(ms.link, ms.material) for ms in obj.material_slots]
+        obj.data.materials.clear()
+        obj.data.materials.append(mat)
 
-    src = np.empty(img.size[0] * img.size[1] * img.channels, dtype=np.float32)
-    img.pixels.foreach_get(src)
-    ch = img.channels
-    sw, sh = img.size
-    src = src.reshape(sh, sw, ch)[::-1]  # top-down for numpy
-    height = src[..., :3] @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        scene = bpy.context.scene
+        saved_engine = scene.render.engine
+        scene.render.engine = 'CYCLES'
+        saved_device = scene.cycles.device
+        scene.cycles.device = 'CPU'
+        saved_samples = scene.cycles.samples
+        scene.cycles.samples = 1
+        saved_mode = None
+        if bpy.context.mode != 'OBJECT':
+            saved_mode = bpy.context.mode
+            bpy.ops.object.mode_set(mode='OBJECT')
+        saved_active = bpy.context.view_layer.objects.active
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
 
-    k = max(int(stroke_size), 1)
-    # wide smooth radius + narrow detail radius averaged = painterly base
-    gx_l = np.roll(height, k, axis=1); gx_r = np.roll(height, -k, axis=1)
-    gy_t = np.roll(height, k, axis=0); gy_b = np.roll(height, -k, axis=0)
-    dx = gx_l - gx_r
-    dy = gy_b - gy_t  # flip y for GL-style tangent normal
+        b = scene.render.bake
+        saved_bake = (b.normal_space, b.normal_r, b.normal_g, b.normal_b, b.margin, b.use_clear, b.use_selected_to_active)
+        b.normal_space = 'OBJECT'
+        b.normal_r = 'POS_X'
+        b.normal_g = 'POS_Y'
+        b.normal_b = 'POS_Z'
+        b.margin = 8
+        b.use_selected_to_active = False
 
+        try:
+            bpy.ops.object.bake(type='NORMAL', use_clear=True)
+        finally:
+            scene.render.engine = saved_engine
+            scene.cycles.device = saved_device
+            scene.cycles.samples = saved_samples
+            (b.normal_space, b.normal_r, b.normal_g, b.normal_b, b.margin, b.use_clear, b.use_selected_to_active) = saved_bake
+            obj.data.materials.clear()
+            seen = set()
+            for link, m in saved_slots:
+                if m is None or m.name in seen:
+                    continue
+                seen.add(m.name)
+                obj.data.materials.append(m)
+            if saved_active:
+                bpy.context.view_layer.objects.active = saved_active
+            if saved_mode:
+                bpy.ops.object.mode_set(mode=saved_mode)
 
-    norm = np.sqrt(dx * dx + dy * dy + 1.0)
-    nx = dx / norm; ny = dy / norm; nz = 1.0 / norm
-    # Bake in Blender Object space to match SHD_SPACE_BLENDER_OBJECT ("Blender Object").
-    # Blender decodes: n = (2R-1, -2G+1, -2B+1). Inverse encoding below.
-    out = np.stack([(nx * 0.5 + 0.5),
-                    (0.5 - ny * 0.5),
-                    (0.5 - nz * 0.5)], axis=-1)
-    out = np.repeat(out, 1, axis=-1)  # RGB
-    alpha = np.ones(out.shape[:2] + (1,), dtype=np.float32)
-    out = np.concatenate([out, alpha], axis=-1)
+        # save baked PNG in top-down orientation for the engine (flip once here)
+        if img.has_data is False and img.size[0] == 0:
+            return "bake produced empty image"
+        import numpy as _np
+        w, h = img.size
+        ch = img.channels
+        buf = _np.empty(w * h * ch, dtype=_np.float32)
+        img.pixels.foreach_get(buf)
+        buf = buf.reshape(h, w, ch)[::-1]  # flip: Blender bottom-up -> top-down
+        flat = bpy.data.images.new("Painterly_FlipTmp", w, h, alpha=True)
+        flat.pixels.foreach_set(buf[::-1].ravel())  # back to Blender order in datablock
+        flat.filepath_raw = out_path
+        flat.file_format = 'PNG'
+        flat.save()
+        bpy.data.images.remove(flat)
+        return None
+    except Exception as e:
+        return str(e)
 
-    from bpy.types import Image as BImage
-    baked = bpy.data.images.new("painterly_normal_baked", width=sw, height=sh, alpha=True)
-    baked.pixels.foreach_set(out[::-1].ravel())
-    baked.filepath_raw = out_path
-    baked.file_format = 'PNG'
-    baked.save()
-    return out_path
 
 
 def _renormalize_file(path, result, base_name="painterly"):
@@ -403,7 +388,7 @@ class PN_OT_preview_bake(bpy.types.Operator):
         base = context.scene.painterly_settings.tex_name.strip() or "Painterly"
         path = os.path.join(bpy.app.tempdir, base + "_normal.png")
         if not os.path.isfile(path):
-            self.report({'ERROR'}, f"No bake found at {path}. Run Paintify first.")
+            self.report({'ERROR'}, f"No bake found at {path}. Run Send to Isophote first.")
             return {'CANCELLED'}
         return _open_view(path, "Baked Normal")
 
@@ -418,7 +403,7 @@ class PN_OT_preview_result(bpy.types.Operator):
         base = context.scene.painterly_settings.tex_name.strip() or "Painterly"
         path = os.path.join(bpy.app.tempdir, base + "_ai.png")
         if not os.path.isfile(path):
-            self.report({'ERROR'}, f"No painted result at {path}. Run Paintify first.")
+            self.report({'ERROR'}, f"No painted result at {path}. Run Send to Isophote first.")
             return {'CANCELLED'}
         return _open_view(path, "Painted")
 
@@ -474,16 +459,6 @@ class PN_scene_settings(bpy.types.PropertyGroup):
         ],
         default='2048',
     )
-    stroke_size: EnumProperty(
-        name="Stroke Size",
-        items=[
-            ('1', "Tiny", "Fine strokes, maximum 1x kernel"),
-            ('2', "Medium", "Default, balanced"),
-            ('4', "Big", "Broad chunky strokes"),
-            ('8', "Super Big", "Maximum broad strokes"),
-        ],
-        default='2',
-    )
     renormalize: BoolProperty(
         name="Renormalize Painted Output", default=True,
         description="Re-project AI pixels to valid normal vectors",
@@ -509,9 +484,12 @@ class PN_PT_panel(bpy.types.Panel):
         layout.label(text="Material: " + (mat.name if mat else "none"))
 
         s = context.scene.painterly_settings
+        # keep Name synced to the mesh name until the user types their own
+        if obj and (s.tex_name == s._pn_last_auto_name):
+            s.tex_name = obj.name or "Painterly"
+        s._pn_last_auto_name = s.tex_name
         layout.operator(PN_OT_send_to_isophote.bl_idname, text="Send to Isophote")
         layout.operator(PN_OT_apply_from_isophote.bl_idname, text="Apply from Isophote")
-        layout.operator(PN_OT_bake_and_paint.bl_idname, text="Paintify (direct)")
         row = layout.row(align=True)
         row.operator(PN_OT_preview_bake.bl_idname, text="👁 Baked")
         row.operator(PN_OT_preview_result.bl_idname, text="👁 Painted")
@@ -520,37 +498,6 @@ class PN_PT_panel(bpy.types.Panel):
 
         layout.prop(s, "tex_name", text="Name")
         layout.prop(s, "tex_size")
-
-
-class PN_PT_style(bpy.types.Panel):
-    bl_label = "Style"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "Painterly"
-    bl_parent_id = "PN_PT_panel"
-    bl_order = 1
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        layout = self.layout
-        s = context.scene.painterly_settings
-        layout.prop(s, "stroke_size")
-        layout.prop(s, "renormalize")
-        layout.label(text="Engine: isophote in your browser")
-
-
-class PN_PT_options(bpy.types.Panel):
-    bl_label = "Misc"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "Painterly"
-    bl_parent_id = "PN_PT_panel"
-    bl_order = 2
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        layout = self.layout
-        s = context.scene.painterly_settings
         layout.prop(s, "renormalize")
 
 
@@ -558,12 +505,9 @@ classes = (
     PN_OT_preview_bake,
     PN_OT_preview_result,
     PN_scene_settings,
-    PN_OT_bake_and_paint,
     PN_OT_send_to_isophote,
     PN_OT_apply_from_isophote,
     PN_PT_panel,
-    PN_PT_style,
-    PN_PT_options,
 )
 
 
