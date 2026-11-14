@@ -95,7 +95,7 @@ main { flex: 1; display: flex; min-height: 0; }
 input[type=file] { display: none; }
 /* ---- mobile: fullscreen effects menu ---- */
 #menuBtn { display: none; align-items: center; justify-content: center;
-  width: 34px; height: 34px; padding: 0; }
+  width: 36px; height: 32px; padding: 0; }
 #menuBtn .icon { width: 18px; height: 18px; stroke: currentColor;
   stroke-width: 2; fill: none; stroke-linecap: round; }
 #overlay { display: none; position: fixed; inset: 0; z-index: 30;
@@ -117,11 +117,14 @@ input[type=file] { display: none; }
 #overlay .slider input[type=range]::-moz-range-thumb {
   width: 26px; height: 26px; }
 @media (max-width: 760px) {
-  header { gap: 10px; padding: 0 10px; }
+  header { gap: 8px; padding: 0 10px; }
   #menuBtn { display: flex; }
-  header .btn { padding: 7px 12px; }
+  header .btn { padding: 0; }              /* icon buttons, no text */
+  header .btn.primary { padding: 8px 14px; } /* Export keeps its text */
+  header #status { display: none; }        /* declutter; timing shows in overlay title */
   #viewBtns { top: 10px; }
   #viewBtns .vbtn { padding: 9px 22px; }  /* larger touch target */
+  #panel { display: none; }              /* effects live in the hamburger overlay on phone */
 }
 @media (pointer: coarse) {
   #imgActions { opacity: 1; }                 /* no hover on touch: always show */
@@ -161,7 +164,6 @@ input[type=file] { display: none; }
     </div>
   </div>
   <div id="panel">
-    <div id="panelToggle" title="Sliders"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></div>
     <div class="presets">
       <div class="chip on" data-p="art">Art</div>
       <div class="chip" data-p="medium">Medium</div>
