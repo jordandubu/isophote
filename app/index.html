@@ -192,6 +192,20 @@ input[type=file] { display: none; }
       <input type="range" id="relief" min="0" max="0.6" step="0.05" value="0.10"></div>
     <div class="slider"><div class="row"><label>Seed<span class="dot" id="d_seed" style="visibility:hidden"></span></label><span class="v" id="v_seed">42</span></div>
       <input type="range" id="seed" min="1" max="200" value="42"></div>
+    <div id="settingsToggle" class="row" style="margin-top:14px; cursor:pointer; align-items:center; gap:6px; color:var(--txt3); font-size:12px;">
+      <svg viewBox="0 0 24 24" style="width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      Settings
+    </div>
+    <div id="settings" style="display:none; flex-direction:column; gap:8px; margin-top:10px;">
+      <div style="font-size:11px; letter-spacing:.2px; color:var(--txt2); font-weight:500; margin-bottom:6px;">Add-ons</div>
+      <label id="addonBlenderRow" style="display:flex; align-items:center; gap:8px; font-size:12px; color:var(--txt2); cursor:pointer;">
+        <input type="checkbox" id="addonBlender"> Blender bridge
+      </label>
+      <div id="bridgeBar" style="display:none; align-items:center; gap:8px; margin-top:8px;">
+        <button class="chip" id="bridgeSend" style="padding:6px 12px; border-radius:14px;">Send to Blender</button>
+        <span id="bridgeState" style="font-size:11px; color:var(--txt3);"></span>
+      </div>
+    </div>
   </div>
 </main>
 <div id="overlay">
@@ -391,6 +405,91 @@ $("export").onclick = () => {
   if (!paintedURL) return;
   const a = document.createElement("a");
   a.href = paintedURL; a.download = "isophote.png"; a.click();
+};
+/* ============ settings (persisted) ============ */
+const BRIDGE_PORT = 8778;
+const settings = Object.assign(
+  { addonBlender: false },
+  JSON.parse(localStorage.getItem("isophote_settings") || "{}"));
+function saveSettings() {
+  localStorage.setItem("isophote_settings", JSON.stringify(settings));
+}
+$("settingsToggle").onclick = () => {
+  const open = $("settings").style.display !== "none";
+  $("settings").style.display = open ? "none" : "flex";
+};
+$("addonBlender").checked = settings.addonBlender;
+function applyAddonState() {
+  settings.addonBlender = $("addonBlender").checked;
+  $("bridgeBar").style.display = settings.addonBlender ? "flex" : "none";
+  saveSettings();
+  if (settings.addonBlender) startBridgePolling(); else stopBridgePolling();
+}
+$("addonBlender").onchange = applyAddonState;
+if (settings.addonBlender) { $("bridgeBar").style.display = "flex"; }
+/* ============ Blender bridge ============ */
+const bridge = { on: false, inFlight: false };
+function bridgeURL(path) { return `http://127.0.0.1:${BRIDGE_PORT}${path}`; }
+async function bridgePoll() {
+  // ask the local bridge whether Blender pushed a new image
+  if (bridge.inFlight) return;
+  bridge.inFlight = true;
+  try {
+    const r = await fetch(bridgeURL("/poll"), { method: "POST", body: "{}" });
+    const d = await r.json();
+    if (d.status) $("bridgeState").textContent = d.status;
+    if (d.kind === "image" && d.bgr_png) {
+      $("bridgeState").textContent = "received image — painting…";
+      const blob = b64ToBlob(d.bgr_png, "image/png");
+      await load(blob);                 // reuse the normal load path
+      await livePaint();                // paint now, don't wait for debounce
+      $("bridgeState").textContent = "painted — sending back";
+      await sendToBlender();
+      $("bridgeState").textContent = "sent to Blender";
+    }
+  } catch (e) {
+    $("bridgeState").textContent = "bridge offline (run: python3 serve.py)";
+  }
+  bridge.inFlight = false;
+}
+async function sendToBlender() {
+  if (!paintedURL) { $("bridgeState").textContent = "nothing painted yet"; return; }
+  const blob = await (await fetch(paintedURL)).blob();
+  const b64 = await blobToB64(blob);
+  await fetch(bridgeURL("/send_to_blender"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ png: b64 }),
+  });
+}
+$("bridgeSend").onclick = () => { sendToBlender(); };
+let bridgeTimer = null;
+function startBridgePolling() {
+  if (bridge.on) return;
+  bridge.on = true;
+  bridgePoll();
+  bridgeTimer = setInterval(bridgePoll, 1500);
+}
+function stopBridgePolling() {
+  bridge.on = false;
+  clearInterval(bridgeTimer);
+  bridgeTimer = null;
+  if ($("bridgeState")) $("bridgeState").textContent = "";
+}
+if (settings.addonBlender) startBridgePolling();
+/* helpers */
+function b64ToBlob(b64, type) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type });
+}
+function blobToB64(blob) {
+  return new Promise((res) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result.split(",")[1]);
+    r.readAsDataURL(blob);
+  });
 };
 </script>
 </body></html>

@@ -11,7 +11,14 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8799)
+    ap.add_argument("--bridge-port", type=int, default=8778)
+    ap.add_argument("--no-bridge", action="store_true",
+                    help="disable the Blender bridge server")
     a = ap.parse_args()
+    if not a.no_bridge:
+        import blender_bridge
+        blender_bridge.start(a.bridge_port)
+        print(f"blender bridge       -> http://localhost:{a.bridge_port}")
     print(f"isophote (client-side) -> http://localhost:{a.port}")
     http.server.ThreadingHTTPServer(
         ("127.0.0.1", a.port), Handler).serve_forever()
