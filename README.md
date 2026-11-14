@@ -1,46 +1,76 @@
 # isophote
 
-Flow-guided brush stroke painter. Standalone: Python + OpenCV, no editor needed.
+Turn photos into paintings that look hand-painted — entirely in your browser, instantly, with nothing uploaded anywhere.
 
-Strokes follow the image's contours (structure-tensor flow field), long and
-thin, layered with jitter over an edge-preserving Kuwahara base. Canvas weave
-relief optional.
+**[Try it now](https://jordandubu.github.io/isophote/)** — no install, no account, no server processing. Your photos stay on your device.
 
-## Usage
+<p align="center">
+  <a href="https://jordandubu.github.io/isophote/"><img src="docs/example_art.png" alt="example render" width="360"></a>
+  <a href="https://jordandubu.github.io/isophote/"><img src="docs/example_impasto.png" alt="impasto render" width="360"></a>
+</p>
+<p align="center"><sub>Same photo (left in <a href="docs/example_photo.jpg">docs/</a>), two presets: <b>Art</b> and <b>Impasto</b>. Rendered in ~0.6s in the browser.</sub></p>
+
+## Why isophote
+
+Most "oil paint" filters smudge pixels in place and look like noise. isophote paints the way a painter does:
+
+- **Strokes follow the subject** — each brush stroke is a polyline that walks along the image's contours (structure-tensor isophote field), so lines curve around eyes, petals, and horizon lines instead of cutting across them
+- **Long, thin, layered** — strokes overlap in passes with per-stroke jitter, like paint laid down in layers
+- **Real texture** — optional canvas-weave relief with normal-map lighting, so result catches light like a physical print
+- **Deterministic seeds** — every render is reproducible; share a seed and settings, get the identical painting
+
+## Use it in the browser
+
+Open [jordandubu.github.io/isophote](https://jordandubu.github.io/isophote/), drop a photo (or paste one) → done. Live sliders re-render as you tweak; the hamburger menu holds the effects on phones. When it looks right, hit **Export** to save the PNG.
+
+The render runs on **Rust compiled to WebAssembly** — your browser does all the compute, and the site is fully static.
+
+## Use it from the command line
+
+The same filter is a standalone Python tool (OpenCV), no editor needed:
 
 ```bash
-.venv/bin/python isophote.py photo.jpg -o painted.png \
-    --len 45 --width 3 --layers 4 --relief 0.1
+pip install opencv-python numpy
+python isophote.py photo.jpg -o painted.png --len 45 --width 3 --layers 4 --relief 0.1
 ```
 
-## Knobs
+All knobs with defaults:
 
 | flag | default | meaning |
 |---|---|---|
-| `--len`        | 26  | brush length, px (long = 40-70) |
-| `--width`      | 7   | brush thickness, px (thin = 3-5) |
-| `--layers`     | 2   | stroke passes (more = denser detail) |
-| `--density`    | auto | stroke count (auto ~ area/140) |
-| `--base-radius`| 6   | Kuwahara base flattening |
-| `--flow-smooth`| 8   | flow field coherence (higher = straighter strokes) |
-| `--relief`     | 0.35| canvas weave shading (0 = off) |
-| `--no-canvas`  |     | disable canvas texture |
-| `--seed`       | 42  | stroke randomness |
+| `--len` | 26 | stroke length, px (long = 40–70) |
+| `--width` | 7 | stroke thickness, px (thin = 3–5) |
+| `--layers` | 2 | paint passes (more = denser) |
+| `--density` | auto | stroke count (auto ≈ area / 140) |
+| `--base-radius` | 6 | Kuwahara base flattening |
+| `--flow-smooth` | 0 | flow-orientation smoothing |
+| `--no-canvas` | off | disable canvas weave |
+| `--relief` | 0.35 | canvas relief strength (0 = flat) |
+| `--seed` | 42 | stroke randomness |
+
+**Recipes:** long + thin → `--len 45 --width 3 --layers 4` · chunky impasto → `--len 24 --width 9 --layers 2 --relief 0.3` · soft pastel → `--len 30 --width 5 --relief 0 --base-radius 8`
 
 ## How it works
 
-1. **Kuwahara base** — quadrant-min-variance flatten, edge preserving.
-2. **Flow field** — structure tensor of smoothed gray; orientation =
-   isophote direction, coherence = anisotropy.
-3. **Coherent smoothing** — orientation-averaged so flat regions inherit
-   nearby directions.
-4. **Strokes** — polylines walking along the flow with direction inertia,
-   color sampled from the original photo under the stroke midpoint,
-   luminance jitter per stroke (loaded-brush feel), gradient-first ordering.
-5. **Canvas relief** — procedural weave heightmap → normal map → lambert.
+1. **Kuwahara base** — quadrant min-variance flatten (edge-preserving, painterly backdrop)
+2. **Flow field** — structure tensor of the smoothed grayscale: orientation = isophote (equal-brightness contour) direction, coherence = anisotropy strength
+3. **Coherent smoothing** — orientations averaged weighted by coherence, so flat regions inherit nearby directions instead of turning noisy
+4. **Strokes** — polylines walking the flow with direction inertia, color sampled from the original under the stroke midpoint, per-stroke luminance jitter, gradient-first ordering
+5. **Canvas relief** — procedural weave heightmap → normal map → Lambert shading
 
-## Tuning notes
+The browser core is a Rust port of the same pipeline ([`rust/`](rust/)); it's **bit-exact** on the seeded RNG (PCG64 mirror of NumPy) and verified stage-by-stage against the Python/OpenCV reference.
 
-- long+thin+art: `--len 45 --width 3 --layers 4`
-- chunky impasto: `--len 24 --width 9 --layers 2 --relief 0.3`
-- soft pastel: `--len 30 --width 5 --relief 0 --base-radius 8`
+## Repository map
+
+| path | what |
+|---|---|
+| `app/` | static web app (index.html, wasm glue, compiled wasm) — **what the live site serves** |
+| `rust/` | Rust crate: PCG64 + full pipeline, parity tests against fixtures |
+| `isophote.py` | standalone Python CLI |
+| `serve.py` | tiny static server used in development (`python3 serve.py` → :8799) |
+| `web.py` | older server-compute UI, kept as a parity oracle |
+| `docs/` | images used by this README |
+
+## License
+
+MIT — see [LICENSE](LICENSE).
