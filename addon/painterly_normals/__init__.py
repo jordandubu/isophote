@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 3, 2),
+    "version": (0, 3, 3),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -486,11 +486,8 @@ class PN_PT_panel(bpy.types.Panel):
         layout.label(text="Material: " + (mat.name if mat else "none"))
 
         s = context.scene.painterly_settings
-        # keep Name synced to the mesh name until the user types their own
-        last = AUTO_NAME.get("last")
-        if obj and (s.tex_name == last or not s.tex_name):
-            s.tex_name = obj.name or "Painterly"
-        AUTO_NAME["last"] = s.tex_name
+        # auto-fill happens in the timer (ID-property writes are not allowed
+        # during UI draw); draw only reads
         layout.operator(PN_OT_send_to_isophote.bl_idname, text="Send to Isophote")
         layout.operator(PN_OT_apply_from_isophote.bl_idname, text="Apply from Isophote")
         row = layout.row(align=True)
@@ -618,14 +615,35 @@ def _bridge_stop():
         _bridge_server = None
 
 
+def _autofill_name():
+    """Keep Name synced to the active mesh name until the user types their own.
+    Runs on a timer: writing ID properties is forbidden inside UI draw."""
+    try:
+        ctx = bpy.context
+        s = getattr(ctx.scene, "painterly_settings", None)
+        if s is not None:
+            obj = ctx.active_object
+            last = AUTO_NAME.get("last")
+            if obj and (s.tex_name == last or not s.tex_name):
+                s.tex_name = obj.name or "Painterly"
+            AUTO_NAME["last"] = s.tex_name
+    except Exception:
+        pass
+    return 0.5
+
+
 def register():
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.painterly_settings = bpy.props.PointerProperty(type=PN_scene_settings)
     _bridge_start()
+    if not bpy.app.timers.is_registered(_autofill_name):
+        bpy.app.timers.register(_autofill_name, first_interval=0.5, persistent=True)
 
 
 def unregister():
+    if bpy.app.timers.is_registered(_autofill_name):
+        bpy.app.timers.unregister(_autofill_name)
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
     del bpy.types.Scene.painterly_settings
