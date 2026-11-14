@@ -96,20 +96,8 @@ main { flex: 1; display: flex; min-height: 0; }
 .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--mod);
   display: inline-block; margin-left: 5px; vertical-align: 1px; }
 input[type=file] { display: none; }
-#boot { position: absolute; inset: 0; display: flex; flex-direction: column;
-  align-items: center; justify-content: center; gap: 12px; background: #111;
-  z-index: 50; color: var(--txt2); }
-#boot .bar { width: 220px; height: 3px; background: var(--elev); border-radius: 2px;
-  overflow: hidden; }
-#boot .bar div { height: 100%; width: 0%; background: var(--accent);
-  transition: width .3s; }
 </style></head>
 <body>
-<div id="boot">
-  <div class="logo" style="font-weight:600;color:#fff">isophote</div>
-  <div class="bar"><div id="bootbar"></div></div>
-  <div id="bootmsg" style="font-size:12px;color:var(--txt3)">loading python runtime…</div>
-</div>
 <header>
   <div class="logo">isophote</div>
   <div class="spacer"></div>
@@ -162,33 +150,8 @@ input[type=file] { display: none; }
   </div>
 </main>
 <input type="file" id="file" accept="image/*">
-<script src="https://cdn.jsdelivr.net/pyodide/v0.28.3/full/pyodide.js"></script>
+<script src="wasm.js"></script>
 <script>
-const PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.28.3/full/";
-// fetch isophote.py source and run it inside pyodide
-let pyodide = null;
-async function boot() {
-  const bar = document.getElementById("bootbar");
-  const msg = document.getElementById("bootmsg");
-  bar.style.width = "10%";
-  pyodide = await loadPyodide({ indexURL: PYODIDE_URL });
-  bar.style.width = "40%";
-  msg.textContent = "loading numpy + opencv…";
-  await pyodide.loadPackage(["numpy", "opencv-python"]);
-  bar.style.width = "80%";
-  msg.textContent = "loading isophote…";
-  const src = await (await fetch("isophote.py")).text();
-  pyodide.FS.writeFile("isophote.py", src);
-  pyodide.runPython("import sys; sys.path.insert(0,'.'); import isophote");
-  bar.style.width = "100%";
-  msg.textContent = "ready";
-  setTimeout(() => document.getElementById("boot").remove(), 400);
-}
-const bootP = boot().catch(e => {
-  document.getElementById("bootmsg").textContent = "failed: " + e.message;
-  throw e;
-});
-
 const PRESETS = {
   art:    {len:45, width:3, layers:4, flow_smooth:8, base_radius:6, relief:0.10},
   medium: {len:30, width:4, layers:3, flow_smooth:8, base_radius:6, relief:0.15},
@@ -324,33 +287,21 @@ async function livePaint() {
   liveBusy = true;
   $("status").textContent = "painting…";
   try {
-    await bootP;
-    // write pixels to pyodide's FS once per unique image (browser decodes,
-    // python reads raw BGRA from /home/pyodide)
-    if (pyodide.__srcKey !== origURL) {
-      pyodide.__srcKey = origURL;
-      pyodide.FS.writeFile("/src.bgra", srcBgrBytes);
-      pyodide.runPython(`
-import numpy as np
-src = np.fromfile("/src.bgra", dtype=np.uint8).reshape(${srcH}, ${srcW}, 4)`);
-    }
     const params = currentParams();
-    const out = await pyodide.runPythonAsync(`
-import json, base64
-from isophote import paint_bytes
-png, secs = paint_bytes(src, ${srcH}, ${srcW},
-    brush_len=int(${params.len}), brush_w=int(${params.width}),
-    layers=int(${params.layers}), relief=${params.relief},
-    base_radius=int(${params.base_radius}),
-    flow_smooth=int(${params.flow_smooth}), seed=int(${params.seed}))
-json.dumps({"b64": base64.b64encode(png).decode(), "secs": secs})
-`);
-    const { b64, secs } = JSON.parse(out);
-    paintedURL = "data:image/png;base64," + b64;
+    const { url, ms } = await wasmPaint(srcBgrBytes, srcW, srcH, {
+      brush_len: Math.round(params.len),
+      brush_w: Math.round(params.width),
+      layers: Math.round(params.layers),
+      relief: params.relief,
+      base_radius: Math.round(params.base_radius),
+      flow_smooth: Math.round(params.flow_smooth),
+      seed: Math.round(params.seed),
+    });
+    paintedURL = url;
     if ($("imgWrap").style.display !== "none") $("solo").src = paintedURL;
     showResultLight();
     $("export").disabled = false;
-    $("status").textContent = secs + "s";
+    $("status").textContent = (ms / 1000).toFixed(2) + "s";
   } catch (e) { $("status").textContent = "error: " + (e.message || e); }
   liveBusy = false;
   if (liveQueue) { liveQueue = false; scheduleLive(); }
