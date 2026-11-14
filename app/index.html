@@ -50,7 +50,10 @@ main { flex: 1; display: flex; min-height: 0; }
 #imgWrap { position: relative; display: flex; align-items: center;
   justify-content: center; max-width: 96%; max-height: 96%; }
 #imgWrap img { max-width: 100%; max-height: 96vh; border-radius: 2px;
-  transition: filter .18s; }
+  transform: scale(var(--zoom, 1)); transform-origin: center center;
+  transition: transform .08s ease-out, filter .18s; }
+#imgWrap.zoomed img { cursor: zoom-out; }
+#imgWrap.zoomed:hover img { filter: none; }
 #imgWrap:hover img { filter: brightness(0.92); }
 #imgActions { position: absolute; top: 10px; right: 10px; display: flex;
   gap: 8px; opacity: 0; transition: opacity .15s; }
@@ -341,8 +344,30 @@ function showResult() {
 }
 $("viewOriginal").onclick = showOrig;
 $("viewResult").onclick = showResult;
+/* wheel zoom: scroll on the image to zoom, click to reset */
+let imgZoom = 1;
+const imgWrap = $("imgWrap");
+function applyZoom() {
+  imgWrap.style.setProperty("--zoom", imgZoom.toFixed(3));
+  imgWrap.classList.toggle("zoomed", imgZoom > 1.01);
+}
+imgWrap.addEventListener("wheel", (e) => {
+  if (imgWrap.style.display === "none") return;
+  e.preventDefault();
+  const step = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  imgZoom = Math.min(8, Math.max(1, imgZoom * step));
+  if (imgZoom === 1) imgWrap.style.removeProperty("--zoom");
+  else imgWrap.style.setProperty("--zoom", imgZoom.toFixed(3));
+  imgWrap.classList.toggle("zoomed", imgZoom > 1.01);
+}, { passive: false });
+imgWrap.addEventListener("click", (e) => {
+  if (e.target.closest("#imgActions")) return;
+  if (imgZoom > 1) { imgZoom = 1; imgWrap.style.removeProperty("--zoom");
+                     imgWrap.classList.remove("zoomed"); }
+});
 /* image actions */
 $("clear").onclick = () => {
+  imgZoom = 1; imgWrap.classList.remove("zoomed"); imgWrap.style.removeProperty("--zoom");
   srcBgrBytes = origURL = paintedURL = null;
   clearTimeout(liveTimer); liveQueue = false;
   $("imgWrap").style.display = "none";
