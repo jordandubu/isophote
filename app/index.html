@@ -206,13 +206,13 @@ input[type=file] { display: none; }
       <button class="pbtn" id="pasteSettings" title="Paste slider values from the clipboard">Paste settings</button>
     </div>
     <div class="slider"><div class="row"><label>Stroke scale<span class="dot" id="d_sscale" style="visibility:hidden"></span></label><span class="v" id="v_sscale">1.0×</span></div>
-      <input type="range" id="sscale" min="0.25" max="4" step="0.05" value="1"></div>
-    <div class="slider"><div class="row"><label>Stroke length<span class="dot" id="d_len" style="visibility:hidden"></span></label><span class="v" id="v_len">45</span></div>
-      <input type="range" id="len" min="10" max="90" value="45"></div>
-    <div class="slider"><div class="row"><label>Stroke width<span class="dot" id="d_width" style="visibility:hidden"></span></label><span class="v" id="v_width">3</span></div>
-      <input type="range" id="width" min="2" max="14" value="3"></div>
-    <div class="slider"><div class="row"><label>Layers<span class="dot" id="d_layers" style="visibility:hidden"></span></label><span class="v" id="v_layers">4</span></div>
-      <input type="range" id="layers" min="1" max="6" value="4"></div>
+      <input type="range" id="sscale" min="-4" max="4" step="0.05" value="0"></div>
+    <div class="slider"><div class="row"><label>Stroke length<span class="dot" id="d_len" style="visibility:hidden"></span></label><span class="v" id="v_len">40</span></div>
+      <input type="range" id="len" min="10" max="90" value="40"></div>
+    <div class="slider"><div class="row"><label>Stroke width<span class="dot" id="d_width" style="visibility:hidden"></span></label><span class="v" id="v_width">9</span></div>
+      <input type="range" id="width" min="2" max="14" value="9"></div>
+    <div class="slider"><div class="row"><label>Layers<span class="dot" id="d_layers" style="visibility:hidden"></span></label><span class="v" id="v_layers">2</span></div>
+      <input type="range" id="layers" min="1" max="6" value="2"></div>
     <div class="slider"><div class="row"><label>Flow coherence<span class="dot" id="d_flow_smooth" style="visibility:hidden"></span></label><span class="v" id="v_flow_smooth">8</span></div>
       <input type="range" id="flow_smooth" min="2" max="24" value="8"></div>
     <div class="slider"><div class="row"><label>Base flatten<span class="dot" id="d_base_radius" style="visibility:hidden"></span></label><span class="v" id="v_base_radius">6</span></div>
@@ -234,21 +234,38 @@ input[type=file] { display: none; }
 <script src="wasm.js"></script>
 <script>
 const PRESETS = {
-  art:    {len:45, width:3, layers:4, flow_smooth:8, base_radius:6, relief:0.10},
+  art:    {len:40, width:9, layers:2, flow_smooth:8, base_radius:6, relief:0.10},
   medium: {len:30, width:4, layers:3, flow_smooth:8, base_radius:6, relief:0.15},
   bold:   {len:60, width:5, layers:2, flow_smooth:8, base_radius:8, relief:0.10},
   pastel: {len:30, width:5, layers:3, flow_smooth:8, base_radius:9, relief:0.00},
 };
-const DEFAULTS = {len:45, width:3, layers:4, flow_smooth:8, base_radius:6, relief:0.10, seed:42, sscale:1};
+const DEFAULTS = {len:40, width:9, layers:2, flow_smooth:8, base_radius:6, relief:0.10, seed:42, sscale:1};
 const KEYS = ["sscale","len","width","layers","flow_smooth","base_radius","relief","seed"];
 let srcBgrBytes = null, origURL = null, paintedURL = null, presetOn = "art", srcExt = "png";
 let srcW = 0, srcH = 0;
 const $ = id => document.getElementById(id);
 let overlayBody = null;
+/* stroke scale slider stores a symmetric position -4..4 (0 = 1x); the
+   actual multiplier is 2^(pos/2): ±4 → 0.25x / 4x, so 1x sits centered
+   and both directions have equal visual range */
+const sscaleFromPos = pos => Math.pow(2, pos / 2);
+const sscaleToPos = m => Math.round(Math.log2(m) * 2 / 0.05) * 0.05;
 for (const k of KEYS) {
   const el = $(k);
   el.addEventListener("input", () => {
-    $("v_"+k).textContent = k === "sscale" ? (+el.value).toFixed(2).replace(/\.?0+$/,"") + "×" : el.value;
+    if (k === "sscale") {
+      const m = sscaleFromPos(+el.value);
+      const txt = (m < 1 ? m.toFixed(2) : m.toFixed(2)).replace(/\.?0+$/,"") + "×";
+      $("v_"+k).textContent = txt;
+      if (overlayBody) overlayBody.querySelectorAll("#v_"+k).forEach(v => v.textContent = txt);
+      const mod = +el.value !== 0;
+      $("d_"+k).style.visibility = mod ? "visible" : "hidden";
+      if (overlayBody) { const cd = overlayBody.querySelector("#d_"+k); if (cd) cd.style.visibility = $("d_"+k).style.visibility; }
+      if (mod) presetOn = null;
+      scheduleLive();
+      return;
+    }
+    $("v_"+k).textContent = el.value;
     if (overlayBody) overlayBody.querySelectorAll("#v_"+k).forEach(v => v.textContent = el.value);
     const def = DEFAULTS[k];
     $("d_"+k).style.visibility = (+el.value !== def) ? "visible" : "hidden";
@@ -270,13 +287,15 @@ document.querySelectorAll(".chip").forEach(c => c.onclick = () => {
 /* copy/paste settings via clipboard: a compact JSON of all slider values */
 function settingsObject() {
   const o = {};
-  for (const k of KEYS) o[k] = +$(k).value;
+  for (const k of KEYS) o[k] = k === "sscale" ? sscaleFromPos(+$(k).value) : +$(k).value;
   return o;
 }
 function applySettings(obj) {
   for (const k of KEYS) {
     if (!(k in obj) || isNaN(obj[k])) continue;
-    $(k).value = obj[k];
+    // sscale in stored settings is the multiplier (e.g. 1.5); the slider
+    // element holds the symmetric position whose default is 0 (=1x)
+    $(k).value = k === "sscale" ? sscaleToPos(obj[k]) : obj[k];
     $(k).dispatchEvent(new Event("input", {bubbles: false}));
   }
 }
@@ -504,7 +523,7 @@ async function livePaint() {
     // the core downscales to 1400 long edge, and 720 is the reference size
     // where the default sliders were tuned
     const eff = Math.min(Math.max(srcW, srcH), 1400) / 720;
-    const s = params.sscale * eff;
+    const s = sscaleFromPos(params.sscale) * eff;
     const { url, ms } = await wasmPaint(srcBgrBytes, srcW, srcH, {
       brush_len: Math.max(4, Math.round(params.len * s)),
       brush_w: Math.max(1, Math.round(params.width * s)),
