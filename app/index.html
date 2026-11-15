@@ -84,6 +84,12 @@ main { flex: 1; display: flex; min-height: 0; }
   cursor: pointer; transition: all .12s; }
 .chip:hover { color: var(--txt); }
 .chip.on { background: var(--accent); color: #fff; border-color: transparent; }
+.pp-row { display: flex; gap: 6px; margin: 6px 0 2px; }
+.pbtn { flex: 1; padding: 6px 0; border-radius: 14px; background: transparent;
+  border: 1px solid var(--border); color: var(--txt2); font-size: 11.5px;
+  cursor: pointer; transition: all .12s; }
+.pbtn:hover { color: var(--txt); border-color: var(--txt3); }
+.pbtn.ok { color: var(--accent); border-color: var(--accent); }
 .slider { padding: 8px 0; }
 .slider .row { display: flex; justify-content: space-between;
   align-items: center; margin-bottom: 4px; }
@@ -195,6 +201,10 @@ input[type=file] { display: none; }
       <div class="chip" data-p="bold">Impasto</div>
       <div class="chip" data-p="pastel">Pastel</div>
     </div>
+    <div class="pp-row">
+      <button class="pbtn" id="copySettings" title="Copy all slider values to the clipboard">Copy settings</button>
+      <button class="pbtn" id="pasteSettings" title="Paste slider values from the clipboard">Paste settings</button>
+    </div>
     <div class="slider"><div class="row"><label>Stroke scale<span class="dot" id="d_sscale" style="visibility:hidden"></span></label><span class="v" id="v_sscale">1.0×</span></div>
       <input type="range" id="sscale" min="0.25" max="4" step="0.05" value="1"></div>
     <div class="slider"><div class="row"><label>Stroke length<span class="dot" id="d_len" style="visibility:hidden"></span></label><span class="v" id="v_len">45</span></div>
@@ -256,6 +266,84 @@ document.querySelectorAll(".chip").forEach(c => c.onclick = () => {
     $("d_"+k).style.visibility = "hidden"; }
   if (overlayBody) overlayBody.querySelectorAll(".chip").forEach(c => c.classList.toggle("on", c.dataset.p === presetOn));
   scheduleLive();
+});
+/* copy/paste settings via clipboard: a compact JSON of all slider values */
+function settingsObject() {
+  const o = {};
+  for (const k of KEYS) o[k] = +$(k).value;
+  return o;
+}
+function applySettings(obj) {
+  for (const k of KEYS) {
+    if (!(k in obj) || isNaN(obj[k])) continue;
+    $(k).value = obj[k];
+    $(k).dispatchEvent(new Event("input", {bubbles: false}));
+  }
+}
+function flashBtn(btn, ok = true) {
+  btn.classList.add("ok");
+  setTimeout(() => btn.classList.remove("ok"), 900);
+}
+/* clipboard fallback for non-focused/non-secure contexts */
+function legacyWriteClipboard(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.cssText = "position:fixed;opacity:0";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+  ta.remove();
+  return ok;
+}
+function legacyReadClipboard() {
+  // sync execCommand('paste') is blocked in modern browsers; throw and let
+  // the caller show the manual-paste hint
+  const ta = document.createElement("textarea");
+  ta.contentEditable = "true";
+  ta.style.cssText = "position:fixed;opacity:0";
+  document.body.appendChild(ta);
+  ta.focus();
+  let ok = false;
+  try { ok = document.execCommand("paste"); } catch (e) {}
+  const text = ok ? ta.value : null;
+  ta.remove();
+  if (!ok) throw new Error("manual");
+  return text;
+}
+$("copySettings").onclick = async () => {
+  try {
+    const json = JSON.stringify(settingsObject());
+    try { await navigator.clipboard.writeText(json); }
+    catch (e) { if (!legacyWriteClipboard(json)) throw e; }
+    flashBtn($("copySettings"));
+  } catch (e) { $("status").textContent = "copy failed: " + (e.message || e); }
+};
+$("pasteSettings").onclick = async () => {
+  try {
+    let text;
+    try { text = await navigator.clipboard.readText(); }
+    catch (e) { text = legacyReadClipboard(); }
+    const obj = JSON.parse(text);
+    if (typeof obj !== "object" || obj === null) throw new Error("not settings");
+    applySettings(obj);
+    presetOn = null;
+    flashBtn($("pasteSettings"));
+  } catch (e) { $("status").textContent = "paste failed — copy settings first, or paste JSON directly with Ctrl+V"; }
+};
+/* Ctrl+V anywhere on the page also applies copied settings */
+window.addEventListener("paste", (e) => {
+  const text = e.clipboardData && e.clipboardData.getData("text");
+  if (!text) return;
+  try {
+    const obj = JSON.parse(text);
+    if (obj && typeof obj === "object" && "len" in obj) {
+      applySettings(obj);
+      presetOn = null;
+      e.preventDefault();
+      flashBtn($("pasteSettings"));
+    }
+  } catch (err) { /* not settings JSON — let normal paste happen */ }
 });
 /* mobile hamburger: fullscreen effects menu mirrors the panel controls live */
 const overlayBodyEl = $("overlayBody");
