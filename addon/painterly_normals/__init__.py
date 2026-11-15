@@ -734,6 +734,15 @@ def _autofill_name():
             if obj and (s.tex_name == last or not s.tex_name):
                 s.tex_name = obj.name or "Painterly"
             AUTO_NAME["last"] = s.tex_name
+            # surface what the bridge is holding, so the user knows the
+            # next step is Apply (the web app cannot apply by itself)
+            waiting = ("frame waiting — click 'Apply from Isophote'"
+                       if _bridge_state.get("result_png") else
+                       ("animated frames waiting — click 'Apply animated (seeds)'"
+                        if _bridge_state.get("result_anim") else ""))
+            s.status = waiting if waiting else (
+                "" if s.status.startswith(("frame waiting", "animated frames waiting"))
+                else s.status)
     except Exception:
         pass
     return 0.5

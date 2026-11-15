@@ -649,6 +649,7 @@ async function sendToBlender() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ png: b64 }),
   });
+  $("bridgeState").textContent = "sent — now click 'Apply from Isophote' inside Blender";
 }
 /* send animated: paint N extra seeds silently and post them all; Blender
    wires them into an image sequence so the paint flickers as strokes */
@@ -695,7 +696,7 @@ async function _sendAnimatedToBlender(count = 10) {
     body: JSON.stringify({ anim: frames }),
   });
   $("animProgress").style.display = "none";
-  $("bridgeState").textContent = `sent ${frames.length} frames — Apply animated in Blender`;
+  $("bridgeState").textContent = `sent ${frames.length} frames — now click 'Apply animated (seeds)' inside Blender`;
 }
 /* dropdown wiring */
 $("sendCaret").onclick = (e) => { e.stopPropagation();
