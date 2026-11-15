@@ -628,6 +628,7 @@ if (settings.addonBlender) { $("sendGroup").style.display = ""; }
 /* ============ Blender bridge ============ */
 const bridge = { on: false, inFlight: false };
 let bridgeImagePending = false;   // bridge delivered (or is about to) a Blender image
+let bridgeLastPainted = "";       // hash of last bridge image already painted by this tab
 function bridgeURL(path) { return `http://127.0.0.1:${BRIDGE_PORT}${path}`; }
 async function bridgePoll() {
   // ask the local bridge whether Blender pushed a new image
@@ -637,14 +638,22 @@ async function bridgePoll() {
     const r = await fetch(bridgeURL("/poll"), { method: "POST", body: "{}" });
     const d = await r.json();
     if (d.status) $("bridgeState").textContent = d.status;
-    if (d.kind === "image" && d.bgr_png) {
-      bridgeImagePending = true;   // the default sample must not overwrite it
+    if (d.kind === "image" && d.bgr_png && !bridgeImagePending) {
+      // sticky poll: same image repeats every 1.5s until acked; skip if this
+      // tab already painted it (avoid re-paint loop while waiting for ack)
+      let h = 0;
+      for (let i = 0; i < d.bgr_png.length; i += 4096)
+        h = (h + (d.bgr_png.charCodeAt(i) + i)) | 0;
+      if (h === bridgeLastPainted) return;
+      bridgeImagePending = true;
       try {
         $("bridgeState").textContent = "received image — painting…";
         const blob = b64ToBlob(d.bgr_png, "image/png");
         await load(blob);                 // reuse the normal load path
         await livePaint();                // paint now, don't wait for debounce
-        // painted; user tweaks live, then clicks Send to Blender when done
+        bridgeLastPainted = h;
+        // painted; ack so the bridge clears it (sticky /poll can't be stolen)
+        fetch(bridgeURL("/ack"), { method: "POST", body: "{}" }).catch(() => {});
         $("bridgeState").textContent = "painted — click Send to Blender when done";
       } finally {
         bridgeImagePending = false;

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 4, 1),
+    "version": (0, 4, 2),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -633,7 +633,8 @@ classes = (
 # https://jordandubu.github.io/isophote/ polls it on 127.0.0.1:8778.
 BRIDGE_PORT = 8778
 
-_bridge_state = {"pending_png": None, "result_png": None, "result_anim": None}
+_bridge_state = {"pending_png": None, "pending_ack": False,
+                 "result_png": None, "result_anim": None}
 _bridge_server = None
 
 
@@ -671,14 +672,23 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
 
         if self.path == "/queue":            # Blender -> app
             _bridge_state["pending_png"] = req.get("png")
+            _bridge_state["pending_ack"] = False
             _bridge_state["result_png"] = None
             return self._reply({"ok": True})
 
         if self.path == "/poll":             # app pulls from Blender
+            # sticky: do NOT clear on read; the page acks after painting.
+            # Prevents a second tab / slow load from stealing the image.
             png = _bridge_state["pending_png"]
+            if png is None:
+                return self._reply({"kind": "none"})
+            return self._reply({"kind": "image", "bgr_png": png,
+                                "ack": True})
+
+        if self.path == "/ack":              # page says: painted it, clear
             _bridge_state["pending_png"] = None
-            return self._reply({"kind": "image", "bgr_png": png} if png
-                               else {"kind": "none"})
+            _bridge_state["pending_ack"] = False
+            return self._reply({"ok": True})
 
         if self.path == "/send_to_blender":  # app result -> Blender
             if "anim" in req and isinstance(req["anim"], list):
