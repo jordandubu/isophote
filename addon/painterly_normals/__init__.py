@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 3, 3),
+    "version": (0, 4, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -12,6 +12,7 @@ import bpy
 import os
 import json
 import base64
+import shutil
 import threading
 import http.server
 import webbrowser
@@ -28,6 +29,102 @@ def _open_url(url):
 
 
 # ------------------------------------------------------------- operator
+# ------------------------------------------------------------- animated apply
+class PN_OT_apply_animated_from_isophote(bpy.types.Operator):
+    """Fetch the animated frames from the isophote web app and wire them
+    into the material as a playing image sequence"""
+
+    bl_idname = "painterly.apply_animated_from_isophote"
+    bl_label = "Apply animated from Isophote"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        s = scene.painterly_settings
+        base = s.tex_name.strip() or "Painterly"
+
+        anim = _bridge_state.get("result_anim")
+        if not anim:
+            self.report({'WARNING'},
+                        "No animated frames — use 'Send animated (10 seeds)' in isophote first.")
+            return {'CANCELLED'}
+        _bridge_state["result_anim"] = None
+
+        tmp = bpy.app.tempdir
+        norm_dir = os.path.join(tmp, base + "_anim")
+        os.makedirs(norm_dir, exist_ok=True)
+        obj = context.active_object
+        mat = obj.active_material if obj else None
+        if mat is None or not mat.use_nodes:
+            self.report({'ERROR'}, "Active object needs a material with nodes.")
+            return {'CANCELLED'}
+
+        paths = []
+        try:
+            for i, png_b64 in enumerate(anim):
+                raw = base64.b64decode(png_b64)
+                src = os.path.join(tmp, f"{base}_anim_{i:03d}.png")
+                with open(src, "wb") as f:
+                    f.write(raw)
+                final = src
+                if s.renormalize:
+                    res = {"path": None, "error": None}
+                    _renormalize_file(src, res, f"{base}_anim_{i:03d}")
+                    if res.get("error"):
+                        self.report({'ERROR'}, f"Renormalize failed: {res['error']}")
+                        return {'CANCELLED'}
+                    final = res["path"]
+                # move into the anim folder with a stable sequence name
+                seq = os.path.join(norm_dir, f"{base}_anim_{i:03d}.png")
+                if final != seq:
+                    shutil.move(final, seq)
+                paths.append(seq)
+        except Exception as e:
+            self.report({'ERROR'}, f"Frame write failed: {e}")
+            return {'CANCELLED'}
+
+        # image sequence: Blender plays frames <base>_anim_###.png
+        img = bpy.data.images.load(paths[0], check_existing=False)
+        img.source = 'SEQUENCE'
+        img.colorspace_settings.name = 'Non-Color'
+        # sequence expects frame files named with the END number; the loaded
+        # first frame sets the pattern
+        _apply_animated_normal(mat, img, start_frame=1, duration=len(paths))
+        s.status = f"Applied animated ({len(paths)} frames)"
+        self.report({'INFO'}, f"Animated painterly normal: {len(paths)} frames from frame 1")
+        return {'FINISHED'}
+
+
+def _apply_animated_normal(mat, img, start_frame=1, duration=10):
+    """Like _apply_normal but the tex node plays an image sequence."""
+    if not mat or not mat.use_nodes:
+        return
+    nt = mat.node_tree
+    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if bsdf is None:
+        bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
+
+    tex = next((n for n in nt.nodes if n.type == 'TEX_IMAGE' and n.name == "PainterlyNormalsTex"), None)
+    nmap = next((n for n in nt.nodes if n.type == 'NORMAL_MAP' and n.space == 'OBJECT'), None)
+    if tex is None:
+        tex = nt.nodes.new('ShaderNodeTexImage')
+        tex.name = "PainterlyNormalsTex"
+    if nmap is None:
+        nmap = nt.nodes.new('ShaderNodeNormalMap')
+        nmap.space = 'OBJECT'
+
+    tex.image = img
+    tex.image_user.frame_duration = duration
+    tex.image_user.frame_start = start_frame
+    tex.image_user.frame_offset = 0
+    tex.image_user.use_cyclic = True
+    tex.image_user.use_auto_refresh = True
+    tex.location = (bsdf.location.x - 400, bsdf.location.y + 220)
+    nmap.location = (bsdf.location.x - 200, bsdf.location.y + 200)
+    nt.links.new(tex.outputs['Color'], nmap.inputs['Color'])
+    nt.links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])
+
+
 class PN_OT_send_to_isophote(bpy.types.Operator):
     """Bake the normal map and send it to the isophote web app for painting"""
 
@@ -490,6 +587,7 @@ class PN_PT_panel(bpy.types.Panel):
         # during UI draw); draw only reads
         layout.operator(PN_OT_send_to_isophote.bl_idname, text="Send to Isophote")
         layout.operator(PN_OT_apply_from_isophote.bl_idname, text="Apply from Isophote")
+        layout.operator(PN_OT_apply_animated_from_isophote.bl_idname, text="Apply animated (seeds)")
         row = layout.row(align=True)
         row.operator(PN_OT_preview_bake.bl_idname, text="👁 Baked")
         row.operator(PN_OT_preview_result.bl_idname, text="👁 Painted")
@@ -521,6 +619,7 @@ classes = (
     PN_scene_settings,
     PN_OT_send_to_isophote,
     PN_OT_apply_from_isophote,
+    PN_OT_apply_animated_from_isophote,
     PN_PT_panel,
     PN_PT_misc,
 )
@@ -532,7 +631,7 @@ classes = (
 # https://jordandubu.github.io/isophote/ polls it on 127.0.0.1:8778.
 BRIDGE_PORT = 8778
 
-_bridge_state = {"pending_png": None, "result_png": None}
+_bridge_state = {"pending_png": None, "result_png": None, "result_anim": None}
 _bridge_server = None
 
 
@@ -580,10 +679,18 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
                                else {"kind": "none"})
 
         if self.path == "/send_to_blender":  # app result -> Blender
-            _bridge_state["result_png"] = req.get("png")
+            if "anim" in req and isinstance(req["anim"], list):
+                _bridge_state["result_anim"] = req["anim"]
+                _bridge_state["result_png"] = None
+            else:
+                _bridge_state["result_png"] = req.get("png")
             return self._reply({"ok": True})
 
         if self.path == "/result":           # addon pulls the app's painting
+            if _bridge_state.get("result_anim"):
+                anim = _bridge_state["result_anim"]
+                _bridge_state["result_anim"] = None
+                return self._reply({"kind": "anim", "frames": anim})
             png = _bridge_state["result_png"]
             _bridge_state["result_png"] = None
             return self._reply({"kind": "image", "png": png} if png

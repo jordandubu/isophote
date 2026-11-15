@@ -58,12 +58,23 @@ All knobs with defaults:
 4. **Strokes** — polylines walking the flow with direction inertia, color sampled from the original under the stroke midpoint, per-stroke luminance jitter, gradient-first ordering
 5. **Canvas relief** — procedural weave heightmap → normal map → Lambert shading
 
+## Use it inside Blender
+
+The repo ships a Blender add-on (`addon/painterly_normals/`) that bridges the web app into your material workflow:
+
+- **Send to Isophote** — bakes the object's normal map and opens it in the isophote web app
+- **Apply from Isophote** — pulls the painted result back and wires it into the material as a normal map
+- **Apply animated (seeds)** — receives multiple seed-variations the app painted (Send dropdown → *Send animated (10 seeds)*) and wires them as a playing image sequence, giving a flickering hand-painted animation when you play the timeline
+
+Install: download [painterly_normals-0.4.0-isophote.zip](../../releases) (or zip the `addon/painterly_normals/` folder yourself), then Blender → *Preferences → Add-ons → Install from Disk*. The add-on is pure Python — no numpy/cv2 required; all painting happens in your browser.
+
 The browser core is a Rust port of the same pipeline ([`rust/`](rust/)); it's **bit-exact** on the seeded RNG (PCG64 mirror of NumPy) and verified stage-by-stage against the Python/OpenCV reference.
 
 ## Repository map
 
 | path | what |
 |---|---|
+| `addon/painterly_normals/` | Blender add-on (pure Python bridge to the web app) |
 | `app/` | static web app (index.html, wasm glue, compiled wasm) — **what the live site serves** |
 | `rust/` | Rust crate: PCG64 + full pipeline, parity tests against fixtures |
 | `isophote.py` | standalone Python CLI |

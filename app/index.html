@@ -31,6 +31,11 @@ header .btn { background: var(--elev); color: var(--txt); border: 1px solid var(
 header .btn:hover { background: #555; }
 header .btn.primary { background: var(--accent); color: #fff; border: none; }
 header .btn.primary:hover { background: rgb(50,150,255); }
+#sendGroup .btn.primary:hover:not(:disabled) { background: rgb(50,150,255); }
+#sendMenu .sendm { display: block; width: 100%; text-align: left; background: transparent;
+  border: none; color: var(--txt2); font-size: 12.5px; padding: 8px 12px;
+  cursor: pointer; border-radius: 6px; }
+#sendMenu .sendm:hover { background: var(--elev); color: var(--txt); }
 header .btn:disabled { opacity: 0.4; cursor: default; }
 header .spacer { flex: 1; }
 #status { color: var(--txt3); font-size: 12px; }
@@ -159,7 +164,19 @@ input[type=file] { display: none; }
   <div class="logo">isophote</div>
   <div class="spacer"></div>
   <div id="status"></div>
-  <button class="btn primary" id="bridgeSend" style="display:none">Send to Blender</button>
+  <div id="sendGroup" style="display:none; position:relative">
+    <button class="btn primary" id="bridgeSend">Send to Blender</button>
+    <button class="btn primary" id="sendCaret" title="More ways to send"
+      style="border-left:none; padding:0; width:26px; display:flex; align-items:center; justify-content:center;">
+      <svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round"><path d="M6 9l6 6 6-6"/></svg>
+    </button>
+    <div id="sendMenu" style="display:none; position:absolute; top:34px; right:0; z-index:30;
+      background: var(--surface); border:1px solid var(--border); border-radius:10px;
+      padding:6px; box-shadow:0 6px 24px rgba(0,0,0,0.5); min-width:190px;">
+      <button class="sendm" data-act="single">Send current frame</button>
+      <button class="sendm" data-act="anim">Send animated (10 seeds)</button>
+    </div>
+  </div>
   <button class="btn" id="menuBtn" title="Effects"><svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
   <button class="btn primary" id="export" style="display:none" disabled>Export</button>
 </header>
@@ -441,7 +458,7 @@ async function load(f, opts = {}) {
   $("imgWrap").style.display = "flex";
   $("viewBtns").style.display = "flex";
   $("export").style.display = "";
-  if (settings.addonBlender) $("bridgeSend").style.display = "";
+  if (settings.addonBlender) $("sendGroup").style.display = "";
   if (opts.silent) return;   // result view replaces the photo as soon as painted
   showOrig();
   scheduleLive();
@@ -487,7 +504,7 @@ $("clear").onclick = () => {
   $("imgWrap").style.display = "none";
   $("viewBtns").style.display = "none";
   $("export").style.display = "none";
-  $("bridgeSend").style.display = "none";
+  $("sendGroup").style.display = "none";
   drop.style.display = "flex";
   $("status").textContent = "";
 };
@@ -573,13 +590,13 @@ document.addEventListener("click", (e) => {
 $("addonBlender").checked = settings.addonBlender;
 function applyAddonState() {
   settings.addonBlender = $("addonBlender").checked;
-  $("bridgeSend").style.display = settings.addonBlender ? "" : "none";
+  $("sendGroup").style.display = settings.addonBlender ? "" : "none";
   $("bridgeSend").disabled = !paintedURL;
   saveSettings();
   if (settings.addonBlender) startBridgePolling(); else stopBridgePolling();
 }
 $("addonBlender").onchange = applyAddonState;
-if (settings.addonBlender) { $("bridgeSend").style.display = ""; }
+if (settings.addonBlender) { $("sendGroup").style.display = ""; }
 /* ============ Blender bridge ============ */
 const bridge = { on: false, inFlight: false };
 let bridgeImagePending = false;   // bridge delivered (or is about to) a Blender image
@@ -620,6 +637,51 @@ async function sendToBlender() {
     body: JSON.stringify({ png: b64 }),
   });
 }
+/* send animated: paint N extra seeds silently and post them all; Blender
+   wires them into an image sequence so the paint flickers as strokes */
+async function sendAnimatedToBlender(count = 10) {
+  if (!srcBgrBytes) { $("bridgeState").textContent = "nothing to send"; return; }
+  const baseSeed = Math.round(parseFloat($("seed").value));
+  const params = currentParams();
+  const eff = Math.min(Math.max(srcW, srcH), 1400) / 720;
+  const s = sscaleFromPos(params.sscale) * eff;
+  const core = {
+    brush_len: Math.max(4, Math.round(params.len * s)),
+    brush_w: Math.max(1, Math.round(params.width * s)),
+    layers: Math.round(params.layers),
+    relief: params.relief,
+    base_radius: Math.max(2, Math.round(params.base_radius * s)),
+    flow_smooth: Math.max(2, Math.round(params.flow_smooth * s)),
+  };
+  $("bridgeState").textContent = "painting animated frames…";
+  const frames = [];
+  // frame 0 is the current painting
+  const blob0 = await (await fetch(paintedURL)).blob();
+  frames.push(await blobToB64(blob0));
+  for (let i = 1; i <= count; i++) {
+    $("bridgeState").textContent = `painting animated frames… ${i}/${count}`;
+    const { url } = await wasmPaint(srcBgrBytes, srcW, srcH, { ...core, seed: baseSeed + i });
+    frames.push(await blobToB64(await (await fetch(url)).blob()));
+  }
+  await fetch(bridgeURL("/send_to_blender"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ anim: frames }),
+  });
+  $("bridgeState").textContent = `sent ${frames.length} frames — Apply animated in Blender`;
+}
+/* dropdown wiring */
+$("sendCaret").onclick = (e) => { e.stopPropagation();
+  $("sendMenu").style.display = $("sendMenu").style.display === "none" ? "block" : "none"; };
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#sendMenu") && !e.target.closest("#sendCaret"))
+    $("sendMenu").style.display = "none";
+});
+document.querySelectorAll("#sendMenu .sendm").forEach(b => b.onclick = async () => {
+  $("sendMenu").style.display = "none";
+  if (b.dataset.act === "anim") await sendAnimatedToBlender();
+  else await sendToBlender();
+});
 $("bridgeSend").onclick = () => { sendToBlender(); };
 let bridgeTimer = null;
 function startBridgePolling() {
