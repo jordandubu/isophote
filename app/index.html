@@ -195,6 +195,8 @@ input[type=file] { display: none; }
       <div class="chip" data-p="bold">Impasto</div>
       <div class="chip" data-p="pastel">Pastel</div>
     </div>
+    <div class="slider"><div class="row"><label>Stroke scale<span class="dot" id="d_sscale" style="visibility:hidden"></span></label><span class="v" id="v_sscale">1.0×</span></div>
+      <input type="range" id="sscale" min="0.25" max="4" step="0.05" value="1"></div>
     <div class="slider"><div class="row"><label>Stroke length<span class="dot" id="d_len" style="visibility:hidden"></span></label><span class="v" id="v_len">45</span></div>
       <input type="range" id="len" min="10" max="90" value="45"></div>
     <div class="slider"><div class="row"><label>Stroke width<span class="dot" id="d_width" style="visibility:hidden"></span></label><span class="v" id="v_width">3</span></div>
@@ -227,8 +229,8 @@ const PRESETS = {
   bold:   {len:60, width:5, layers:2, flow_smooth:8, base_radius:8, relief:0.10},
   pastel: {len:30, width:5, layers:3, flow_smooth:8, base_radius:9, relief:0.00},
 };
-const DEFAULTS = {len:45, width:3, layers:4, flow_smooth:8, base_radius:6, relief:0.10, seed:42};
-const KEYS = ["len","width","layers","flow_smooth","base_radius","relief","seed"];
+const DEFAULTS = {len:45, width:3, layers:4, flow_smooth:8, base_radius:6, relief:0.10, seed:42, sscale:1};
+const KEYS = ["sscale","len","width","layers","flow_smooth","base_radius","relief","seed"];
 let srcBgrBytes = null, origURL = null, paintedURL = null, presetOn = "art", srcExt = "png";
 let srcW = 0, srcH = 0;
 const $ = id => document.getElementById(id);
@@ -236,7 +238,7 @@ let overlayBody = null;
 for (const k of KEYS) {
   const el = $(k);
   el.addEventListener("input", () => {
-    $("v_"+k).textContent = el.value;
+    $("v_"+k).textContent = k === "sscale" ? (+el.value).toFixed(2).replace(/\.?0+$/,"") + "×" : el.value;
     if (overlayBody) overlayBody.querySelectorAll("#v_"+k).forEach(v => v.textContent = el.value);
     const def = DEFAULTS[k];
     $("d_"+k).style.visibility = (+el.value !== def) ? "visible" : "hidden";
@@ -400,7 +402,7 @@ function scheduleLive() {
 }
 function currentParams() {
   const p = {};
-  for (const k of ["len","width","layers","flow_smooth","base_radius","relief","seed"])
+  for (const k of ["sscale","len","width","layers","flow_smooth","base_radius","relief","seed"])
     p[k] = parseFloat($(k).value);
   return p;
 }
@@ -410,13 +412,18 @@ async function livePaint() {
   $("status").textContent = "painting…";
   try {
     const params = currentParams();
+    // strokes are sized in pixels; keep them proportional to the picture:
+    // the core downscales to 1400 long edge, and 720 is the reference size
+    // where the default sliders were tuned
+    const eff = Math.min(Math.max(srcW, srcH), 1400) / 720;
+    const s = params.sscale * eff;
     const { url, ms } = await wasmPaint(srcBgrBytes, srcW, srcH, {
-      brush_len: Math.round(params.len),
-      brush_w: Math.round(params.width),
+      brush_len: Math.max(4, Math.round(params.len * s)),
+      brush_w: Math.max(1, Math.round(params.width * s)),
       layers: Math.round(params.layers),
       relief: params.relief,
-      base_radius: Math.round(params.base_radius),
-      flow_smooth: Math.round(params.flow_smooth),
+      base_radius: Math.max(2, Math.round(params.base_radius * s)),
+      flow_smooth: Math.max(2, Math.round(params.flow_smooth * s)),
       seed: Math.round(params.seed),
     });
     paintedURL = url;
