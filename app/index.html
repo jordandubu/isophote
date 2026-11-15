@@ -176,7 +176,12 @@ input[type=file] { display: none; }
       background: var(--surface); border:1px solid var(--border); border-radius:10px;
       padding:6px; box-shadow:0 6px 24px rgba(0,0,0,0.5); min-width:190px;">
       <button class="sendm" data-act="single">Send current frame</button>
-      <button class="sendm" data-act="anim">Send animated (10 seeds)</button>
+      <button class="sendm" data-act="anim">Send animated</button>
+      <div style="display:flex; align-items:center; gap:8px; padding:8px 10px 4px; border-top:1px solid var(--border); margin-top:6px;">
+        <span style="font-size:12px; color:var(--txt2);">Frames</span>
+        <input type="number" id="animCountInput" min="1" max="24" value="5"
+          style="width:52px; background:transparent; border:1px solid var(--border); border-radius:6px; color:var(--txt); padding:4px 6px; font-size:12px;">
+      </div>
     </div>
   </div>
   <button class="btn" id="menuBtn" title="Effects"><svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
@@ -653,7 +658,7 @@ async function sendToBlender() {
 }
 /* send animated: paint N extra seeds silently and post them all; Blender
    wires them into an image sequence so the paint flickers as strokes */
-async function sendAnimatedToBlender(count = 10) {
+async function sendAnimatedToBlender(count = 5) {
   if (!srcBgrBytes) { $("bridgeState").textContent = "nothing to send"; return; }
   try {
     await _sendAnimatedToBlender(count);
@@ -707,7 +712,10 @@ document.addEventListener("click", (e) => {
 });
 document.querySelectorAll("#sendMenu .sendm").forEach(b => b.onclick = async () => {
   $("sendMenu").style.display = "none";
-  if (b.dataset.act === "anim") await sendAnimatedToBlender();
+  if (b.dataset.act === "anim") {
+    const n = Math.min(24, Math.max(1, Math.round(+($("animCountInput").value) || 5)));
+    await sendAnimatedToBlender(n);
+  }
   else await sendToBlender();
 });
 $("bridgeSend").onclick = () => { sendToBlender(); };

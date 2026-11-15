@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 4, 0),
+    "version": (0, 4, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -46,7 +46,7 @@ class PN_OT_apply_animated_from_isophote(bpy.types.Operator):
         anim = _bridge_state.get("result_anim")
         if not anim:
             self.report({'WARNING'},
-                        "No animated frames — use 'Send animated (10 seeds)' in isophote first.")
+                        "No animated frames — use 'Send animated' in isophote first.")
             return {'CANCELLED'}
         _bridge_state["result_anim"] = None
 
@@ -552,6 +552,8 @@ class PN_scene_settings(bpy.types.PropertyGroup):
     tex_size: EnumProperty(
         name="Texture Size",
         items=[
+            ('256', "256px", "256 x 256"),
+            ('512', "512px", "512 x 512"),
             ('1024', "1K", "1024 x 1024"),
             ('2048', "2K", "2048 x 2048"),
             ('4096', "4K", "4096 x 4096"),
