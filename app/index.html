@@ -281,8 +281,8 @@ input[type=file] { display: none; }
       <input type="range" id="relief" min="0" max="0.6" step="0.05" value="0.10"></div>
     <div class="slider"><div class="row"><label>Seed<span class="dot" id="d_seed" style="visibility:hidden"></span></label><span class="v" id="v_seed">42</span></div>
       <input type="range" id="seed" min="1" max="200" value="42"></div>
-    <div class="slider"><div class="row"><label>Image Scale<span class="dot" id="d_imgscale" style="visibility:hidden"></span></label><span class="v" id="v_imgscale">1.0×</span></div>
-      <input type="range" id="imgscale" min="0" max="5" step="1" value="1"></div>
+    <div class="slider"><div class="row"><label>Image Scale<span class="dot" id="d_imgscale" style="visibility:hidden"></span></label><span class="v" id="v_imgscale">1024px</span></div>
+      <input type="range" id="imgscale" min="0" max="5" step="1" value="2"></div>
   </div>
 </main>
 <div id="overlay">
@@ -301,7 +301,7 @@ const PRESETS = {
   bold:   {len:60, width:5, layers:2, flow_smooth:8, base_radius:8, relief:0.10},
   pastel: {len:30, width:5, layers:3, flow_smooth:8, base_radius:9, relief:0.00},
 };
-const DEFAULTS = {len:40, width:9, layers:2, flow_smooth:8, base_radius:6, relief:0.10, seed:42, sscale:1, imgscale:1};
+const DEFAULTS = {len:40, width:9, layers:2, flow_smooth:8, base_radius:6, relief:0.10, seed:42, sscale:1, imgscale:2};
 const KEYS = ["sscale","len","width","layers","flow_smooth","base_radius","relief","seed","imgscale"];
 let srcBgrBytes = null, origURL = null, paintedURL = null, presetOn = "art", srcExt = "png";
 let srcW = 0, srcH = 0;
@@ -316,11 +316,10 @@ for (const k of KEYS) {
   const el = $(k);
   el.addEventListener("input", () => {
     if (k === "imgscale") {
-      const m = imgscaleFromPos(+el.value);
-      const txt = m.toFixed(1) + "×";
-      $("v_"+k).textContent = txt;
-      if (overlayBody) overlayBody.querySelectorAll("#v_"+k).forEach(v => v.textContent = txt);
-      const mod = m !== 1;
+      const pos = Math.min(+el.value, IMGSCALE_LABELS.length - 1);
+      $("v_"+k).textContent = IMGSCALE_LABELS[pos];
+      if (overlayBody) overlayBody.querySelectorAll("#v_"+k).forEach(v => v.textContent = IMGSCALE_LABELS[pos]);
+      const mod = pos !== 2;   // default is 1024px
       $("d_"+k).style.visibility = mod ? "visible" : "hidden";
       if (overlayBody) { const cd = overlayBody.querySelector("#d_"+k); if (cd) cd.style.visibility = $("d_"+k).style.visibility; }
       if (mod) presetOn = null;
@@ -363,7 +362,7 @@ function settingsObject() {
   const o = {};
   for (const k of KEYS) {
     if (k === "sscale") o[k] = sscaleFromPos(+$(k).value);
-    else if (k === "imgscale") o[k] = imgscaleFromPos(+$(k).value);
+    else if (k === "imgscale") o[k] = IMGSCALE_LABELS[Math.min(+$(k).value, IMGSCALE_LABELS.length - 1)];
     else o[k] = +$(k).value;
   }
   return o;
@@ -375,7 +374,7 @@ function applySettings(obj) {
     // element holds the symmetric position whose default is 0 (=1x).
     // imgscale likewise: stored as multiplier, slider holds step position.
     $(k).value = k === "sscale" ? sscaleToPos(obj[k])
-      : k === "imgscale" ? IMGSCALE_STEPS.indexOf(obj[k]) < 0 ? 1 : IMGSCALE_STEPS.indexOf(obj[k])
+      : k === "imgscale" ? Math.max(0, IMGSCALE_LABELS.indexOf(obj[k]))
       : obj[k];
     $(k).dispatchEvent(new Event("input", {bubbles: false}));
   }
@@ -633,15 +632,14 @@ function currentParams() {
     p[k] = parseFloat($(k).value);
   return p;
 }
-// Image Scale slider: snaps 0.5/1/1.5/2/2.5/3 (positions 0..5).
-// Target paint size = actual image size × scale, floored to the old
-// 1400px cap so 1.0× always behaves exactly like before (a 512px image
-// at 1.0× paints at 512; at 2× it paints at 1024).
-const IMGSCALE_STEPS = [0.5, 1, 1.5, 2, 2.5, 3];
-const imgscaleFromPos = pos => IMGSCALE_STEPS[pos] || 1;
+// Image Scale slider: absolute output long-edge in px — snaps to
+// 256 / 512 / 1024 / 2048 / 4096 / MAX(=image full size, no rescale).
+const IMGSCALE_PX = [256, 512, 1024, 2048, 4096, -1];   // -1 = full size
+const IMGSCALE_LABELS = ["256px", "512px", "1024px", "2048px", "4096px", "MAX"];
+const imgscaleFromPos = pos => IMGSCALE_PX[Math.min(pos, IMGSCALE_PX.length - 1)] ?? 1024;
 function paintTargetLong() {
-  const scale = imgscaleFromPos(+$("imgscale").value);
-  const target = Math.round(Math.max(srcW, srcH) * scale);
+  const target = imgscaleFromPos(+$("imgscale").value);
+  if (target <= 0) return Math.max(srcW, srcH);   // MAX: paint at native size
   return Math.max(target, Math.min(Math.max(srcW, srcH), 1400));
 }
 // painted results per channel when a multi queue is loaded:
