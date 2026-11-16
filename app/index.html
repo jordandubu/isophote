@@ -774,7 +774,9 @@ async function sendToBlender() {
     $("bridgeState").__show("painting all channels…");
     try {
       const params = coreParamsForSize();
-      const blobs = await Promise.all(Object.values(bridgeImgs).map(o => o.blob));
+      // derive STRICTLY from bridgeKinds order (Object.values insertion order
+    // may diverge from kinds after mixed legacy/multi sessions)
+    const blobs = await Promise.all(bridgeKinds.map(k => bridgeImgs[k].blob));
       let bgras = await Promise.all(blobs.map(decodeToBgra));
       let mw = srcW, mh = srcH;
       // Image Scale > 1: upscale every channel so multi paintings match
@@ -907,7 +909,9 @@ async function _sendAnimatedToBlender(count = 10) {
     // each frame paints ALL channels coherently: outer = seed, inner = kind
     // (bridgeKinds order). decode every queued channel once up front,
     // upscale all of them when Image Scale > 1 (core never upsizes)
-    const blobs = await Promise.all(Object.values(bridgeImgs).map(o => o.blob));
+    // derive STRICTLY from bridgeKinds order (Object.values insertion order
+    // may diverge from kinds after mixed legacy/multi sessions)
+    const blobs = await Promise.all(bridgeKinds.map(k => bridgeImgs[k].blob));
     let bgras = await Promise.all(blobs.map(decodeToBgra));
     let aw = srcW, ah = srcH;
     const target = paintTargetLong();
@@ -932,7 +936,7 @@ async function _sendAnimatedToBlender(count = 10) {
     });
     $("animProgress").style.display = "none";
     $("bridgeState").__show(
-      `sent ${total} frames × ${k} maps — now click 'Apply from Isophote' (Animated checked) inside Blender`);
+      `sent ${total} frames × ${k} maps (${kindList(bridgeKinds)}) — now click 'Apply from Isophote' (Animated checked) inside Blender`);
     return;
   }
   const frames1 = [];
