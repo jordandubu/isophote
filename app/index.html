@@ -653,6 +653,7 @@ async function bridgePoll() {
       for (const png of d.pngs)
         for (let i = 0; i < png.length; i += 4096) h = (h + (png.charCodeAt(i) + i)) | 0;
       if (h === bridgeLastPainted) return;
+      bridgeLastPainted = h;          // claim immediately: blocks sample load
       bridgeImagePending = true;
       try {
         bridgeKinds = d.kinds;
@@ -681,6 +682,7 @@ async function bridgePoll() {
       for (let i = 0; i < d.bgr_png.length; i += 4096)
         h = (h + (d.bgr_png.charCodeAt(i) + i)) | 0;
       if (h === bridgeLastPainted) return;
+      bridgeLastPainted = h;          // claim immediately: blocks sample load
       bridgeImagePending = true;
       try {
         $("bridgeState").textContent = "received image — painting…";
