@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 5, 0),
+    "version": (0, 5, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -311,6 +311,7 @@ class PN_OT_apply_from_isophote(bpy.types.Operator):
                 self.report({'ERROR'}, "Active object needs a material with nodes.")
                 return {'CANCELLED'}
             applied = []
+            kind_final = {}
             for kind, png_b64 in zip(kinds, pngs):
                 final = os.path.join(bpy.app.tempdir, f"{base}_{kind}_painted.png")
                 with open(final, "wb") as f:
@@ -319,9 +320,40 @@ class PN_OT_apply_from_isophote(bpy.types.Operator):
                     final = self._normal_chain(context, s, base, final)
                     if final is None:
                         return {'CANCELLED'}
+                kind_final[kind] = final
+                if kind in ('rough', 'metal'):
+                    applied.append(KIND_LABELS[kind])
                 else:
                     _apply_paint(mat, final, kind)
-                applied.append(KIND_LABELS[kind])
+                    applied.append(KIND_LABELS[kind])
+            # both channels painted -> merge into one packed MR map and swap
+            # it into the existing metallic-roughness image node (keeps the
+            # Separate Color wiring; only rough OR metal -> direct sockets)
+            if 'rough' in kind_final and 'metal' in kind_final:
+                orm_path = os.path.join(bpy.app.tempdir, f"{base}_orm.png")
+                err = _pack_orm(kind_final['rough'], kind_final['metal'], orm_path)
+                if err:
+                    # fall back to direct socket wiring
+                    _apply_paint(mat, kind_final['rough'], 'rough')
+                    _apply_paint(mat, kind_final['metal'], 'metal')
+                    self.report({'WARNING'}, f"ORM pack skipped: {err}")
+                else:
+                    name = _replace_mr_tex(mat, orm_path)
+                    if name:
+                        applied = [a for a in applied
+                                   if a not in (KIND_LABELS['rough'], KIND_LABELS['metal'])]
+                        applied.append("packed metallic-roughness")
+                    else:
+                        # shouldn't happen (bsdf checked above); wire directly
+                        _apply_paint(mat, kind_final['rough'], 'rough')
+                        _apply_paint(mat, kind_final['metal'], 'metal')
+                        self.report({'WARNING'}, "No Principled found for ORM swap — wired direct")
+            else:
+                # only one of rough/metal painted: direct socket wiring
+                # (half a pack would lose the other channel's value)
+                for kind in ('rough', 'metal'):
+                    if kind in kind_final:
+                        _apply_paint(mat, kind_final[kind], kind)
             s.status = "Applied: " + ", ".join(applied)
             self.report({'INFO'}, f"Applied: {', '.join(applied)}")
             return {'FINISHED'}
@@ -610,6 +642,108 @@ def _apply_paint(mat, path, kind):
                        and l.to_socket.name == target_socket)
     if only_new:
         nt.links.new(tex.outputs['Color'], bsdf.inputs[target_socket])
+
+
+def _pack_orm(rough_path, metal_path, out_path):
+    """Combine painted rough + metal maps into one glTF-style packed map:
+    R = white (no AO), G = roughness, B = metallic. Same-size inputs
+    expected. Uses Blender's image pixels API + numpy (already used
+    elsewhere in this addon). Returns error string or None."""
+    try:
+        rough = bpy.data.images.load(rough_path, check_existing=False)
+        metal = bpy.data.images.load(metal_path, check_existing=False)
+    except Exception as e:
+        return f"cannot load painted maps: {e}"
+    try:
+        if rough.size[0] != metal.size[0] or rough.size[1] != metal.size[1]:
+            return (f"rough/metal size mismatch: {rough.size[0]}x{rough.size[1]} "
+                    f"vs {metal.size[0]}x{metal.size[1]} — repack skipped")
+        w, h = rough.size[0], rough.size[1]
+        n = w * h
+        rbuf = _np_empty(n * rough.channels)
+        mbuf = _np_empty(n * metal.channels)
+        rough.pixels.foreach_get(rbuf)
+        metal.pixels.foreach_get(mbuf)
+
+        out = bpy.data.images.new("Painterly_ORMTmp", w, h, alpha=True)
+        obuf = _np_empty(n * 4)
+        # default: white R (no AO), G/B filled below, opaque A
+        obuf[0::4] = 1.0
+        obuf[3::4] = 1.0
+        # Blender stores images bottom-up; both inputs use the same storage,
+        # so row order is consistent — no flip needed.
+        obuf[1::4] = rbuf[0::rough.channels]      # G = rough red
+        obuf[2::4] = mbuf[0::metal.channels]      # B = metal red
+        out.pixels.foreach_set(obuf)
+        out.filepath_raw = out_path
+        out.file_format = 'PNG'
+        out.save()
+        bpy.data.images.remove(out)
+        return None
+    except Exception as e:
+        return str(e)
+    finally:
+        bpy.data.images.remove(rough)
+        bpy.data.images.remove(metal)
+
+
+def _np_empty(n):
+    """float32 buffer without a hard numpy import at module top."""
+    import numpy as _np
+    return _np.empty(n, dtype=_np.float32)
+
+
+def _replace_mr_tex(mat, orm_path):
+    """Point the existing metallic-roughness image node at the packed map.
+    Finds any TEX_IMAGE whose Color output reaches Metallic/Roughness (via
+    any node chain); replaces its image, keeps every link. Falls back to a
+    plain PainterlyOrmTex + two links when no such node exists."""
+    nt = mat.node_tree
+    dname = "Painterly_ORM"
+    prev = bpy.data.images.get(dname)
+    if prev:
+        bpy.data.images.remove(prev)
+    img = bpy.data.images.load(orm_path, check_existing=False)
+    img.name = dname
+    img.colorspace_settings.name = 'Non-Color'
+
+    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if bsdf is None:
+        return None
+    # trace upstream from the Metallic/Roughness sockets to find the image
+    # node feeding them (however indirectly — Separate Color, mix, ...).
+    # An empty TEX_IMAGE (image=None) still counts: that's often exactly the
+    # node the user wants filled.
+    def upstream(start_socket):
+        stack = [start_socket]
+        seen = set()
+        while stack:
+            sock = stack.pop()
+            for link in sock.links:
+                node = link.from_node
+                if node.type == 'TEX_IMAGE':
+                    return node
+                if node in seen:
+                    continue
+                seen.add(node)
+                for inp in node.inputs:
+                    stack.append(inp)
+        return None
+    found = upstream(bsdf.inputs['Metallic']) or upstream(bsdf.inputs['Roughness'])
+    if found:
+        found.image = img
+        return found.name
+    # fallback: dedicated node, wired to both sockets
+    tex = next((n for n in nt.nodes
+                if n.type == 'TEX_IMAGE' and n.name == 'PainterlyOrmTex'), None)
+    if tex is None:
+        tex = nt.nodes.new('ShaderNodeTexImage')
+        tex.name = 'PainterlyOrmTex'
+    tex.image = img
+    tex.location = (bsdf.location.x - 400, bsdf.location.y - 360)
+    nt.links.new(tex.outputs['Color'], bsdf.inputs['Roughness'])
+    nt.links.new(tex.outputs['Color'], bsdf.inputs['Metallic'])
+    return tex.name
 
 
 # ------------------------------------------------------------- preview
