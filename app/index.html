@@ -56,10 +56,6 @@ main { flex: 1; display: flex; min-height: 0; }
   padding: 7px 18px; cursor: pointer; font-size: 12.5px; transition: all .12s; }
 #viewBtns .vbtn:hover { color: var(--txt); }
 #viewBtns .vbtn.on { background: var(--elev); color: #fff; }
-#paintQuality { background: transparent; color: var(--txt2); border: none;
-  border-left: 1px solid var(--border); padding: 7px 10px; cursor: pointer;
-  font-size: 12.5px; outline: none; }
-#paintQuality option { background: var(--surface); color: var(--txt); }
 /* image hover actions (enlarge + close, close on the right) */
 #imgWrap { position: relative; display: flex; align-items: center;
   justify-content: center; max-width: 96%; max-height: 96%; }
@@ -229,14 +225,6 @@ input[type=file] { display: none; }
     <div id="viewBtns" style="display:none">
       <button class="vbtn on" id="viewOriginal">Input</button>
       <button class="vbtn" id="viewResult">Result</button>
-      <select id="paintQuality" title="Paint resolution (100% = cap at 1400px, higher keeps more detail, slower)">
-        <option value="1">100%</option>
-        <option value="1.5">150%</option>
-        <option value="2">200%</option>
-        <option value="2.5">250%</option>
-        <option value="3">300%</option>
-        <option value="0">Full</option>
-      </select>
     </div>
     <div id="imgWrap" style="display:none">
       <img id="solo">
@@ -253,6 +241,9 @@ input[type=file] { display: none; }
       <div class="big">Drop a photo</div>
       <div class="small">or click to browse &middot; all computation happens in your browser</div>
     </div>
+    <div id="outRes" style="position:absolute; right:12px; bottom:10px; z-index:6;
+      font-size:11px; color:var(--txt3); font-variant-numeric:tabular-nums;
+      background:rgba(28,28,30,0.6); border-radius:6px; padding:2px 8px; display:none;"></div>
   </div>
   <div id="panel">
     <div class="presets">
@@ -281,6 +272,8 @@ input[type=file] { display: none; }
       <input type="range" id="relief" min="0" max="0.6" step="0.05" value="0.10"></div>
     <div class="slider"><div class="row"><label>Seed<span class="dot" id="d_seed" style="visibility:hidden"></span></label><span class="v" id="v_seed">42</span></div>
       <input type="range" id="seed" min="1" max="200" value="42"></div>
+    <div class="slider"><div class="row"><label>Image Scale<span class="dot" id="d_imgscale" style="visibility:hidden"></span></label><span class="v" id="v_imgscale">1.0×</span></div>
+      <input type="range" id="imgscale" min="0" max="5" step="1" value="1"></div>
   </div>
 </main>
 <div id="overlay">
@@ -299,8 +292,8 @@ const PRESETS = {
   bold:   {len:60, width:5, layers:2, flow_smooth:8, base_radius:8, relief:0.10},
   pastel: {len:30, width:5, layers:3, flow_smooth:8, base_radius:9, relief:0.00},
 };
-const DEFAULTS = {len:40, width:9, layers:2, flow_smooth:8, base_radius:6, relief:0.10, seed:42, sscale:1};
-const KEYS = ["sscale","len","width","layers","flow_smooth","base_radius","relief","seed"];
+const DEFAULTS = {len:40, width:9, layers:2, flow_smooth:8, base_radius:6, relief:0.10, seed:42, sscale:1, imgscale:1};
+const KEYS = ["sscale","len","width","layers","flow_smooth","base_radius","relief","seed","imgscale"];
 let srcBgrBytes = null, origURL = null, paintedURL = null, presetOn = "art", srcExt = "png";
 let srcW = 0, srcH = 0;
 const $ = id => document.getElementById(id);
@@ -313,6 +306,18 @@ const sscaleToPos = m => Math.round(Math.log2(m) * 2 / 0.05) * 0.05;
 for (const k of KEYS) {
   const el = $(k);
   el.addEventListener("input", () => {
+    if (k === "imgscale") {
+      const m = imgscaleFromPos(+el.value);
+      const txt = m.toFixed(1) + "×";
+      $("v_"+k).textContent = txt;
+      if (overlayBody) overlayBody.querySelectorAll("#v_"+k).forEach(v => v.textContent = txt);
+      const mod = m !== 1;
+      $("d_"+k).style.visibility = mod ? "visible" : "hidden";
+      if (overlayBody) { const cd = overlayBody.querySelector("#d_"+k); if (cd) cd.style.visibility = $("d_"+k).style.visibility; }
+      if (mod) presetOn = null;
+      scheduleLive();
+      return;
+    }
     if (k === "sscale") {
       const m = sscaleFromPos(+el.value);
       const txt = (m < 1 ? m.toFixed(2) : m.toFixed(2)).replace(/\.?0+$/,"") + "×";
@@ -347,15 +352,22 @@ document.querySelectorAll(".chip").forEach(c => c.onclick = () => {
 /* copy/paste settings via clipboard: a compact JSON of all slider values */
 function settingsObject() {
   const o = {};
-  for (const k of KEYS) o[k] = k === "sscale" ? sscaleFromPos(+$(k).value) : +$(k).value;
+  for (const k of KEYS) {
+    if (k === "sscale") o[k] = sscaleFromPos(+$(k).value);
+    else if (k === "imgscale") o[k] = imgscaleFromPos(+$(k).value);
+    else o[k] = +$(k).value;
+  }
   return o;
 }
 function applySettings(obj) {
   for (const k of KEYS) {
     if (!(k in obj) || isNaN(obj[k])) continue;
     // sscale in stored settings is the multiplier (e.g. 1.5); the slider
-    // element holds the symmetric position whose default is 0 (=1x)
-    $(k).value = k === "sscale" ? sscaleToPos(obj[k]) : obj[k];
+    // element holds the symmetric position whose default is 0 (=1x).
+    // imgscale likewise: stored as multiplier, slider holds step position.
+    $(k).value = k === "sscale" ? sscaleToPos(obj[k])
+      : k === "imgscale" ? IMGSCALE_STEPS.indexOf(obj[k]) < 0 ? 1 : IMGSCALE_STEPS.indexOf(obj[k])
+      : obj[k];
     $(k).dispatchEvent(new Event("input", {bubbles: false}));
   }
 }
@@ -576,14 +588,17 @@ function currentParams() {
     p[k] = parseFloat($(k).value);
   return p;
 }
-// paint resolution: quality multiplier over the 1400px reference cap
-// (1 = old behavior; higher keeps more detail, linearly slower; 0 = none)
-function paintMaxSize() {
-  const q = parseFloat($("paintQuality").value) || 1;
-  if (q <= 0) return 0;
-  return Math.max(1400, Math.round(1400 * q));
+// Image Scale slider: snaps 0.5/1/1.5/2/2.5/3 (positions 0..5).
+// Target paint size = actual image size × scale, floored to the old
+// 1400px cap so 1.0× always behaves exactly like before (a 512px image
+// at 1.0× paints at 512; at 2× it paints at 1024).
+const IMGSCALE_STEPS = [0.5, 1, 1.5, 2, 2.5, 3];
+const imgscaleFromPos = pos => IMGSCALE_STEPS[pos] || 1;
+function paintTargetLong() {
+  const scale = imgscaleFromPos(+$("imgscale").value);
+  const target = Math.round(Math.max(srcW, srcH) * scale);
+  return Math.max(target, Math.min(Math.max(srcW, srcH), 1400));
 }
-$("paintQuality").onchange = () => scheduleLive();
 async function livePaint() {
   if (liveBusy) { liveQueue = true; return; }
   liveBusy = true;
@@ -591,12 +606,18 @@ async function livePaint() {
   try {
     const params = currentParams();
     // strokes are sized in pixels; keep them proportional to the picture:
-    // the core downscales to max_size (default 1400) long edge, and 720 is
-    // the reference size where the default sliders were tuned
-    const ms_ = paintMaxSize();
-    const eff = (ms_ > 0 ? Math.min(Math.max(srcW, srcH), ms_) : Math.max(srcW, srcH)) / 720;
+    // the core downscales the input to max_size (long edge) before painting,
+    // 720 is the reference size where the default sliders were tuned
+    const t_ = paintTargetLong();
+    // the core only downsizes; to paint ABOVE source res, pre-upscale here
+    let inBytes = srcBgrBytes, inW = srcW, inH = srcH;
+    if (t_ > Math.max(srcW, srcH)) {
+      const up = await upscaleImage(srcBgrBytes, srcW, srcH, t_);
+      inBytes = up.bytes; inW = up.w; inH = up.h;
+    }
+    const eff = t_ / 720;
     const s = sscaleFromPos(params.sscale) * eff;
-    const { url, ms } = await wasmPaint(srcBgrBytes, srcW, srcH, {
+    const { url, ms, w: outW_, h: outH_ } = await wasmPaint(inBytes, inW, inH, {
       brush_len: Math.max(4, Math.round(params.len * s)),
       brush_w: Math.max(1, Math.round(params.width * s)),
       layers: Math.round(params.layers),
@@ -604,13 +625,16 @@ async function livePaint() {
       base_radius: Math.max(2, Math.round(params.base_radius * s)),
       flow_smooth: Math.max(2, Math.round(params.flow_smooth * s)),
       seed: Math.round(params.seed),
-      max_size: ms_,
+      max_size: t_,
     });
     paintedURL = url;
     if ($("imgWrap").style.display !== "none") $("solo").src = paintedURL;
     showResultLight();
     $("export").disabled = false;
     $("bridgeSend").disabled = false;
+    // painted resolution, bottom-right of the canvas
+    $("outRes").textContent = `${outW_}×${outH_}`;
+    $("outRes").style.display = "";
     $("status").textContent = (ms / 1000).toFixed(2) + "s";
   } catch (e) { $("status").textContent = "error: " + (e.message || e); }
   liveBusy = false;
@@ -751,8 +775,17 @@ async function sendToBlender() {
     try {
       const params = coreParamsForSize();
       const blobs = await Promise.all(Object.values(bridgeImgs).map(o => o.blob));
-      const bgras = await Promise.all(blobs.map(decodeToBgra));
-      const { urls } = await wasmPaintMulti(bgras, srcW, srcH, params);
+      let bgras = await Promise.all(blobs.map(decodeToBgra));
+      let mw = srcW, mh = srcH;
+      // Image Scale > 1: upscale every channel so multi paintings match
+      // the live view resolution (the core never upsizes)
+      const target = paintTargetLong();
+      if (target > Math.max(srcW, srcH)) {
+        const ups = await Promise.all(bgras.map(b => upscaleImage(b, srcW, srcH, target)));
+        bgras = ups.map(u => u.bytes);
+        mw = ups[0].w; mh = ups[0].h;
+      }
+      const { urls } = await wasmPaintMulti(bgras, mw, mh, params);
       const pngs = [];
       for (const url of urls) pngs.push(await blobToB64(await (await fetch(url)).blob()));
       await fetch(bridgeURL("/send_to_blender"), {
@@ -782,8 +815,8 @@ async function sendToBlender() {
 // current params in core scale (same math as livePaint/_sendAnimatedToBlender)
 function coreParamsForSize() {
   const params = currentParams();
-  const ms_ = paintMaxSize();
-  const eff = (ms_ > 0 ? Math.min(Math.max(srcW, srcH), ms_) : Math.max(srcW, srcH)) / 720;
+  const ms_ = paintTargetLong();
+  const eff = ms_ / 720;
   const s = sscaleFromPos(params.sscale) * eff;
   return {
     brush_len: Math.max(4, Math.round(params.len * s)),
@@ -797,6 +830,34 @@ function coreParamsForSize() {
   };
 }
 
+// Upscale BGRA bytes so the long edge == target (browser bilinear).
+// Needed because the wasm core only downsizes, never upsizes.
+async function upscaleImage(bgra, w, h, targetLong) {
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const ctx = c.getContext("2d");
+  const imgData = ctx.createImageData(w, h);
+  const d = imgData.data;
+  for (let i = 0; i < w * h; i++) {
+    d[i * 4] = bgra[i * 4 + 2]; d[i * 4 + 1] = bgra[i * 4 + 1];
+    d[i * 4 + 2] = bgra[i * 4]; d[i * 4 + 3] = bgra[i * 4 + 3];
+  }
+  ctx.putImageData(imgData, 0, 0);
+  const scale = targetLong / Math.max(w, h);
+  const nw = Math.round(w * scale), nh = Math.round(h * scale);
+  const c2 = document.createElement("canvas");
+  c2.width = nw; c2.height = nh;
+  const ctx2 = c2.getContext("2d");
+  ctx2.imageSmoothingEnabled = true;
+  ctx2.imageSmoothingQuality = "high";
+  ctx2.drawImage(c, 0, 0, nw, nh);
+  const d2 = ctx2.getImageData(0, 0, nw, nh).data;
+  const out = new Uint8Array(nw * nh * 4);
+  for (let i = 0; i < nw * nh * 4; i += 4) {
+    out[i] = d2[i + 2]; out[i + 1] = d2[i + 1]; out[i + 2] = d2[i]; out[i + 3] = d2[i + 3];
+  }
+  return { bytes: out, w: nw, h: nh };
+}
 // File/Blob -> BGRA Uint8Array at full size (same swap as load())
 async function decodeToBgra(blob) {
   const bitmap = await createImageBitmap(blob);
@@ -844,11 +905,19 @@ async function _sendAnimatedToBlender(count = 10) {
   const frames = [];
   if (multi) {
     // each frame paints ALL channels coherently: outer = seed, inner = kind
-    // (bridgeKinds order). decode every queued channel once up front.
+    // (bridgeKinds order). decode every queued channel once up front,
+    // upscale all of them when Image Scale > 1 (core never upsizes)
     const blobs = await Promise.all(Object.values(bridgeImgs).map(o => o.blob));
-    const bgras = await Promise.all(blobs.map(decodeToBgra));
+    let bgras = await Promise.all(blobs.map(decodeToBgra));
+    let aw = srcW, ah = srcH;
+    const target = paintTargetLong();
+    if (target > Math.max(srcW, srcH)) {
+      const ups = await Promise.all(bgras.map(b => upscaleImage(b, srcW, srcH, target)));
+      bgras = ups.map(u => u.bytes);
+      aw = ups[0].w; ah = ups[0].h;
+    }
     for (let i = 0; i <= count; i++) {
-      const { urls } = await wasmPaintMulti(bgras, srcW, srcH, { ...core, seed: baseSeed + i });
+      const { urls } = await wasmPaintMulti(bgras, aw, ah, { ...core, seed: baseSeed + i });
       const one = [];
       for (const url of urls) one.push(await blobToB64(await (await fetch(url)).blob()));
       frames.push(one);
@@ -870,8 +939,14 @@ async function _sendAnimatedToBlender(count = 10) {
   // frame 0 is the current painting
   const blob0 = await (await fetch(paintedURL)).blob();
   frames1.push(await blobToB64(blob0));
+  const target1 = paintTargetLong();
+  let abytes = srcBgrBytes, aW = srcW, aH = srcH;
+  if (target1 > Math.max(srcW, srcH)) {
+    const up = await upscaleImage(srcBgrBytes, srcW, srcH, target1);
+    abytes = up.bytes; aW = up.w; aH = up.h;
+  }
   for (let i = 1; i <= count; i++) {
-    const { url } = await wasmPaint(srcBgrBytes, srcW, srcH, { ...core, seed: baseSeed + i });
+    const { url } = await wasmPaint(abytes, aW, aH, { ...core, seed: baseSeed + i });
     frames1.push(await blobToB64(await (await fetch(url)).blob()));
     const pct = Math.round(i / count * 100);
     $("animBar").style.width = pct + "%";
