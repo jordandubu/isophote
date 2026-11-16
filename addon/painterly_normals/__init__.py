@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 6, 4),
+    "version": (0, 6, 5),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -188,14 +188,18 @@ def _paint_targets_for(kind):
     """(socket, node_name, colorspace) for a kind; normal gets its chain."""
     if kind == 'normal':
         return ('Normal', 'PainterlyNormalsTex', 'Non-Color')
-    if kind in ('orm', 'other'):
-        raise ValueError(f"{kind} is not supported in animated apply — use rough+metal or a static apply")
+    if kind == 'other':
+        raise ValueError("other is not supported in animated apply — pick a real channel")
+    if kind == 'orm':
+        # animated packed map: tex -> Separate Color -> Roughness/Metallic
+        return ('Roughness', 'PainterlyOrmAnimTex', 'Non-Color')
     return _PAINT_TARGETS[kind]
 
 
 def _apply_animated_map(mat, img, start_frame=1, duration=10, kind='normal'):
     """Wire `img` (a SEQUENCE image) into the material for `kind`.
-    normal: tex -> object-space NormalMap -> Normal. Others: tex -> socket."""
+    normal: tex -> object-space NormalMap -> Normal. Others: tex -> socket.
+    orm: tex -> Separate Color -> Roughness/Metallic (packed MR sequence)."""
     if not mat or not mat.use_nodes:
         return
     nt = mat.node_tree
@@ -224,7 +228,7 @@ def _apply_animated_map(mat, img, start_frame=1, duration=10, kind='normal'):
         nt.links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])
         return
 
-    target_socket, node_name, _cs = _PAINT_TARGETS[kind]
+    target_socket, node_name, _cs = _paint_targets_for(kind)
     tex = next((n for n in nt.nodes if n.type == 'TEX_IMAGE' and n.name == node_name), None)
     if tex is None:
         tex = nt.nodes.new('ShaderNodeTexImage')
@@ -235,8 +239,20 @@ def _apply_animated_map(mat, img, start_frame=1, duration=10, kind='normal'):
     tex.image_user.frame_offset = 0
     tex.image_user.use_cyclic = True
     tex.image_user.use_auto_refresh = True
-    y = 220 - 120 * (_PAINT_ORDER[kind] + 1)
+    y = 220 - 120 * (_PAINT_ORDER.get(kind, 0) + 1)
     tex.location = (bsdf.location.x - 400, bsdf.location.y + y)
+    if kind == 'orm':
+        # packed sequence: split G/B into the two scalar sockets
+        sep = next((n for n in nt.nodes if n.type == 'SEPARATE_COLOR'
+                    and n.inputs['Color'].links
+                    and n.inputs['Color'].links[0].from_node.name == node_name), None)
+        if sep is None:
+            sep = nt.nodes.new('ShaderNodeSeparateColor')
+            sep.location = (bsdf.location.x - 200, bsdf.location.y + y)
+            nt.links.new(tex.outputs['Color'], sep.inputs['Color'])
+        nt.links.new(sep.outputs['Green'], bsdf.inputs['Roughness'])
+        nt.links.new(sep.outputs['Blue'], bsdf.inputs['Metallic'])
+        return
     nt.links.new(tex.outputs['Color'], bsdf.inputs[target_socket])
 
 
