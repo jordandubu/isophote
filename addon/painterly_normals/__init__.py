@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 6, 3),
+    "version": (0, 6, 4),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -424,8 +424,16 @@ class PN_OT_apply_from_isophote(bpy.types.Operator):
                     if kind == 'orm':
                         name = _replace_mr_tex(mat, final)
                         if not name:
+                            # no Principled reachable in the top node tree:
+                            # park the image on a named node so the user
+                            # only has to noodle it into their group
+                            nt_ = mat.node_tree
+                            fb = nt_.nodes.new('ShaderNodeTexImage')
+                            fb.name = 'PainterlyOrmTex'
+                            fb.image = bpy.data.images.get('Painterly_ORM')
+                            fb.location = (0, 0)
                             self.report({'WARNING'},
-                                        "No metallic-roughness image node — ORM loaded, wire it manually")
+                                        "No Principled BSDF at the top of the material — ORM image on 'PainterlyOrmTex', wire it manually")
                     elif kind == 'other':
                         _apply_other(mat, final)
                     else:
@@ -912,11 +920,32 @@ def _replace_mr_tex(mat, orm_path):
                 for inp in node.inputs:
                     stack.append(inp)
         return None
+
+    def feeds_bsdf(mrnode):
+        """True when mrnode's Color (directly or via chains) reaches the
+        Metallic/Roughness sockets of bsdf."""
+        stack = [mrnode.outputs['Color']]
+        seen = set()
+        while stack:
+            sock = stack.pop()
+            for link in sock.links:
+                # bpy wrappers are recreated per access: compare by name
+                if (link.to_node.name == bsdf.name
+                        and link.to_socket.name in ('Metallic', 'Roughness')):
+                    return True
+                if link.to_node.name in seen:
+                    continue
+                seen.add(link.to_node.name)
+                for outp in link.to_node.outputs:
+                    stack.append(outp)
+        return False
+
     found = upstream(bsdf.inputs['Metallic']) or upstream(bsdf.inputs['Roughness'])
-    if found:
+    if found and feeds_bsdf(found):
         found.image = img
         return found.name
-    # fallback: dedicated node, wired to both sockets
+    # fallback: dedicated node, wired to both sockets (through Separate Color
+    # so the packed R/G/B channels split correctly)
     tex = next((n for n in nt.nodes
                 if n.type == 'TEX_IMAGE' and n.name == 'PainterlyOrmTex'), None)
     if tex is None:
@@ -924,8 +953,15 @@ def _replace_mr_tex(mat, orm_path):
         tex.name = 'PainterlyOrmTex'
     tex.image = img
     tex.location = (bsdf.location.x - 400, bsdf.location.y - 360)
-    nt.links.new(tex.outputs['Color'], bsdf.inputs['Roughness'])
-    nt.links.new(tex.outputs['Color'], bsdf.inputs['Metallic'])
+    sep = next((n for n in nt.nodes if n.type == 'SEPARATE_COLOR'
+                and n.inputs['Color'].links
+                and n.inputs['Color'].links[0].from_node is tex), None)
+    if sep is None:
+        sep = nt.nodes.new('ShaderNodeSeparateColor')
+        sep.location = (bsdf.location.x - 200, bsdf.location.y - 360)
+        nt.links.new(tex.outputs['Color'], sep.inputs['Color'])
+    nt.links.new(sep.outputs['Green'], bsdf.inputs['Roughness'])
+    nt.links.new(sep.outputs['Blue'], bsdf.inputs['Metallic'])
     return tex.name
 
 
