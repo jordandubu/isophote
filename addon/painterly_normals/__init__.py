@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 6, 1),
+    "version": (0, 6, 2),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -345,7 +345,19 @@ class PN_OT_send_to_isophote(bpy.types.Operator):
                 "pngs": [baked[k] for k in wired],
             }
         _bridge_state["pending_ack"] = False
-        _open_url("https://jordandubu.github.io/isophote/")
+        import urllib.request
+        try:
+            urllib.request.urlopen(
+                "http://127.0.0.1:%d/health" % BRIDGE_PORT,
+                data=b"{}", timeout=1.0)
+        except Exception:
+            self.report({'ERROR'},
+                        "Bridge not reachable on 127.0.0.1:8778 — fully quit "
+                        "and reopen Blender, then paste the isophote URL "
+                        "manually. Queued anyway; the page will pick it up "
+                        "once the bridge is back.")
+            s.status = "Bridge down — queued (restart Blender to unblock)"
+        _open_url("https://jordandubu.github.io/isophote/?bridge=1")
         label = " + ".join(KIND_LABELS.get(k, k) for k in wired)
         s.status = "Sent to isophote — paint it in the browser, then Apply"
         self.report({'INFO'}, f"{label} sent to isophote — paint, click Send to Blender, then Apply")
@@ -1173,6 +1185,9 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
             req = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             return self._reply({"error": "bad json"}, 400)
+
+        if self.path == "/health":           # liveness probe from the send op
+            return self._reply({"ok": True})
 
         if self.path == "/queue":            # Blender -> app
             _bridge_state["pending_png"] = req.get("png")

@@ -606,6 +606,12 @@ const BRIDGE_PORT = 8778;
 const settings = Object.assign(
   { addonBlender: false },
   JSON.parse(localStorage.getItem("isophote_settings") || "{}"));
+// Add-on opens the site with ?bridge=1 -> force the bridge on even if the
+// user never ticked the checkbox (and persist it for future visits)
+if (new URLSearchParams(location.search).has("bridge")) {
+  settings.addonBlender = true;
+  try { localStorage.setItem("isophote_settings", JSON.stringify(settings)); } catch {}
+}
 function saveSettings() {
   localStorage.setItem("isophote_settings", JSON.stringify(settings));
 }
