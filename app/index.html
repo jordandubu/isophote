@@ -226,9 +226,15 @@ input[type=file] { display: none; }
       <button class="vbtn" id="viewOriginal">Input</button>
       <button class="vbtn" id="viewResult">Result</button>
     </div>
-    <div id="chTabs" style="position:absolute; top:64px; left:50%; transform:translateX(-50%);
-      z-index:6; gap:4px; background:rgba(28,28,30,0.85); border:1px solid var(--border);
-      border-radius:8px; padding:3px; display:none;"></div>
+    <div id="chSelectWrap" style="position:absolute; top:60px; left:50%; transform:translateX(-50%);
+      z-index:6; display:none;">
+      <select id="chSelect" style="appearance:none; -webkit-appearance:none;
+        background:rgba(20,20,22,0.88); color:var(--txt); border:1px solid var(--border);
+        border-radius:10px; padding:7px 34px 7px 14px; font-size:12.5px; cursor:pointer;
+        outline:none; box-shadow:0 4px 18px rgba(0,0,0,0.45);
+        background-image:url('data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'10\' height=\'6\' viewBox=\'0 0 10 6\'><path d=\'M1 1l4 4 4-4\' stroke=\'%23aaa\' stroke-width=\'1.5\' fill=\'none\' stroke-linecap=\'round\'/></svg>');
+        background-repeat:no-repeat; background-position:right 12px center;"></select>
+    </div>
     <div id="imgWrap" style="display:none">
       <img id="solo">
       <div id="imgActions">
@@ -535,25 +541,31 @@ function showResult() {
 }
 $("viewOriginal").onclick = showOrig;
 $("viewResult").onclick = showResult;
-/* channel tabs (multi only): switch which painted map the canvas shows.
+/* channel picker (multi only): switch which painted map the canvas shows.
    All channels share stroke geometry, so switching is just a display swap. */
 function buildChannelTabs() {
-  const bar = $("chTabs");
+  const wrap = $("chSelectWrap");
+  const sel = $("chSelect");
   if (!bridgeKinds || !paintedByKind || paintedByKind[activeKind] === undefined) {
-    bar.style.display = "none";
-    bar.innerHTML = "";
+    wrap.style.display = "none";
+    sel.innerHTML = "";
     return;
   }
-  bar.innerHTML = "";
+  sel.innerHTML = "";
   for (const k of bridgeKinds) {
-    const b = document.createElement("button");
-    b.className = "vbtn" + (k === activeKind ? " on" : "");
-    b.textContent = KIND_LABEL[k] || k;
-    b.onclick = () => { activeKind = k; paintViewUrl(); buildChannelTabs(); };
-    bar.appendChild(b);
+    const o = document.createElement("option");
+    o.value = k;
+    o.textContent = KIND_LABEL[k] || k;
+    sel.appendChild(o);
   }
-  bar.style.display = "flex";
+  sel.value = activeKind;
+  wrap.style.display = "";
 }
+$("chSelect").onchange = (e) => {
+  activeKind = e.target.value;
+  paintViewUrl();
+  buildChannelTabs();
+};
 function paintViewUrl() {
   if (!paintedByKind || !activeKind) return;
   const entry = paintedByKind[activeKind];
@@ -590,7 +602,7 @@ $("clear").onclick = () => {
   srcBgrBytes = origURL = paintedURL = null;
   bridgeKinds = null; bridgeImgs = null;
   paintedByKind = null; activeKind = null;
-  $("chTabs").style.display = "none"; $("chTabs").innerHTML = "";
+  $("chSelectWrap").style.display = "none"; $("chSelect").innerHTML = "";
   clearTimeout(liveTimer); liveQueue = false;
   $("imgWrap").style.display = "none";
   $("viewBtns").style.display = "none";
