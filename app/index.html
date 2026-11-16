@@ -223,9 +223,12 @@ input[type=file] { display: none; }
 <main>
   <div id="stage">
     <div id="viewBtns" style="display:none">
-      <button class="vbtn on" id="viewOriginal">Input</button>
+      <button class="vbtn" id="viewOriginal">Input</button>
       <button class="vbtn" id="viewResult">Result</button>
     </div>
+    <div id="chTabs" style="position:absolute; top:64px; left:50%; transform:translateX(-50%);
+      z-index:6; gap:4px; background:rgba(28,28,30,0.85); border:1px solid var(--border);
+      border-radius:8px; padding:3px; display:none;"></div>
     <div id="imgWrap" style="display:none">
       <img id="solo">
       <div id="imgActions">
@@ -532,6 +535,34 @@ function showResult() {
 }
 $("viewOriginal").onclick = showOrig;
 $("viewResult").onclick = showResult;
+/* channel tabs (multi only): switch which painted map the canvas shows.
+   All channels share stroke geometry, so switching is just a display swap. */
+function buildChannelTabs() {
+  const bar = $("chTabs");
+  if (!bridgeKinds || !paintedByKind || paintedByKind[activeKind] === undefined) {
+    bar.style.display = "none";
+    bar.innerHTML = "";
+    return;
+  }
+  bar.innerHTML = "";
+  for (const k of bridgeKinds) {
+    const b = document.createElement("button");
+    b.className = "vbtn" + (k === activeKind ? " on" : "");
+    b.textContent = KIND_LABEL[k] || k;
+    b.onclick = () => { activeKind = k; paintViewUrl(); buildChannelTabs(); };
+    bar.appendChild(b);
+  }
+  bar.style.display = "flex";
+}
+function paintViewUrl() {
+  if (!paintedByKind || !activeKind) return;
+  const entry = paintedByKind[activeKind];
+  if (!entry) return;
+  paintedURL = entry.url;
+  if ($("imgWrap").style.display !== "none") $("solo").src = paintedURL;
+  $("viewResult").classList.add("on");
+  $("viewOriginal").classList.remove("on");
+}
 /* wheel zoom: scroll on the image to zoom, click to reset */
 let imgZoom = 1;
 const imgWrap = $("imgWrap");
@@ -558,6 +589,8 @@ $("clear").onclick = () => {
   imgZoom = 1; imgWrap.classList.remove("zoomed"); imgWrap.style.removeProperty("--zoom");
   srcBgrBytes = origURL = paintedURL = null;
   bridgeKinds = null; bridgeImgs = null;
+  paintedByKind = null; activeKind = null;
+  $("chTabs").style.display = "none"; $("chTabs").innerHTML = "";
   clearTimeout(liveTimer); liveQueue = false;
   $("imgWrap").style.display = "none";
   $("viewBtns").style.display = "none";
@@ -599,6 +632,10 @@ function paintTargetLong() {
   const target = Math.round(Math.max(srcW, srcH) * scale);
   return Math.max(target, Math.min(Math.max(srcW, srcH), 1400));
 }
+// painted results per channel when a multi queue is loaded:
+// { url, srcBytes, w, h } per kind; activeKind is the one shown in view
+let paintedByKind = null;   // null = single-image mode (plain paintedURL)
+let activeKind = null;
 async function livePaint() {
   if (liveBusy) { liveQueue = true; return; }
   liveBusy = true;
@@ -617,7 +654,7 @@ async function livePaint() {
     }
     const eff = t_ / 720;
     const s = sscaleFromPos(params.sscale) * eff;
-    const { url, ms, w: outW_, h: outH_ } = await wasmPaint(inBytes, inW, inH, {
+    const core = {
       brush_len: Math.max(4, Math.round(params.len * s)),
       brush_w: Math.max(1, Math.round(params.width * s)),
       layers: Math.round(params.layers),
@@ -626,7 +663,35 @@ async function livePaint() {
       flow_smooth: Math.max(2, Math.round(params.flow_smooth * s)),
       seed: Math.round(params.seed),
       max_size: t_,
-    });
+    };
+    let url, ms, outW_, outH_;
+    if (bridgeKinds && bridgeImgs) {
+      // stroke replay: paint EVERY channel with the same strokes, keep
+      // each painted result so the tabs can switch between them
+      const blobs = await Promise.all(bridgeKinds.map(k => bridgeImgs[k].blob));
+      let bgras = await Promise.all(blobs.map(decodeToBgra));
+      let mw = inW, mh = inH;
+      if (inW !== srcW || inH !== srcH) {
+        const ups = await Promise.all(bgras.map(b => upscaleImage(b, srcW, srcH, t_)));
+        bgras = ups.map(u => u.bytes);
+        mw = ups[0].w; mh = ups[0].h;
+      }
+      const r = await wasmPaintMulti(bgras, mw, mh, core);
+      ms = r.ms;
+      paintedByKind = {};
+      for (let i = 0; i < bridgeKinds.length; i++) {
+        const u = r.urls[i];
+        paintedByKind[bridgeKinds[i]] = { url: u };
+      }
+      if (!activeKind || !paintedByKind[activeKind]) {
+        activeKind = bridgeKinds[0];
+      }
+      buildChannelTabs();
+      url = paintedByKind[activeKind].url;
+      outW_ = mw; outH_ = mh;
+    } else {
+      ({ url, ms, w: outW_, h: outH_ } = await wasmPaint(inBytes, inW, inH, core));
+    }
     paintedURL = url;
     if ($("imgWrap").style.display !== "none") $("solo").src = paintedURL;
     showResultLight();
@@ -643,6 +708,7 @@ async function livePaint() {
 function showResultLight() {
   $("viewResult").classList.add("on");
   $("viewOriginal").classList.remove("on");
+  buildChannelTabs();
 }
 /* export */
 $("export").onclick = () => {
@@ -722,6 +788,8 @@ async function bridgePoll() {
       try {
         bridgeKinds = d.kinds;
         bridgeImgs = {};
+        paintedByKind = null;
+        activeKind = d.kinds[0];
         d.kinds.forEach((k, i) => {
           const b64 = d.pngs[i];
           bridgeImgs[k] = { b64, blob: b64ToBlob(b64, "image/png") };
@@ -787,7 +855,15 @@ async function sendToBlender() {
         bgras = ups.map(u => u.bytes);
         mw = ups[0].w; mh = ups[0].h;
       }
-      const { urls } = await wasmPaintMulti(bgras, mw, mh, params);
+      // livePaint() already painted with the current params (same seed,
+      // same strokes) — reuse its per-kind results; fall back to a fresh
+      // replay when it hasn't run for this state yet
+      let urls;
+      if (paintedByKind && bridgeKinds.every(k => paintedByKind[k])) {
+        urls = bridgeKinds.map(k => paintedByKind[k].url);
+      } else {
+        ({ urls } = await wasmPaintMulti(bgras, mw, mh, params));
+      }
       const pngs = [];
       for (const url of urls) pngs.push(await blobToB64(await (await fetch(url)).blob()));
       await fetch(bridgeURL("/send_to_blender"), {
