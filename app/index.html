@@ -667,15 +667,29 @@ async function livePaint() {
     let url, ms, outW_, outH_;
     if (bridgeKinds && bridgeImgs) {
       // stroke replay: paint EVERY channel with the same strokes, keep
-      // each painted result so the tabs can switch between them
+      // each painted result so the tabs can switch between them.
+      // Sources may differ in size (mixed bakes/images): normalize every
+      // channel, plus the reference input, to one working size
+      // (inW × inH — the already-upscaled reference target).
       const blobs = await Promise.all(bridgeKinds.map(k => bridgeImgs[k].blob));
-      let bgras = await Promise.all(blobs.map(decodeToBgra));
-      let mw = inW, mh = inH;
-      if (inW !== srcW || inH !== srcH) {
-        const ups = await Promise.all(bgras.map(b => upscaleImage(b, srcW, srcH, t_)));
-        bgras = ups.map(u => u.bytes);
-        mw = ups[0].w; mh = ups[0].h;
+      const dimsPerKind = await Promise.all(blobs.map(async b => {
+        const bm = await createImageBitmap(b);
+        const dims = { w: bm.width, h: bm.height };
+        bm.close();
+        return dims;
+      }));
+      const jobs = [];
+      for (let i = 0; i < bridgeKinds.length; i++) {
+        const d = dimsPerKind[i];
+        if (d.w !== inW || d.h !== inH) {
+          jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, t_);
+        } else {
+          jobs[i] = decodeToBgra(blobs[i]).then(b => ({ bytes: b, w: d.w, h: d.h }));
+        }
       }
+      const ups = await Promise.all(jobs);
+      const bgras = ups.map(u => u.bytes);
+      const mw = ups[0].w, mh = ups[0].h;
       const r = await wasmPaintMulti(bgras, mw, mh, core);
       ms = r.ms;
       paintedByKind = {};
@@ -845,16 +859,29 @@ async function sendToBlender() {
       // derive STRICTLY from bridgeKinds order (Object.values insertion order
     // may diverge from kinds after mixed legacy/multi sessions)
     const blobs = await Promise.all(bridgeKinds.map(k => bridgeImgs[k].blob));
-      let bgras = await Promise.all(blobs.map(decodeToBgra));
-      let mw = srcW, mh = srcH;
-      // Image Scale > 1: upscale every channel so multi paintings match
-      // the live view resolution (the core never upsizes)
-      const target = paintTargetLong();
-      if (target > Math.max(srcW, srcH)) {
-        const ups = await Promise.all(bgras.map(b => upscaleImage(b, srcW, srcH, target)));
-        bgras = ups.map(u => u.bytes);
-        mw = ups[0].w; mh = ups[0].h;
+      // all channels must be one size for the core: normalize to the
+      // reference's working size (same math as livePaint)
+      const dimsK = await Promise.all(blobs.map(async b => {
+        const bm = await createImageBitmap(b);
+        const d = { w: bm.width, h: bm.height };
+        bm.close(); return d;
+      }));
+      const t_ = paintTargetLong();
+      // reference working size = livePaint's inW×inH for srcW×srcH
+      const refW2 = Math.max(srcW, srcH) > t_ ? Math.round(srcW * (t_ / Math.max(srcW, srcH))) : srcW;
+      const refH2 = Math.max(srcW, srcH) > t_ ? Math.round(srcH * (t_ / Math.max(srcW, srcH))) : srcH;
+      const jobs = [];
+      for (let i = 0; i < bridgeKinds.length; i++) {
+        const d = dimsK[i];
+        if (d.w !== refW2 || d.h !== refH2) {
+          jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, t_);
+        } else {
+          jobs[i] = decodeToBgra(blobs[i]).then(b => ({ bytes: b, w: d.w, h: d.h }));
+        }
       }
+      const ups = await Promise.all(jobs);
+      const bgras = ups.map(u => u.bytes);
+      const mw = ups[0].w, mh = ups[0].h;
       // livePaint() already painted with the current params (same seed,
       // same strokes) — reuse its per-kind results; fall back to a fresh
       // replay when it hasn't run for this state yet
@@ -988,14 +1015,28 @@ async function _sendAnimatedToBlender(count = 10) {
     // derive STRICTLY from bridgeKinds order (Object.values insertion order
     // may diverge from kinds after mixed legacy/multi sessions)
     const blobs = await Promise.all(bridgeKinds.map(k => bridgeImgs[k].blob));
-    let bgras = await Promise.all(blobs.map(decodeToBgra));
-    let aw = srcW, ah = srcH;
-    const target = paintTargetLong();
-    if (target > Math.max(srcW, srcH)) {
-      const ups = await Promise.all(bgras.map(b => upscaleImage(b, srcW, srcH, target)));
-      bgras = ups.map(u => u.bytes);
-      aw = ups[0].w; ah = ups[0].h;
+    // all channels must be one size for the core: normalize to the
+    // reference's working size (same math as livePaint)
+    const dimsA = await Promise.all(blobs.map(async b => {
+      const bm = await createImageBitmap(b);
+      const d = { w: bm.width, h: bm.height };
+      bm.close(); return d;
+    }));
+    const tA = paintTargetLong();
+    const refW = Math.max(srcW, srcH) > tA ? Math.round(srcW * (tA / Math.max(srcW, srcH))) : srcW;
+    const refH = Math.max(srcW, srcH) > tA ? Math.round(srcH * (tA / Math.max(srcW, srcH))) : srcH;
+    const jobs = [];
+    for (let i = 0; i < bridgeKinds.length; i++) {
+      const d = dimsA[i];
+      if (d.w !== refW || d.h !== refH) {
+        jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, tA);
+      } else {
+        jobs[i] = decodeToBgra(blobs[i]).then(b => ({ bytes: b, w: d.w, h: d.h }));
+      }
     }
+    const ups = await Promise.all(jobs);
+    const bgras = ups.map(u => u.bytes);
+    const aw = ups[0].w, ah = ups[0].h;
     for (let i = 0; i <= count; i++) {
       const { urls } = await wasmPaintMulti(bgras, aw, ah, { ...core, seed: baseSeed + i });
       const one = [];
