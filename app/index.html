@@ -204,8 +204,11 @@ input[type=file] { display: none; }
   <label id="addonBlenderRow" style="display:flex; align-items:center; gap:8px; font-size:12px; color:var(--txt2); cursor:pointer;">
     <input type="checkbox" id="addonBlender"> Blender bridge
   </label>
-  <div id="bridgeState" style="font-size:11px; color:var(--txt3);"></div>
 </div>
+<div id="bridgeState" style="display:none; position:fixed; top:56px; left:50%; transform:translateX(-50%);
+  z-index:45; background:var(--surface); border:1px solid var(--border); border-radius:999px;
+  padding:6px 16px; font-size:12px; color:var(--txt2);
+  box-shadow:0 4px 18px rgba(0,0,0,0.45); pointer-events:none;"></div>
 <div id="animProgress" style="display:none; position:fixed; inset:0; z-index:60;
   background:rgba(10,10,10,0.75); align-items:center; justify-content:center;">
   <div style="background: var(--surface); border:1px solid var(--border); border-radius:12px;
@@ -629,11 +632,12 @@ function applyAddonState() {
   settings.addonBlender = $("addonBlender").checked;
   $("sendGroup").style.display = settings.addonBlender ? "" : "none";
   $("bridgeSend").disabled = !paintedURL;
+  $("bridgeState").style.display = settings.addonBlender ? "" : "none";
   saveSettings();
   if (settings.addonBlender) startBridgePolling(); else stopBridgePolling();
 }
 $("addonBlender").onchange = applyAddonState;
-if (settings.addonBlender) { $("sendGroup").style.display = ""; }
+if (settings.addonBlender) { $("sendGroup").style.display = ""; $("bridgeState").style.display = ""; }
 /* ============ Blender bridge ============ */
 const bridge = { on: false, inFlight: false };
 let bridgeImagePending = false;   // bridge delivered (or is about to) a Blender image
@@ -704,7 +708,7 @@ async function bridgePoll() {
       }
     }
   } catch (e) {
-    $("bridgeState").textContent = "bridge offline (run: python3 serve.py)";
+    $("bridgeState").textContent = "bridge offline — restart Blender (runs the relay on 127.0.0.1:8778)";
   }
   bridge.inFlight = false;
 }
