@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 6, 2),
+    "version": (0, 6, 3),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -271,51 +271,67 @@ class PN_OT_send_to_isophote(bpy.types.Operator):
         _ensure_default_channel(s)
         rows = s.channels
         baked = {}   # wire kind -> b64
-        for ch in rows:
-            if ch.mode == 'none':
-                continue
-            kind = ch.kind
-            if ch.mode == 'image':
-                if ch.image is None:
-                    self.report({'ERROR'}, f"Channel '{KIND_LABELS.get(kind, kind)}': no image selected")
-                    s.status = "missing image"
-                    return {'CANCELLED'}
-                with open(ch.image.filepath_from_user(), "rb") as f:
-                    baked[kind] = base64.b64encode(f.read()).decode()
-                continue
-            # bake mode
-            if kind == 'other':
-                self.report({'ERROR'}, "'Other' channels use an image — set Source to Image")
-                s.status = "Other needs an image"
-                return {'CANCELLED'}
-            if kind == 'orm':
-                # bake both channels, pack rough+metal into one MR map
-                for sub in ('rough', 'metal'):
-                    path = os.path.join(bpy.app.tempdir, base + KIND_SUFFIX[sub])
-                    err = _bake_map(obj, size, sub, path)
-                    if err:
-                        self.report({'ERROR'}, f"Bake failed ({sub}): {err}")
-                        s.status = f"Bake failed ({sub})"
+        try:
+            for ch in rows:
+                if ch.mode == 'none':
+                    continue
+                kind = ch.kind
+                if ch.mode == 'image':
+                    if ch.image is None:
+                        self.report({'ERROR'}, f"Channel '{KIND_LABELS.get(kind, kind)}': no image selected")
+                        s.status = "missing image"
                         return {'CANCELLED'}
-                orm_path = os.path.join(bpy.app.tempdir, f"{base}_orm_raw.png")
-                err = _pack_orm(os.path.join(bpy.app.tempdir, base + KIND_SUFFIX['rough']),
-                                os.path.join(bpy.app.tempdir, base + KIND_SUFFIX['metal']),
-                                orm_path)
-                if err:
-                    self.report({'ERROR'}, f"ORM pack failed: {err}")
-                    s.status = "ORM pack failed"
+                    # packed images live inside the .blend (no filepath): save
+                    # pixels ourselves; unpacked: read the file directly
+                    img = ch.image
+                    if img.packed_file is not None or not img.filepath_from_user():
+                        path = os.path.join(bpy.app.tempdir, f"{base}_{kind}_source.png")
+                        img.filepath_raw = path
+                        img.file_format = 'PNG'
+                        img.save()
+                    else:
+                        path = img.filepath_from_user()
+                    with open(path, "rb") as f:
+                        baked[kind] = base64.b64encode(f.read()).decode()
+                    continue
+                # bake mode
+                if kind == 'other':
+                    self.report({'ERROR'}, "'Other' channels use an image — set Source to Image")
+                    s.status = "Other needs an image"
                     return {'CANCELLED'}
-                with open(orm_path, "rb") as f:
-                    baked['orm'] = base64.b64encode(f.read()).decode()
-                continue
-            path = os.path.join(bpy.app.tempdir, base + KIND_SUFFIX.get(kind, f'_{kind}.png'))
-            err = _bake_map(obj, size, kind, path)
-            if err:
-                self.report({'ERROR'}, f"Bake failed ({kind}): {err}")
-                s.status = f"Bake failed ({kind})"
-                return {'CANCELLED'}
-            with open(path, "rb") as f:
-                baked[kind] = base64.b64encode(f.read()).decode()
+                if kind == 'orm':
+                    # bake both channels, pack rough+metal into one MR map
+                    for sub in ('rough', 'metal'):
+                        path = os.path.join(bpy.app.tempdir, base + KIND_SUFFIX[sub])
+                        err = _bake_map(obj, size, sub, path)
+                        if err:
+                            self.report({'ERROR'}, f"Bake failed ({sub}): {err}")
+                            s.status = f"Bake failed ({sub})"
+                            return {'CANCELLED'}
+                    orm_path = os.path.join(bpy.app.tempdir, f"{base}_orm_raw.png")
+                    err = _pack_orm(os.path.join(bpy.app.tempdir, base + KIND_SUFFIX['rough']),
+                                    os.path.join(bpy.app.tempdir, base + KIND_SUFFIX['metal']),
+                                    orm_path)
+                    if err:
+                        self.report({'ERROR'}, f"ORM pack failed: {err}")
+                        s.status = "ORM pack failed"
+                        return {'CANCELLED'}
+                    with open(orm_path, "rb") as f:
+                        baked['orm'] = base64.b64encode(f.read()).decode()
+                    continue
+                path = os.path.join(bpy.app.tempdir, base + KIND_SUFFIX.get(kind, f'_{kind}.png'))
+                err = _bake_map(obj, size, kind, path)
+                if err:
+                    self.report({'ERROR'}, f"Bake failed ({kind}): {err}")
+                    s.status = f"Bake failed ({kind})"
+                    return {'CANCELLED'}
+                with open(path, "rb") as f:
+                    baked[kind] = base64.b64encode(f.read()).decode()
+
+        except Exception as e:
+            self.report({'ERROR'}, f"Send failed: {e}")
+            s.status = f"Send failed: {e}"
+            return {'CANCELLED'}
 
         if not baked:
             self.report({'ERROR'}, "No active channels — set at least one row to Bake or Image")

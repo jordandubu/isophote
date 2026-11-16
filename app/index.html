@@ -678,7 +678,7 @@ function applyAddonState() {
   settings.addonBlender = $("addonBlender").checked;
   $("sendGroup").style.display = settings.addonBlender ? "" : "none";
   $("bridgeSend").disabled = !paintedURL;
-  $("bridgeState").style.display = settings.addonBlender ? "" : "none";
+  $("bridgeState").style.display = (settings.addonBlender && bridgeMsg) ? "" : "none";
   saveSettings();
   if (settings.addonBlender) startBridgePolling(); else stopBridgePolling();
 }
@@ -691,7 +691,7 @@ $("bridgeState").__show = (txt) => {
   $("bridgeState").textContent = txt;
   $("bridgeState").style.display = "";
 };
-if (settings.addonBlender) { $("sendGroup").style.display = ""; $("bridgeState").style.display = ""; }
+if (settings.addonBlender) { $("sendGroup").style.display = ""; }
 /* ============ Blender bridge ============ */
 const bridge = { on: false, inFlight: false };
 let bridgeImagePending = false;   // bridge delivered (or is about to) a Blender image
