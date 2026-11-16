@@ -281,7 +281,7 @@ input[type=file] { display: none; }
       <input type="range" id="relief" min="0" max="0.6" step="0.05" value="0.10"></div>
     <div class="slider"><div class="row"><label>Seed<span class="dot" id="d_seed" style="visibility:hidden"></span></label><span class="v" id="v_seed">42</span></div>
       <input type="range" id="seed" min="1" max="200" value="42"></div>
-    <div class="slider"><div class="row"><label>Image Scale<span class="dot" id="d_imgscale" style="visibility:hidden"></span></label><span class="v" id="v_imgscale">1024px</span></div>
+    <div class="slider"><div class="row"><label><input type="checkbox" id="imgscaleOn" checked style="vertical-align:-2px; accent-color:var(--accent);"> Image Scale</label><span style="display:flex; align-items:center; gap:8px;"><span class="v" id="v_imgscale">1024px</span><span class="dot" id="d_imgscale" style="visibility:hidden"></span></span></div>
       <input type="range" id="imgscale" min="0" max="5" step="1" value="2"></div>
   </div>
 </main>
@@ -638,10 +638,13 @@ const IMGSCALE_PX = [256, 512, 1024, 2048, 4096, -1];   // -1 = full size
 const IMGSCALE_LABELS = ["256px", "512px", "1024px", "2048px", "4096px", "MAX"];
 const imgscaleFromPos = pos => IMGSCALE_PX[Math.min(pos, IMGSCALE_PX.length - 1)] ?? 1024;
 function paintTargetLong() {
+  // unchecked: image scale disabled — paint at the source's own resolution
+  if (!$("imgscaleOn").checked) return Math.max(srcW, srcH);
   const target = imgscaleFromPos(+$("imgscale").value);
   if (target <= 0) return Math.max(srcW, srcH);   // MAX: paint at native size
   return Math.max(target, Math.min(Math.max(srcW, srcH), 1400));
 }
+$("imgscaleOn").onchange = () => scheduleLive();
 // painted results per channel when a multi queue is loaded:
 // { url, srcBytes, w, h } per kind; activeKind is the one shown in view
 let paintedByKind = null;   // null = single-image mode (plain paintedURL)
