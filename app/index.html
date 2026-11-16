@@ -636,7 +636,7 @@ let bridgeLastPainted = "";       // hash of last bridge image already painted b
 let bridgeKinds = null;           // ["color","normal",...] when a multi queue is loaded
 let bridgeImgs = null;            // {kind: {b64, blob}} source (unpainted) channels
 const KIND_LABEL = { color: "base color", normal: "normal map", rough: "roughness",
-                     metal: "metallic", emission: "emission" };
+                     metal: "metallic", emission: "emission", orm: "ORM", other: "custom" };
 const kindList = (kinds) => kinds.map(k => KIND_LABEL[k] || k).join(" + ");
 function bridgeURL(path) { return `http://127.0.0.1:${BRIDGE_PORT}${path}`; }
 async function bridgePoll() {
@@ -820,7 +820,7 @@ async function _sendAnimatedToBlender(count = 10) {
     });
     $("animProgress").style.display = "none";
     $("bridgeState").textContent =
-      `sent ${total} frames × ${k} maps — now click 'Apply animated (seeds)' inside Blender`;
+      `sent ${total} frames × ${k} maps — now click 'Apply from Isophote' (Animated checked) inside Blender`;
     return;
   }
   const frames1 = [];
@@ -841,7 +841,7 @@ async function _sendAnimatedToBlender(count = 10) {
     body: JSON.stringify({ anim: frames1 }),
   });
   $("animProgress").style.display = "none";
-  $("bridgeState").textContent = `sent ${frames1.length} frames — now click 'Apply animated (seeds)' inside Blender`;
+  $("bridgeState").textContent = `sent ${frames1.length} frames — now click 'Apply from Isophote' (Animated checked) inside Blender`;
 }
 /* dropdown wiring */
 $("sendCaret").onclick = (e) => { e.stopPropagation();

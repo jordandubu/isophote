@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 5, 1),
+    "version": (0, 6, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -16,13 +16,14 @@ import shutil
 import threading
 import http.server
 import webbrowser
-from bpy.props import StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty
+from bpy.props import StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty, PointerProperty, CollectionProperty
 
 AUTO_NAME = {}   # tracks the last auto-filled Name so user edits are kept
 
 KIND_LABELS = {
     'normal': 'normal map', 'color': 'base color', 'rough': 'roughness',
-    'metal': 'metallic', 'emission': 'emission',
+    'metal': 'metallic', 'emission': 'emission', 'orm': 'ORM',
+    'other': 'custom',
 }
 
 
@@ -42,6 +43,15 @@ class PN_OT_apply_animated_from_isophote(bpy.types.Operator):
     bl_idname = "painterly.apply_animated_from_isophote"
     bl_label = "Apply animated from Isophote"
     bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def _apply_from(cls, context, report_op):
+        """Entry used by 'Apply from Isophote' when Animated is checked."""
+        try:
+            return bpy.ops.painterly.apply_animated_from_isophote()
+        except RuntimeError as e:   # reported ERROR/WARNING path
+            report_op.report({'ERROR'}, str(e).replace("Error: ", ""))
+            return {'CANCELLED'}
 
     def execute(self, context):
         scene = context.scene
@@ -155,10 +165,31 @@ class PN_OT_apply_animated_from_isophote(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _apply_other(mat, path):
+    """Load the painted 'Other' map as an UNWIRED image node the user can
+    noodle wherever they want."""
+    nt = mat.node_tree
+    dname = "Painterly_Other"
+    prev = bpy.data.images.get(dname)
+    if prev:
+        bpy.data.images.remove(prev)
+    img = bpy.data.images.load(path, check_existing=False)
+    img.name = dname
+    tex = next((n for n in nt.nodes if n.name == "PainterlyOtherTex"), None)
+    if tex is None:
+        tex = nt.nodes.new('ShaderNodeTexImage')
+        tex.name = "PainterlyOtherTex"
+        bx = next((n.location.x for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), 0)
+        tex.location = (bx - 400, -480)
+    tex.image = img
+
+
 def _paint_targets_for(kind):
     """(socket, node_name, colorspace) for a kind; normal gets its chain."""
     if kind == 'normal':
         return ('Normal', 'PainterlyNormalsTex', 'Non-Color')
+    if kind in ('orm', 'other'):
+        raise ValueError(f"{kind} is not supported in animated apply — use rough+metal or a static apply")
     return _PAINT_TARGETS[kind]
 
 
@@ -210,20 +241,13 @@ def _apply_animated_map(mat, img, start_frame=1, duration=10, kind='normal'):
 
 
 KIND_SUFFIX = {'normal': '_normal.png', 'color': '_color.png', 'rough': '_rough.png',
-               'metal': '_metal.png', 'emission': '_emission.png'}
-KIND_PROP = {'color': 'bake_color', 'rough': 'bake_rough',
-             'metal': 'bake_metallic', 'emission': 'bake_emission'}
+               'metal': '_metal.png', 'emission': '_emission.png', 'other': '_other.png'}
 # order used for kinds array on the wire (color first as replay reference)
-KIND_ORDER = ['color', 'normal', 'rough', 'metal', 'emission']
-
-
-def _selected_kinds(s):
-    """Checked + enabled kinds in wire order ('normal' always included)."""
-    return [k for k in KIND_ORDER if k == 'normal' or getattr(s, KIND_PROP[k])]
+KIND_ORDER = ['color', 'normal', 'rough', 'metal', 'emission', 'orm', 'other']
 
 
 class PN_OT_send_to_isophote(bpy.types.Operator):
-    """Bake the selected maps and send them to the isophote web app for painting"""
+    """Bake/send the channels configured in 'To Isophote' to the isophote web app"""
 
     bl_idname = "painterly.send_to_isophote"
     bl_label = "Send to Isophote"
@@ -244,10 +268,46 @@ class PN_OT_send_to_isophote(bpy.types.Operator):
 
         import os
         size = int(s.tex_size)
-        kinds = _selected_kinds(s)
-        baked = {}
-        for kind in kinds:
-            path = os.path.join(bpy.app.tempdir, base + KIND_SUFFIX[kind])
+        rows = _channel_rows(s)
+        baked = {}   # wire kind -> b64
+        for ch in rows:
+            if ch.mode == 'none':
+                continue
+            kind = ch.kind
+            if ch.mode == 'image':
+                if ch.image is None:
+                    self.report({'ERROR'}, f"Channel '{KIND_LABELS.get(kind, kind)}': no image selected")
+                    s.status = "missing image"
+                    return {'CANCELLED'}
+                with open(ch.image.filepath_from_user(), "rb") as f:
+                    baked[kind] = base64.b64encode(f.read()).decode()
+                continue
+            # bake mode
+            if kind == 'other':
+                self.report({'ERROR'}, "'Other' channels use an image — set Source to Image")
+                s.status = "Other needs an image"
+                return {'CANCELLED'}
+            if kind == 'orm':
+                # bake both channels, pack rough+metal into one MR map
+                for sub in ('rough', 'metal'):
+                    path = os.path.join(bpy.app.tempdir, base + KIND_SUFFIX[sub])
+                    err = _bake_map(obj, size, sub, path)
+                    if err:
+                        self.report({'ERROR'}, f"Bake failed ({sub}): {err}")
+                        s.status = f"Bake failed ({sub})"
+                        return {'CANCELLED'}
+                orm_path = os.path.join(bpy.app.tempdir, f"{base}_orm_raw.png")
+                err = _pack_orm(os.path.join(bpy.app.tempdir, base + KIND_SUFFIX['rough']),
+                                os.path.join(bpy.app.tempdir, base + KIND_SUFFIX['metal']),
+                                orm_path)
+                if err:
+                    self.report({'ERROR'}, f"ORM pack failed: {err}")
+                    s.status = "ORM pack failed"
+                    return {'CANCELLED'}
+                with open(orm_path, "rb") as f:
+                    baked['orm'] = base64.b64encode(f.read()).decode()
+                continue
+            path = os.path.join(bpy.app.tempdir, base + KIND_SUFFIX.get(kind, f'_{kind}.png'))
             err = _bake_map(obj, size, kind, path)
             if err:
                 self.report({'ERROR'}, f"Bake failed ({kind}): {err}")
@@ -255,8 +315,14 @@ class PN_OT_send_to_isophote(bpy.types.Operator):
                 return {'CANCELLED'}
             with open(path, "rb") as f:
                 baked[kind] = base64.b64encode(f.read()).decode()
-        # replay reference: color if present, else first selected in wire order
-        ordered = [k for k in KIND_ORDER if k in baked]
+
+        if not baked:
+            self.report({'ERROR'}, "No active channels — set at least one row to Bake or Image")
+            return {'CANCELLED'}
+
+        # replay reference: color before normal, else wire order
+        wired = [k for k in KIND_ORDER if k in baked]
+        wired += [k for k in baked if k not in wired]
 
         # queue for the web app (embedded relay, in-process); 1 channel keeps
         # the legacy {png} shape for old pages
@@ -265,8 +331,8 @@ class PN_OT_send_to_isophote(bpy.types.Operator):
         _bridge_state["result_kind"] = None
         _bridge_state["result_anim"] = None
         _bridge_state["result_anim_kinds"] = None
-        if len(ordered) == 1:
-            kind = ordered[0]
+        if len(wired) == 1:
+            kind = wired[0]
             _bridge_state["pending_png"] = baked[kind]
             _bridge_state["pending_kind"] = kind
         else:
@@ -274,12 +340,12 @@ class PN_OT_send_to_isophote(bpy.types.Operator):
             _bridge_state["pending_kind"] = None
             _bridge_state["pending_multi"] = {
                 "kind": "multi",
-                "kinds": ordered,
-                "pngs": [baked[k] for k in ordered],
+                "kinds": wired,
+                "pngs": [baked[k] for k in wired],
             }
         _bridge_state["pending_ack"] = False
         _open_url("https://jordandubu.github.io/isophote/")
-        label = " + ".join(KIND_LABELS[k] for k in ordered)
+        label = " + ".join(KIND_LABELS.get(k, k) for k in wired)
         s.status = "Sent to isophote — paint it in the browser, then Apply"
         self.report({'INFO'}, f"{label} sent to isophote — paint, click Send to Blender, then Apply")
         return {'FINISHED'}
@@ -297,6 +363,8 @@ class PN_OT_apply_from_isophote(bpy.types.Operator):
         s = scene.painterly_settings
         base = s.tex_name.strip() or "Painterly"
 
+        if s.apply_animated:
+            return PN_OT_apply_animated_from_isophote._apply_from(context, self)
         kinds = _bridge_state.get("result_kinds")
         if kinds:
             pngs = _bridge_state.get("result_pngs") or []
@@ -321,15 +389,22 @@ class PN_OT_apply_from_isophote(bpy.types.Operator):
                     if final is None:
                         return {'CANCELLED'}
                 kind_final[kind] = final
-                if kind in ('rough', 'metal'):
+                # normal was wired by _normal_chain; rough/metal are held
+                # back for ORM packing (below); orm/other wire directly
+                if kind not in ('rough', 'metal', 'normal'):
+                    if kind == 'orm':
+                        name = _replace_mr_tex(mat, final)
+                        if not name:
+                            self.report({'WARNING'},
+                                        "No metallic-roughness image node — ORM loaded, wire it manually")
+                    elif kind == 'other':
+                        _apply_other(mat, final)
+                    else:
+                        _apply_paint(mat, final, kind)
                     applied.append(KIND_LABELS[kind])
-                else:
-                    _apply_paint(mat, final, kind)
-                    applied.append(KIND_LABELS[kind])
-            # both channels painted -> merge into one packed MR map and swap
-            # it into the existing metallic-roughness image node (keeps the
-            # Separate Color wiring; only rough OR metal -> direct sockets)
             if 'rough' in kind_final and 'metal' in kind_final:
+                # two separate painted maps -> merge into one packed MR map
+                # and swap it into the user's existing MR image node
                 orm_path = os.path.join(bpy.app.tempdir, f"{base}_orm.png")
                 err = _pack_orm(kind_final['rough'], kind_final['metal'], orm_path)
                 if err:
@@ -746,83 +821,83 @@ def _replace_mr_tex(mat, orm_path):
     return tex.name
 
 
-# ------------------------------------------------------------- preview
-class PN_OT_preview_bake(bpy.types.Operator):
-    """Show the baked maps"""
-    bl_idname = "painterly.preview_bake"
-    bl_label = ""
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        s = context.scene.painterly_settings
-        base = s.tex_name.strip() or "Painterly"
-        for kind in _selected_kinds(s):
-            path = os.path.join(bpy.app.tempdir, base + KIND_SUFFIX[kind])
-            if not os.path.isfile(path):
-                self.report({'ERROR'}, f"No bake found at {path}. Run Send to Isophote first.")
-                return {'CANCELLED'}
-            return _open_view(path, f"Baked {KIND_LABELS[kind]}")
-        return {'CANCELLED'}
-
-
-class PN_OT_preview_result(bpy.types.Operator):
-    """Show the AI-painted normal"""
-    bl_idname = "painterly.preview_result"
-    bl_label = ""
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        s = context.scene.painterly_settings
-        base = s.tex_name.strip() or "Painterly"
-        for kind in _selected_kinds(s):
-            if kind == 'normal':
-                path = os.path.join(bpy.app.tempdir, base + "_ai.png")
-                name = "Painted"
-            else:
-                path = os.path.join(bpy.app.tempdir, f"{base}_{kind}_painted.png")
-                name = f"Painted {KIND_LABELS[kind]}"
-            if not os.path.isfile(path):
-                self.report({'ERROR'}, f"No painted result at {path}. Run Send to Isophote first.")
-                return {'CANCELLED'}
-            return _open_view(path, name)
-        return {'CANCELLED'}
-
-
-def _open_view(path, title):
-    if not os.path.isfile(path):
-        return {'CANCELLED'}
-    name = "PainterlyPreview_" + os.path.basename(path)
-    old = bpy.data.images.get(name)
-    if old:
-        bpy.data.images.remove(old)
-    img = bpy.data.images.load(path, check_existing=False)
-    img.name = name
-    try:
-        # new window: duplicate current area into image editor
-        for area in bpy.context.screen.areas:
-            if area.type == 'IMAGE_EDITOR':
-                break
-        else:
-            # change most area to image editor temporarily? simplest: open as new window
-            pass
-    except Exception:
-        pass
-    # Simplest robust approach: reuse an IMAGE_EDITOR area if present, else convert one
-    area = next((a for a in bpy.context.screen.areas if a.type == 'IMAGE_EDITOR'), None)
-    if area is None:
-        # convert a Spreadsheet area if exists else any
-        src = next((a for a in bpy.context.screen.areas if a.type not in ('VIEW_3D',)), None) or bpy.context.screen.areas[-1]
-        with bpy.context.temp_override(area=src):
-            bpy.ops.screen.area_type(type='IMAGE_EDITOR')
-        area = src
-    space = area.spaces.active
-    space.image = img
-    space.ui_mode = 'VIEW'
-    return {'FINISHED'}
-
-
-
 # ------------------------------------------------------------- scene props
+# ------------------------------------------------------------- channels
+CHANNEL_KINDS = [
+    ('normal', "Normal", "Object-space normal map (the headline feature)"),
+    ('color', "Base Color", "Diffuse albedo bake"),
+    ('rough', "Roughness", "Roughness map"),
+    ('metal', "Metallic", "Metallic map"),
+    ('orm', "ORM", "Packed MetallicRoughness (R=AO slot white, G=rough, B=metal) "
+             "- bakes rough+metal and packs them like your single MR map"),
+    ('emission', "Emission", "Emission color map"),
+    ('other', "Other", "Any image you pick yourself - wired as an unwired "
+              "PainterlyOtherTex node you can noodle into anything"),
+]
+_CHANNEL_MODES = [
+    ('bake', "Bake", "Bake this channel from the material"),
+    ('image', "Image", "Use an existing image instead of baking"),
+    ('none', "None", "Skip this channel"),
+]
+
+
+class PN_channel(bpy.types.PropertyGroup):
+    kind: EnumProperty(
+        name="Channel",
+        items=CHANNEL_KINDS,
+        default='normal',
+        description="Which map this row paints",
+    )
+    mode: EnumProperty(
+        name="Source",
+        items=_CHANNEL_MODES,
+        default='bake',
+        description="Bake from the material, use an existing image, or skip",
+    )
+    image: PointerProperty(
+        name="Image",
+        type=bpy.types.Image,
+        description="Image to send when Source is Image",
+    )
+
+
+class PN_OT_channel_add(bpy.types.Operator):
+    """Add a channel row"""
+    bl_idname = "painterly.channel_add"
+    bl_label = "Add channel"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.painterly_settings
+        if len(s.channels) >= len(CHANNEL_KINDS):
+            self.report({'WARNING'}, "All channel kinds already in use")
+            return {'CANCELLED'}
+        used = {ch.kind for ch in s.channels}
+        kind = next(k for k, _n, _d in CHANNEL_KINDS if k not in used)
+        row = s.channels.add()
+        row.kind = kind
+        row.mode = 'none'
+        s.channels_index = len(s.channels) - 1
+        return {'FINISHED'}
+
+
+class PN_OT_channel_remove(bpy.types.Operator):
+    """Remove this channel row"""
+    bl_idname = "painterly.channel_remove"
+    bl_label = "Remove channel"
+    bl_options = {'REGISTER', 'UNDO'}
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        s = context.scene.painterly_settings
+        if len(s.channels) <= 1:
+            self.report({'WARNING'}, "Keep at least one channel row")
+            return {'CANCELLED'}
+        s.channels.remove(self.index)
+        s.channels_index = min(s.channels_index, len(s.channels) - 1)
+        return {'FINISHED'}
+
+
 class PN_scene_settings(bpy.types.PropertyGroup):
     tex_name: StringProperty(
         name="Texture Name",
@@ -845,21 +920,12 @@ class PN_scene_settings(bpy.types.PropertyGroup):
         name="Renormalize Painted Output", default=True,
         description="Re-project AI pixels to valid normal vectors",
     )
-    bake_color: BoolProperty(
-        name="Base Color", default=False,
-        description="Also bake and paint the Base Color (diffuse albedo) map",
-    )
-    bake_rough: BoolProperty(
-        name="Roughness", default=False,
-        description="Also bake and paint the Roughness map",
-    )
-    bake_metallic: BoolProperty(
-        name="Metallic", default=False,
-        description="Also bake and paint the Metallic map",
-    )
-    bake_emission: BoolProperty(
-        name="Emission", default=False,
-        description="Also bake and paint the Emission map",
+    channels: CollectionProperty(type=PN_channel)
+    channels_index: IntProperty(default=0)
+    apply_animated: BoolProperty(
+        name="Animated", default=False,
+        description="Apply as an animated image sequence (requires a "
+                    "'Send animated' painting from isophote)",
     )
     strokes_coherent: BoolProperty(
         name="Same Brushstrokes", default=True,
@@ -880,79 +946,71 @@ class PN_PT_panel(bpy.types.Panel):
 
     bl_order = 0
 
-    @staticmethod
-    def _principled(mat):
-        """First Principled BSDF of the material tree (same rule as apply)."""
-        if not mat or not mat.use_nodes:
-            return None
-        return next((n for n in mat.node_tree.nodes
-                     if n.type == 'BSDF_PRINCIPLED'), None)
-
-    @staticmethod
-    def _has_input(bsdf, socket_name, default, tol=0.01):
-        """Socket is 'real': linked, or default differs from its flat value."""
-        if bsdf is None:
-            return False
-        sock = bsdf.inputs.get(socket_name)
-        if sock is None:
-            return False
-        if sock.is_linked:
-            return True
-        dv = sock.default_value
-        if isinstance(default, tuple):
-            return any(abs(dv[i] - default[i]) > tol for i in range(len(default)))
-        return abs(float(dv) - default) > tol
-
     def draw(self, context):
         layout = self.layout
         obj = context.active_object
         mat = obj.active_material if obj else None
         layout.label(text="Material: " + (mat.name if mat else "none"))
-
         s = context.scene.painterly_settings
-        # auto-fill happens in the timer (ID-property writes are not allowed
-        # during UI draw); draw only reads
-        bsdf = self._principled(mat)
-
-        # --- channel table: checkbox per map; only enable what's real ---
-        box = layout.box()
-        box.label(text="Maps to paint:")
-        if bsdf is None:
-            box.label(text="needs Principled BSDF", icon='ERROR')
-        else:
-            # normal: always available (the headline feature)
-            box.label(text="✓ Normal map", icon='CHECKMARK')
-            row = box.row()
-            row.enabled = self._has_input(bsdf, 'Base Color', (0.8, 0.8, 0.8, 1.0))
-            row.prop(s, "bake_color")
-            row = box.row()
-            row.enabled = self._has_input(bsdf, 'Roughness', 0.5)
-            row.prop(s, "bake_rough")
-            row = box.row()
-            row.enabled = self._has_input(bsdf, 'Metallic', 0.0)
-            row.prop(s, "bake_metallic")
-            emi = (bsdf.inputs.get('Emission Strength') is not None
-                   and bsdf.inputs['Emission Strength'].default_value > 0.0) or \
-                  self._has_input(bsdf, 'Emission Color', (1.0, 1.0, 1.0, 1.0), 0.001)
-            row = box.row()
-            row.enabled = emi
-            row.prop(s, "bake_emission")
-            box.prop(s, "strokes_coherent")
-
-        n = 1 + sum(1 for p in ("bake_color", "bake_rough", "bake_metallic",
-                                "bake_emission") if getattr(s, p))
-        layout.operator(PN_OT_send_to_isophote.bl_idname,
-                        text=f"Send to Isophote ({n} map{'s' if n != 1 else ''})")
-        layout.operator(PN_OT_apply_from_isophote.bl_idname, text="Apply from Isophote")
-        layout.operator(PN_OT_apply_animated_from_isophote.bl_idname, text="Apply animated (seeds)")
-        row = layout.row(align=True)
-        row.operator(PN_OT_preview_bake.bl_idname, text="👁 Baked")
-        row.operator(PN_OT_preview_result.bl_idname, text="👁 Painted")
+        row = layout.row()
+        row.scale_y = 1.8
+        row.operator(PN_OT_send_to_isophote.bl_idname, text="Send to Isophote")
         if s.status:
             layout.label(text=s.status, icon='TIME')
 
+
+def _channel_rows(s):
+    """Active channel rows; lazily creates the single default Normal row."""
+    if len(s.channels) == 0:
+        s.channels.add()          # default: one Normal / Bake row
+        s.channels[0].kind = 'normal'
+        s.channels[0].mode = 'bake'
+    return s.channels
+
+
+class PN_PT_to_isophote(bpy.types.Panel):
+    bl_label = "To Isophote"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Painterly"
+    bl_parent_id = "PN_PT_panel"
+    bl_order = 1
+    bl_options = set()
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.painterly_settings
+        rows = _channel_rows(s)
+        for i, ch in enumerate(rows):
+            box = layout.box()
+            row = box.row(align=True)
+            row.prop(ch, "kind", text="")
+            row.prop(ch, "mode", text="")
+            row.operator(PN_OT_channel_remove.bl_idname, text="",
+                         icon='X').index = i
+            if ch.mode == 'image' and ch.kind != 'normal':
+                box.prop(ch, "image")
+        row = layout.row(align=True)
+        row.operator(PN_OT_channel_add.bl_idname, text="", icon='ADD')
+        layout.prop(s, "strokes_coherent")
         layout.prop(s, "tex_name", text="Name")
         layout.prop(s, "tex_size")
+
+
+class PN_PT_from_isophote(bpy.types.Panel):
+    bl_label = "From Isophote"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Painterly"
+    bl_parent_id = "PN_PT_panel"
+    bl_order = 2
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.painterly_settings
+        col = layout.column(align=True)
+        col.operator(PN_OT_apply_from_isophote.bl_idname, text="Apply from Isophote")
+        col.prop(s, "apply_animated")
 
 
 class PN_PT_misc(bpy.types.Panel):
@@ -961,7 +1019,7 @@ class PN_PT_misc(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "Painterly"
     bl_parent_id = "PN_PT_panel"
-    bl_order = 1
+    bl_order = 3
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
@@ -971,13 +1029,16 @@ class PN_PT_misc(bpy.types.Panel):
 
 
 classes = (
-    PN_OT_preview_bake,
-    PN_OT_preview_result,
+    PN_channel,
     PN_scene_settings,
+    PN_OT_channel_add,
+    PN_OT_channel_remove,
     PN_OT_send_to_isophote,
     PN_OT_apply_from_isophote,
     PN_OT_apply_animated_from_isophote,
     PN_PT_panel,
+    PN_PT_to_isophote,
+    PN_PT_from_isophote,
     PN_PT_misc,
 )
 
@@ -1163,11 +1224,11 @@ def _autofill_name():
                            + " waiting — click 'Apply from Isophote'")
             elif _bridge_state.get("result_anim_kinds"):
                 waiting = (", ".join(KIND_LABELS[k] for k in _bridge_state["result_anim_kinds"])
-                           + " animated frames waiting — click 'Apply animated (seeds)'")
+                           + " animated frames waiting — click 'Apply from Isophote'")
             elif _bridge_state.get("result_png"):
                 waiting = "frame waiting — click 'Apply from Isophote'"
             elif _bridge_state.get("result_anim"):
-                waiting = "animated frames waiting — click 'Apply animated (seeds)'"
+                waiting = "animated frames waiting — click 'Apply from Isophote'"
             else:
                 waiting = ""
             s.status = waiting if waiting else (
