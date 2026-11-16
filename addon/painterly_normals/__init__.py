@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 6, 5),
+    "version": (0, 6, 6),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -1066,7 +1066,8 @@ class PN_scene_settings(bpy.types.PropertyGroup):
         maxlen=120,
     )
     tex_size: EnumProperty(
-        name="Texture Size",
+        name="Baked Texture Size",
+        description="Resolution for BAKE-mode channels only; image-mode rows keep their own image size",
         items=[
             ('256', "256px", "256 x 256"),
             ('512', "512px", "512 x 512"),
