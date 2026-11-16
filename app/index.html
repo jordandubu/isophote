@@ -695,14 +695,15 @@ async function livePaint() {
       for (let i = 0; i < bridgeKinds.length; i++) {
         const d = dimsPerKind[i];
         if (d.w !== inW || d.h !== inH) {
-          jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, t_);
+          // exact destination = reference working dims (aspect-true)
+          jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, t_, inW, inH);
         } else {
           jobs[i] = decodeToBgra(blobs[i]).then(b => ({ bytes: b, w: d.w, h: d.h }));
         }
       }
       const ups = await Promise.all(jobs);
       const bgras = ups.map(u => u.bytes);
-      const mw = ups[0].w, mh = ups[0].h;
+      const mw = inW, mh = inH;
       const r = await wasmPaintMulti(bgras, mw, mh, core);
       ms = r.ms;
       paintedByKind = {};
@@ -887,14 +888,14 @@ async function sendToBlender() {
       for (let i = 0; i < bridgeKinds.length; i++) {
         const d = dimsK[i];
         if (d.w !== refW2 || d.h !== refH2) {
-          jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, t_);
+          jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, t_, refW2, refH2);
         } else {
           jobs[i] = decodeToBgra(blobs[i]).then(b => ({ bytes: b, w: d.w, h: d.h }));
         }
       }
       const ups = await Promise.all(jobs);
       const bgras = ups.map(u => u.bytes);
-      const mw = ups[0].w, mh = ups[0].h;
+      const mw = refW2, mh = refH2;
       // livePaint() already painted with the current params (same seed,
       // same strokes) — reuse its per-kind results; fall back to a fresh
       // replay when it hasn't run for this state yet
@@ -950,7 +951,9 @@ function coreParamsForSize() {
 
 // Upscale BGRA bytes so the long edge == target (browser bilinear).
 // Needed because the wasm core only downsizes, never upsizes.
-async function upscaleImage(bgra, w, h, targetLong) {
+async function upscaleImage(bgra, w, h, targetLong, outW, outH) {
+  // outW/outH: exact destination dims (keep each channel's relative size).
+  // Without them: scale the image's own long edge to targetLong.
   const c = document.createElement("canvas");
   c.width = w; c.height = h;
   const ctx = c.getContext("2d");
@@ -961,8 +964,10 @@ async function upscaleImage(bgra, w, h, targetLong) {
     d[i * 4 + 2] = bgra[i * 4]; d[i * 4 + 3] = bgra[i * 4 + 3];
   }
   ctx.putImageData(imgData, 0, 0);
-  const scale = targetLong / Math.max(w, h);
-  const nw = Math.round(w * scale), nh = Math.round(h * scale);
+  // outW/outH: stretch independently so ANY source lands on the exact
+  // reference rect; otherwise scale own long edge to targetLong
+  const nw = outW || Math.round(w * (targetLong / Math.max(w, h)));
+  const nh = outH || Math.round(h * (targetLong / Math.max(w, h)));
   const c2 = document.createElement("canvas");
   c2.width = nw; c2.height = nh;
   const ctx2 = c2.getContext("2d");
@@ -1042,14 +1047,14 @@ async function _sendAnimatedToBlender(count = 10) {
     for (let i = 0; i < bridgeKinds.length; i++) {
       const d = dimsA[i];
       if (d.w !== refW || d.h !== refH) {
-        jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, tA);
+        jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, tA, refW, refH);
       } else {
         jobs[i] = decodeToBgra(blobs[i]).then(b => ({ bytes: b, w: d.w, h: d.h }));
       }
     }
     const ups = await Promise.all(jobs);
     const bgras = ups.map(u => u.bytes);
-    const aw = ups[0].w, ah = ups[0].h;
+    const aw = refW, ah = refH;
     for (let i = 0; i <= count; i++) {
       const { urls } = await wasmPaintMulti(bgras, aw, ah, { ...core, seed: baseSeed + i });
       const one = [];
