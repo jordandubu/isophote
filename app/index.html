@@ -637,12 +637,34 @@ function currentParams() {
 const IMGSCALE_PX = [256, 512, 1024, 2048, 4096, -1];   // -1 = full size
 const IMGSCALE_LABELS = ["256px", "512px", "1024px", "2048px", "4096px", "MAX"];
 const imgscaleFromPos = pos => IMGSCALE_PX[Math.min(pos, IMGSCALE_PX.length - 1)] ?? 1024;
-function paintTargetLong() {
+// Multi-channel reference rect = the channel with the LONGEST edge (first
+// wins on ties). Every other channel is stretched to this rect, so no small
+// source image can shrink the whole batch. Cached; null = no multi queue.
+let multiRef = null;
+function multiRefVal() { return multiRef; }
+async function multiRefRect() {
+  if (!(bridgeKinds && bridgeImgs)) return null;
+  const blobs = await Promise.all(bridgeKinds.map(k => bridgeImgs[k].blob));
+  const dims = await Promise.all(blobs.map(async b => {
+    const bm = await createImageBitmap(b);
+    const d = { w: bm.width, h: bm.height };
+    bm.close(); return d;
+  }));
+  let best = 0;
+  for (let i = 1; i < dims.length; i++)
+    if (Math.max(dims[i].w, dims[i].h) > Math.max(dims[best].w, dims[best].h)) best = i;
+  multiRef = { refW: dims[best].w, refH: dims[best].h, refLong: Math.max(dims[best].w, dims[best].h) };
+  return multiRef;
+}
+function paintTargetLong(refW) {
+  // refW: optional long edge of the multi reference rect (multi mode);
+  // null/undefined = use the page's loaded source (single-image mode)
+  const L = refW == null ? Math.max(srcW, srcH) : refW;
   // unchecked: image scale disabled — paint at the source's own resolution
-  if (!$("imgscaleOn").checked) return Math.max(srcW, srcH);
+  if (!$("imgscaleOn").checked) return L;
   const target = imgscaleFromPos(+$("imgscale").value);
-  if (target <= 0) return Math.max(srcW, srcH);   // MAX: paint at native size
-  return Math.max(target, Math.min(Math.max(srcW, srcH), 1400));
+  if (target <= 0) return L;                      // MAX: paint at native size
+  return Math.max(target, Math.min(L, 1400));
 }
 $("imgscaleOn").onchange = () => scheduleLive();
 // painted results per channel when a multi queue is loaded:
@@ -658,10 +680,15 @@ async function livePaint() {
     // strokes are sized in pixels; keep them proportional to the picture:
     // the core downscales the input to max_size (long edge) before painting,
     // 720 is the reference size where the default sliders were tuned
-    const t_ = paintTargetLong();
+    const ref = multiRefVal();
+    const t_ = paintTargetLong(ref ? ref.refLong : null);
     // the core only downsizes; to paint ABOVE source res, pre-upscale here
     let inBytes = srcBgrBytes, inW = srcW, inH = srcH;
-    if (t_ > Math.max(srcW, srcH)) {
+    if (ref) {
+      // multi: working rect = reference rect, aspect-true when scaled
+      inW = ref.refLong > t_ ? Math.round(ref.refW * (t_ / ref.refLong)) : ref.refW;
+      inH = ref.refLong > t_ ? Math.round(ref.refH * (t_ / ref.refLong)) : ref.refH;
+    } else if (t_ > Math.max(srcW, srcH)) {
       const up = await upscaleImage(srcBgrBytes, srcW, srcH, t_);
       inBytes = up.bytes; inW = up.w; inH = up.h;
     }
@@ -817,6 +844,7 @@ async function bridgePoll() {
         bridgeKinds = d.kinds;
         bridgeImgs = {};
         paintedByKind = null;
+        multiRef = null;
         activeKind = d.kinds[0];
         d.kinds.forEach((k, i) => {
           const b64 = d.pngs[i];
@@ -825,6 +853,10 @@ async function bridgePoll() {
         $("bridgeState").__show(
           `received ${kindList(d.kinds)} — painting ${KIND_LABEL[d.kinds[0]] || d.kinds[0]} in view, all on send…`);
         await load(bridgeImgs[d.kinds[0]].blob);   // reference through the normal path
+        // load() overwrites srcW/srcH with kinds[0]'s dims; re-pin them to
+        // the LARGEST channel so brush math matches the working rect
+        const ref = await multiRefRect();
+        srcW = ref.refW; srcH = ref.refH;
         await livePaint();
         bridgeLastPainted = h;
         fetch(bridgeURL("/ack"), { method: "POST", body: "{}" }).catch(() => {});
@@ -880,10 +912,11 @@ async function sendToBlender() {
         const d = { w: bm.width, h: bm.height };
         bm.close(); return d;
       }));
-      const t_ = paintTargetLong();
-      // reference working size = livePaint's inW×inH for srcW×srcH
-      const refW2 = Math.max(srcW, srcH) > t_ ? Math.round(srcW * (t_ / Math.max(srcW, srcH))) : srcW;
-      const refH2 = Math.max(srcW, srcH) > t_ ? Math.round(srcH * (t_ / Math.max(srcW, srcH))) : srcH;
+      const ref = multiRefVal() || await multiRefRect();
+      const t_ = paintTargetLong(ref ? ref.refLong : null);
+      // reference working size = livePaint's inW×inH for the reference rect
+      const refW2 = ref && ref.refLong > t_ ? Math.round(ref.refW * (t_ / ref.refLong)) : (ref ? ref.refW : srcW);
+      const refH2 = ref && ref.refLong > t_ ? Math.round(ref.refH * (t_ / ref.refLong)) : (ref ? ref.refH : srcH);
       const jobs = [];
       for (let i = 0; i < bridgeKinds.length; i++) {
         const d = dimsK[i];
@@ -934,7 +967,8 @@ async function sendToBlender() {
 // current params in core scale (same math as livePaint/_sendAnimatedToBlender)
 function coreParamsForSize() {
   const params = currentParams();
-  const ms_ = paintTargetLong();
+  const ref = multiRefVal();
+  const ms_ = paintTargetLong(ref ? ref.refLong : null);
   const eff = ms_ / 720;
   const s = sscaleFromPos(params.sscale) * eff;
   return {
@@ -1040,9 +1074,10 @@ async function _sendAnimatedToBlender(count = 10) {
       const d = { w: bm.width, h: bm.height };
       bm.close(); return d;
     }));
-    const tA = paintTargetLong();
-    const refW = Math.max(srcW, srcH) > tA ? Math.round(srcW * (tA / Math.max(srcW, srcH))) : srcW;
-    const refH = Math.max(srcW, srcH) > tA ? Math.round(srcH * (tA / Math.max(srcW, srcH))) : srcH;
+    const ref = multiRefVal() || await multiRefRect();
+    const tA = paintTargetLong(ref ? ref.refLong : null);
+    const refW = ref && ref.refLong > tA ? Math.round(ref.refW * (tA / ref.refLong)) : (ref ? ref.refW : srcW);
+    const refH = ref && ref.refLong > tA ? Math.round(ref.refH * (tA / ref.refLong)) : (ref ? ref.refH : srcH);
     const jobs = [];
     for (let i = 0; i < bridgeKinds.length; i++) {
       const d = dimsA[i];
