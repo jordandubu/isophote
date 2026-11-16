@@ -451,10 +451,12 @@ stage.addEventListener("drop", e => { e.preventDefault();
   if (e.dataTransfer.files[0]) load(e.dataTransfer.files[0]); });
 $("file").onchange = e => { if (e.target.files[0]) load(e.target.files[0]); };
 /* default sample: paint silently, skip it if the bridge already delivered
-   Blender's image (poll can complete before this fetch resolves) */
+   Blender's image (poll can complete before this fetch resolves).
+   bridgeLastPainted doubles as the "bridge claimed" latch: the multi branch
+   sets it BEFORE its awaits, so the sample can never win that race. */
 let sampleLoaded = false;
 fetch("test_photo.jpg").then(r => r.ok ? r.blob() : null).then(b => {
-  if (b && !srcBgrBytes && !bridgeImagePending) {
+  if (b && !srcBgrBytes && !bridgeImagePending && !bridgeLastPainted) {
     sampleLoaded = true;
     return load(b, {silent: true});
   }
@@ -528,6 +530,7 @@ imgWrap.addEventListener("click", (e) => {
 $("clear").onclick = () => {
   imgZoom = 1; imgWrap.classList.remove("zoomed"); imgWrap.style.removeProperty("--zoom");
   srcBgrBytes = origURL = paintedURL = null;
+  bridgeKinds = null; bridgeImgs = null;
   clearTimeout(liveTimer); liveQueue = false;
   $("imgWrap").style.display = "none";
   $("viewBtns").style.display = "none";
@@ -629,6 +632,12 @@ if (settings.addonBlender) { $("sendGroup").style.display = ""; }
 const bridge = { on: false, inFlight: false };
 let bridgeImagePending = false;   // bridge delivered (or is about to) a Blender image
 let bridgeLastPainted = "";       // hash of last bridge image already painted by this tab
+// multi-channel ("stroke replay") queue state: null = legacy single image
+let bridgeKinds = null;           // ["color","normal",...] when a multi queue is loaded
+let bridgeImgs = null;            // {kind: {b64, blob}} source (unpainted) channels
+const KIND_LABEL = { color: "base color", normal: "normal map", rough: "roughness",
+                     metal: "metallic", emission: "emission" };
+const kindList = (kinds) => kinds.map(k => KIND_LABEL[k] || k).join(" + ");
 function bridgeURL(path) { return `http://127.0.0.1:${BRIDGE_PORT}${path}`; }
 async function bridgePoll() {
   // ask the local bridge whether Blender pushed a new image
@@ -638,6 +647,33 @@ async function bridgePoll() {
     const r = await fetch(bridgeURL("/poll"), { method: "POST", body: "{}" });
     const d = await r.json();
     if (d.status) $("bridgeState").textContent = d.status;
+    // new multi-channel queue from the addon: {kind:"multi", kinds, pngs[0]=references}
+    if (d.kind === "multi" && Array.isArray(d.kinds) && Array.isArray(d.pngs) && d.pngs.length === d.kinds.length && !bridgeImagePending) {
+      let h = 0;
+      for (const png of d.pngs)
+        for (let i = 0; i < png.length; i += 4096) h = (h + (png.charCodeAt(i) + i)) | 0;
+      if (h === bridgeLastPainted) return;
+      bridgeImagePending = true;
+      try {
+        bridgeKinds = d.kinds;
+        bridgeImgs = {};
+        d.kinds.forEach((k, i) => {
+          const b64 = d.pngs[i];
+          bridgeImgs[k] = { b64, blob: b64ToBlob(b64, "image/png") };
+        });
+        $("bridgeState").textContent =
+          `received ${kindList(d.kinds)} — painting ${KIND_LABEL[d.kinds[0]] || d.kinds[0]} in view, all on send…`;
+        await load(bridgeImgs[d.kinds[0]].blob);   // reference through the normal path
+        await livePaint();
+        bridgeLastPainted = h;
+        fetch(bridgeURL("/ack"), { method: "POST", body: "{}" }).catch(() => {});
+        $("bridgeState").textContent =
+          `received ${kindList(d.kinds)} — adjust sliders freely; ALL channels repaint on Send`;
+      } finally {
+        bridgeImagePending = false;
+      }
+      return;
+    }
     if (d.kind === "image" && d.bgr_png && !bridgeImagePending) {
       // sticky poll: same image repeats every 1.5s until acked; skip if this
       // tab already painted it (avoid re-paint loop while waiting for ack)
@@ -666,14 +702,70 @@ async function bridgePoll() {
 }
 async function sendToBlender() {
   if (!paintedURL) { $("bridgeState").textContent = "nothing painted yet"; return; }
+  if (bridgeKinds && bridgeImgs) {
+    // multi: repaint ALL queued channels with the current params, reference
+    // first; falls back to reference-only (legacy payload) on failure
+    $("bridgeState").textContent = "painting all channels…";
+    try {
+      const params = coreParamsForSize();
+      const blobs = await Promise.all(Object.values(bridgeImgs).map(o => o.blob));
+      const bgras = await Promise.all(blobs.map(decodeToBgra));
+      const { urls } = await wasmPaintMulti(bgras, srcW, srcH, params);
+      const pngs = [];
+      for (const url of urls) pngs.push(await blobToB64(await (await fetch(url)).blob()));
+      await fetch(bridgeURL("/send_to_blender"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kinds: bridgeKinds, pngs }),
+      });
+      $("bridgeState").textContent =
+        `sent ${bridgeKinds.length} maps (${kindList(bridgeKinds)}) — now click 'Apply from Isophote' inside Blender`;
+      return;
+    } catch (e) {
+      $("bridgeState").textContent =
+        `multi paint failed (${e.message || e}) — sending ${KIND_LABEL[bridgeKinds[0]]} only`;
+      // fall through to the legacy single-channel send
+    }
+  }
   const blob = await (await fetch(paintedURL)).blob();
   const b64 = await blobToB64(blob);
   await fetch(bridgeURL("/send_to_blender"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ png: b64 }),
+    body: JSON.stringify({ png: b64, kind: bridgeKinds ? bridgeKinds[0] : "normal" }),
   });
   $("bridgeState").textContent = "sent — now click 'Apply from Isophote' inside Blender";
+}
+
+// current params in core scale (same math as livePaint/_sendAnimatedToBlender)
+function coreParamsForSize() {
+  const params = currentParams();
+  const eff = Math.min(Math.max(srcW, srcH), 1400) / 720;
+  const s = sscaleFromPos(params.sscale) * eff;
+  return {
+    brush_len: Math.max(4, Math.round(params.len * s)),
+    brush_w: Math.max(1, Math.round(params.width * s)),
+    layers: Math.round(params.layers),
+    relief: params.relief,
+    base_radius: Math.max(2, Math.round(params.base_radius * s)),
+    flow_smooth: Math.max(2, Math.round(params.flow_smooth * s)),
+    seed: Math.round(params.seed),
+  };
+}
+
+// File/Blob -> BGRA Uint8Array at full size (same swap as load())
+async function decodeToBgra(blob) {
+  const bitmap = await createImageBitmap(blob);
+  const c = document.createElement("canvas");
+  c.width = bitmap.width; c.height = bitmap.height;
+  const ctx = c.getContext("2d");
+  ctx.drawImage(bitmap, 0, 0);
+  const d = ctx.getImageData(0, 0, bitmap.width, bitmap.height).data;
+  const out = new Uint8Array(d.length);
+  for (let i = 0; i < d.length; i += 4) {
+    out[i] = d[i + 2]; out[i + 1] = d[i + 1]; out[i + 2] = d[i]; out[i + 3] = d[i + 3];
+  }
+  return out;
 }
 /* send animated: paint N extra seeds silently and post them all; Blender
    wires them into an image sequence so the paint flickers as strokes */
@@ -688,27 +780,54 @@ async function sendAnimatedToBlender(count = 5) {
 }
 async function _sendAnimatedToBlender(count = 10) {
   const baseSeed = Math.round(parseFloat($("seed").value));
-  const params = currentParams();
-  const eff = Math.min(Math.max(srcW, srcH), 1400) / 720;
-  const s = sscaleFromPos(params.sscale) * eff;
+  const core0 = coreParamsForSize();
   const core = {
-    brush_len: Math.max(4, Math.round(params.len * s)),
-    brush_w: Math.max(1, Math.round(params.width * s)),
-    layers: Math.round(params.layers),
-    relief: params.relief,
-    base_radius: Math.max(2, Math.round(params.base_radius * s)),
-    flow_smooth: Math.max(2, Math.round(params.flow_smooth * s)),
+    brush_len: core0.brush_len,
+    brush_w: core0.brush_w,
+    layers: core0.layers,
+    relief: core0.relief,
+    base_radius: core0.base_radius,
+    flow_smooth: core0.flow_smooth,
   };
   $("animProgress").style.display = "flex";
   $("animBar").style.width = "0%";
-  $("animCount").textContent = `1 / ${count + 1}`;
+  const multi = !!(bridgeKinds && bridgeImgs);
+  const k = multi ? bridgeKinds.length : 1;
+  const total = count + 1;
+  $("animCount").textContent = multi
+    ? `1 / ${total} × ${k} channels` : `1 / ${total}`;
   const frames = [];
+  if (multi) {
+    // each frame paints ALL channels coherently: outer = seed, inner = kind
+    // (bridgeKinds order). decode every queued channel once up front.
+    const blobs = await Promise.all(Object.values(bridgeImgs).map(o => o.blob));
+    const bgras = await Promise.all(blobs.map(decodeToBgra));
+    for (let i = 0; i <= count; i++) {
+      const { urls } = await wasmPaintMulti(bgras, srcW, srcH, { ...core, seed: baseSeed + i });
+      const one = [];
+      for (const url of urls) one.push(await blobToB64(await (await fetch(url)).blob()));
+      frames.push(one);
+      $("animBar").style.width = Math.round((i + 1) / total * 100) + "%";
+      $("animCount").textContent = `${i + 1} / ${total} × ${k} channels`;
+    }
+    $("animCount").textContent = "sending to Blender…";
+    await fetch(bridgeURL("/send_to_blender"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kinds: bridgeKinds, anim: frames }),
+    });
+    $("animProgress").style.display = "none";
+    $("bridgeState").textContent =
+      `sent ${total} frames × ${k} maps — now click 'Apply animated (seeds)' inside Blender`;
+    return;
+  }
+  const frames1 = [];
   // frame 0 is the current painting
   const blob0 = await (await fetch(paintedURL)).blob();
-  frames.push(await blobToB64(blob0));
+  frames1.push(await blobToB64(blob0));
   for (let i = 1; i <= count; i++) {
     const { url } = await wasmPaint(srcBgrBytes, srcW, srcH, { ...core, seed: baseSeed + i });
-    frames.push(await blobToB64(await (await fetch(url)).blob()));
+    frames1.push(await blobToB64(await (await fetch(url)).blob()));
     const pct = Math.round(i / count * 100);
     $("animBar").style.width = pct + "%";
     $("animCount").textContent = `${i + 1} / ${count + 1}`;
@@ -717,10 +836,10 @@ async function _sendAnimatedToBlender(count = 10) {
   await fetch(bridgeURL("/send_to_blender"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ anim: frames }),
+    body: JSON.stringify({ anim: frames1 }),
   });
   $("animProgress").style.display = "none";
-  $("bridgeState").textContent = `sent ${frames.length} frames — now click 'Apply animated (seeds)' inside Blender`;
+  $("bridgeState").textContent = `sent ${frames1.length} frames — now click 'Apply animated (seeds)' inside Blender`;
 }
 /* dropdown wiring */
 $("sendCaret").onclick = (e) => { e.stopPropagation();

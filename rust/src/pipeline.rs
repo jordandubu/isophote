@@ -498,14 +498,25 @@ fn quadrant_origin(q: i32, n: i32) -> (i64, i64) {
 
 // ---------------------------------------------------------------- strokes
 
-pub struct StrokeOut {
-    pub bgra: Vec<u8>,
-    pub updated: Vec<f32>,
+pub struct Stroke {
+    /// polyline nodes (x, y), f32 like the python reference (jitter in f32)
+    pub pts: Vec<(f32, f32)>,
+    /// final jittered brush thickness
+    pub th: i32,
+    /// color-patch radius: unjittered brush_w/2 (matches original render)
+    pub pr: i32,
+    /// per-stroke brightness jitter (rng-derived; shared across channels)
+    pub lum: f32,
 }
 
-pub fn render_strokes(
+/// Stroke geometry + every RNG decision, none of the coloring. Same RNG
+/// consumption order as the pre-split render_strokes (jittered grid,
+/// gradient sort, then per stroke lum/length/width draws, and the <3-point
+/// skip happens BEFORE the draws), so the single-channel path stays
+/// bit-identical. Paint several channels with [`paint_from_strokes`] along
+/// the same strokes (stroke replay).
+pub fn generate_strokes(
     bgr: &[u8],
-    base: &[u8],
     w: usize,
     h: usize,
     flow: &Flow,
@@ -514,16 +525,9 @@ pub fn render_strokes(
     width: i32,
     layers: i32,
     jitter: f64,
-    opacity: f64,
     seed: u64,
-) -> StrokeOut {
+) -> Vec<Stroke> {
     let mut rng = Pcg64::new(seed);
-    // canvas starts as base (BGRA out)
-    let mut canvas: Vec<[f32; 3]> = base
-        .chunks(3)
-        .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
-        .collect();
-    let mut updated = vec![0f32; w * h];
     // gradient magnitude of gray
     let gray = gray_from_bgr(bgr, w, h);
     let gx = sobel3(&gray, w, h, 1, 0);
@@ -532,6 +536,7 @@ pub fn render_strokes(
 
     let step = (h as i32 / (strokes_per_layer as f64).sqrt() as i32).max(2);
     let jit = step as f64 * 0.5 * jitter;
+    let mut out_strokes: Vec<Stroke> = Vec::new();
 
     for _layer in 0..layers {
         // pts stored f32 like the python reference (jitter math in f32)
@@ -600,47 +605,84 @@ pub fn render_strokes(
             if poly.len() < 3 {
                 continue;
             }
-            // brush color: mean of source patch around stroke midpoint
-            let mi = poly.len() / 2;
-            let mx = ((poly[mi].0 as i64).clamp(0, w as i64 - 1)) as i64;
-            let my = ((poly[mi].1 as i64).clamp(0, h as i64 - 1)) as i64;
-            let r = ((width as i64) / 2).max(1);
-            let (mut sb, mut sg, mut sr, mut cnt) = (0f64, 0f64, 0f64, 0i64);
-            for yy in (my - r).max(0)..=(my + r).min(h as i64 - 1) {
-                for xx in (mx - r).max(0)..=(mx + r).min(w as i64 - 1) {
-                    let p = (yy as usize * w + xx as usize) * 3;
-                    sb += bgr[p] as f64;
-                    sg += bgr[p + 1] as f64;
-                    sr += bgr[p + 2] as f64;
-                    cnt += 1;
-                }
-            }
             let lum = rng.uniform(0.94, 1.06) as f32;
             let _lj = length as f64 * rng.uniform(1.0 - jitter, 1.0 + jitter);
             let wj = ((width as f64 * rng.uniform(1.0 - jitter, 1.0 + jitter)) as i64).max(1) as i32;
             let th = wj.max(1);
-            // python: f32 patch mean (f32 accumulation!) then *lum f32
-            let col = [
-                ((sb / cnt as f64) as f32 * lum).clamp(0.0, 255.0),
-                ((sg / cnt as f64) as f32 * lum).clamp(0.0, 255.0),
-                ((sr / cnt as f64) as f32 * lum).clamp(0.0, 255.0),
-            ];
-            draw_polyline(&mut canvas, &mut updated, w, h, &poly, col, th, 1.0);
+            out_strokes.push(Stroke { pts: poly, th, pr: ((width / 2).max(1)), lum });
         }
+    }
+    out_strokes
+}
+
+/// Draw pre-generated strokes on `base` sampling colors from `bgr`. With the
+/// same `strokes` the output is bit-identical to the pre-split
+/// render_strokes for the single-channel case: same patch means (f64 sums),
+/// same lum/th, same draw order, same blend, same relief.
+/// `relief` = Params.relief; >0 multiplies in the canvas plane shading.
+pub fn paint_from_strokes(
+    bgr: &[u8],
+    base: &[u8],
+    w: usize,
+    h: usize,
+    strokes: &[Stroke],
+    relief: f64,
+) -> Vec<u8> {
+    // canvas starts as base (BGRA out)
+    let mut canvas: Vec<[f32; 3]> = base
+        .chunks(3)
+        .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
+        .collect();
+    let mut updated = vec![0f32; w * h];
+
+    for s in strokes {
+        let poly = &s.pts[..];
+        // python: f32 patch mean (f64 accumulation in rust, cast to f32),
+        // then *lum f32
+        let mi = poly.len() / 2;
+        let mx = ((poly[mi].0 as i64).clamp(0, w as i64 - 1)) as i64;
+        let my = ((poly[mi].1 as i64).clamp(0, h as i64 - 1)) as i64;
+        let r = s.pr as i64;
+        let (mut sb, mut sg, mut sr, mut cnt) = (0f64, 0f64, 0f64, 0i64);
+        for yy in (my - r).max(0)..=(my + r).min(h as i64 - 1) {
+            for xx in (mx - r).max(0)..=(mx + r).min(w as i64 - 1) {
+                let p = (yy as usize * w + xx as usize) * 3;
+                sb += bgr[p] as f64;
+                sg += bgr[p + 1] as f64;
+                sr += bgr[p + 2] as f64;
+                cnt += 1;
+            }
+        }
+        let col = [
+            ((sb / cnt as f64) as f32 * s.lum).clamp(0.0, 255.0),
+            ((sg / cnt as f64) as f32 * s.lum).clamp(0.0, 255.0),
+            ((sr / cnt as f64) as f32 * s.lum).clamp(0.0, 255.0),
+        ];
+        draw_polyline(&mut canvas, &mut updated, w, h, &poly, col, s.th, 1.0);
     }
 
     // blend: a = clip(blur(updated) * 1.4, 0, 1) * opacity
     let blurred = gaussian_blur_plane(&updated, w, h, 0.6);
     let mut out = vec![0u8; w * h * 4];
     for i in 0..w * h {
-        let a = (blurred[i] * 1.4).clamp(0.0, 1.0) * opacity as f32;
+        let a = (blurred[i] * 1.4).clamp(0.0, 1.0) * 0.9f32;
         for c in 0..3 {
             let v = canvas[i][c] * a + base[i * 3 + c] as f32 * (1.0 - a);
             out[i * 4 + c] = v.round().clamp(0.0, 255.0) as u8;
         }
         out[i * 4 + 3] = 255;
     }
-    StrokeOut { bgra: out, updated: updated }
+    if relief > 0.0 {
+        let (shade, _h) = canvas_relief(w, h, 12, relief);
+        for i in 0..w * h {
+            let sh = shade[i];
+            for c in 0..4 {
+                let v = out[i * 4 + c] as f32;
+                out[i * 4 + c] = (v * sh).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
 }
 
 /// cv2.LINE_AA-ish polyline with thickness (anti-aliased coverage).
@@ -775,21 +817,15 @@ pub fn canvas_relief(w: usize, h: usize, scale: i32, strength: f64) -> (Vec<f32>
 
 pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, String) {
     // BGRA -> BGR
-    let mut bgr = vec![0u8; w * h * 3];
-    for i in 0..w * h {
-        bgr[i * 3] = bgra[i * 4];
-        bgr[i * 3 + 1] = bgra[i * 4 + 1];
-        bgr[i * 3 + 2] = bgra[i * 4 + 2];
-    }
+    let bgr = bgra_to_bgr(bgra, w, h);
     // resize handled by JS (canvas); here we assume already-resized
     let base = kuwahara(&bgr, w, h, p.base_radius);
     let gray = gray_from_bgr(&bgr, w, h);
     let flow0 = flow_field(&gray, w, h, 2.5);
     let flow = smooth_flow(flow0, p.flow_smooth);
     let n_strokes = (w * h) as i32 / 140;
-    let stroke_out = render_strokes(
+    let strokes = generate_strokes(
         &bgr,
-        &base,
         w,
         h,
         &flow,
@@ -798,19 +834,84 @@ pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, Stri
         p.brush_w,
         p.layers,
         0.6,
-        0.9,
         p.seed,
     );
-    let mut out = stroke_out.bgra;
-    if p.relief > 0.0 {
-        let (shade, _h) = canvas_relief(w, h, 12, p.relief);
-        for i in 0..w * h {
-            let s = shade[i];
-            for c in 0..4 {
-                let v = out[i * 4 + c] as f32;
-                out[i * 4 + c] = (v * s).round().clamp(0.0, 255.0) as u8;
-            }
+    let out = paint_from_strokes(&bgr, &base, w, h, &strokes, p.relief);
+    (out, String::new())
+}
+
+/// bgra_to_bgr helper shared by the single and multi paths.
+fn bgra_to_bgr(bgra: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut bgr = vec![0u8; w * h * 3];
+    for i in 0..w * h {
+        bgr[i * 3] = bgra[i * 4];
+        bgr[i * 3 + 1] = bgra[i * 4 + 1];
+        bgr[i * 3 + 2] = bgra[i * 4 + 2];
+    }
+    bgr
+}
+
+/// Multi-channel coherent paint: flow + strokes derived from `ref_bgra`
+/// only, then the SAME strokes are stamped on every channel in `chans`
+/// (stroke replay). `chans[0]` is treated as the reference and included in
+/// the returned Vec (element 0 = painted reference), so callers pass ONLY
+/// the other channels: returned.len() == chans.len() + 1 with the reference
+/// first. Every channel gets identical stem/brush geometry and identical
+/// per-stroke lum only when seeded alike; the per-channel color sampling
+/// makes each map its own painting. relief is applied to all.
+pub fn paint_bgra_multi(
+    ref_bgra: &[u8],
+    chans: &[&[u8]],
+    w: usize,
+    h: usize,
+    p: &Params,
+) -> Result<Vec<Vec<u8>>, String> {
+    if w == 0 || h == 0 {
+        return Err("empty image".into());
+    }
+    if chans.is_empty() || chans.len() > 4 {
+        return Err(format!("1-4 channels required, got {}", chans.len()));
+    }
+    let n = w * h * 4;
+    for (i, c) in chans.iter().enumerate() {
+        if c.len() != n {
+            return Err(format!("channel {i} is {} bytes, expected {n}", c.len()));
         }
     }
-    (out, String::new())
+    if ref_bgra.len() != n {
+        return Err(format!(
+            "reference is {} bytes, expected {n}",
+            ref_bgra.len()
+        ));
+    }
+
+    let ref_bgr = bgra_to_bgr(ref_bgra, w, h);
+    let base = kuwahara(&ref_bgr, w, h, p.base_radius);
+    let gray = gray_from_bgr(&ref_bgr, w, h);
+    let flow0 = flow_field(&gray, w, h, 2.5);
+    let flow = smooth_flow(flow0, p.flow_smooth);
+    let n_strokes = (w * h) as i32 / 140;
+    let strokes = generate_strokes(
+        &ref_bgr,
+        w,
+        h,
+        &flow,
+        n_strokes,
+        p.brush_len,
+        p.brush_w,
+        p.layers,
+        0.6,
+        p.seed,
+    );
+    let mut out = Vec::with_capacity(chans.len() + 1);
+    out.push(paint_from_strokes(&ref_bgr, &base, w, h, &strokes, p.relief));
+    // painted ref is BGRA already (paint_from_strokes emits BGRA); the
+    // result above is the painted reference.
+    for c in chans {
+        let cgr = bgra_to_bgr(c, w, h);
+        let cbase = kuwahara(&cgr, w, h, p.base_radius);
+        let painted = paint_from_strokes(&cgr, &cbase, w, h, &strokes, p.relief);
+        out.push(painted);
+    }
+    Ok(out)
 }

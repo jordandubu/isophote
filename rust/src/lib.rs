@@ -160,3 +160,85 @@ pub extern "C" fn wasm_paint_out_dims(w: i32, h: i32) -> i64 {
     }
     ((h as i64) << 32) | (w as i64 & 0xffff_ffff)
 }
+
+/// Multi-channel coherent paint ("stroke replay"). Blob at `in_ptr` is
+/// `k` sequential BGRA frames (each `w*h*4`); **frame 0 is the reference**
+/// (drives flow + strokes), frames 1..k are the other channels painted with
+/// the same strokes. Params JSON identical to `wasm_paint`.
+///
+/// `out_ptr` must hold up to `k*w*h*4` bytes (no downscale here: JS sends
+/// already-decoded same-size frames). On success all `k` painted BGRA
+/// frames are written sequentially at `out_ptr` (reference first, same
+/// order as input) and the return value is `0`.
+///
+/// On failure returns `N > 0`: the caller must then read the first `N`
+/// bytes at `out_ptr` as the UTF-8 error message. Returns `-1` only for
+/// null pointers / non-positive dims (no message written).
+///
+/// # Safety
+/// `in_ptr`/`out_ptr`/`params_ptr` must be valid for the described lengths.
+#[no_mangle]
+pub extern "C" fn wasm_paint_multi(
+    w: i32,
+    h: i32,
+    k: i32,
+    in_ptr: *const u8,
+    out_ptr: *mut u8,
+    params_ptr: *const u8,
+    params_len: i32,
+) -> i32 {
+    if w <= 0 || h <= 0 || k <= 0 || k > 8 || in_ptr.is_null() || out_ptr.is_null() {
+        return -1;
+    }
+    let (w, h, k) = (w as usize, h as usize, k as usize);
+    let frame = w * h * 4;
+    let blob = unsafe { std::slice::from_raw_parts(in_ptr, frame * k) };
+    let json = if params_ptr.is_null() || params_len <= 0 {
+        String::new()
+    } else {
+        let pslice = unsafe { std::slice::from_raw_parts(params_ptr, params_len as usize) };
+        String::from_utf8_lossy(pslice).into_owned()
+    };
+    let p: pipeline::Params = if json.is_empty() {
+        pipeline::Params {
+            brush_len: 26,
+            brush_w: 7,
+            layers: 2,
+            relief: 0.35,
+            base_radius: 6,
+            flow_smooth: 8,
+            seed: 42,
+        }
+    } else {
+        match serde_json::from_str(&json) {
+            Ok(v) => v,
+            Err(e) => return write_err(out_ptr, frame * k, format!("bad params: {e}")),
+        }
+    };
+    let frames: Vec<&[u8]> = (0..k).map(|i| &blob[i * frame..(i + 1) * frame]).collect();
+    match pipeline::paint_bgra_multi(frames[0], &frames[1..], w, h, &p) {
+        Ok(painted) => {
+            // no downscale in the multi path: same dims in/out
+            let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, frame * k) };
+            for (dst, src) in out.chunks_exact_mut(frame).zip(painted.iter()) {
+                dst.copy_from_slice(src);
+            }
+            0
+        }
+        Err(e) => write_err(out_ptr, frame * k, e),
+    }
+}
+
+/// Write a UTF-8 error message at `out_ptr`, truncated/zero-padded to `cap`
+/// bytes; returns the message length as the export's error return.
+fn write_err(out_ptr: *mut u8, cap: usize, msg: String) -> i32 {
+    let bytes = msg.as_bytes();
+    let n = bytes.len().min(cap);
+    if n > 0 {
+        let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, cap) };
+        // zero the whole buffer first so the caller can bound the message
+        out.iter_mut().for_each(|b| *b = 0);
+        out[..n].copy_from_slice(&bytes[..n]);
+    }
+    n as i32
+}

@@ -40,23 +40,69 @@ async function wasmPaint(bgra, w, h, params) {
     const outH = Number(dims >> 32n);
     const outW = Number(dims & 0xffffffffn);
     const outLen = outW * outH * 4;
-    const out = new Uint8Array(wasm.exports.memory.buffer, outPtr, outLen);
-    // BGRA -> RGBA for putImageData
-    const rgbaOut = new ImageData(outW, outH);
-    const od = rgbaOut.data;
-    for (let i = 0; i < outW * outH; i++) {
-      od[i * 4] = out[i * 4 + 2];     // R
-      od[i * 4 + 1] = out[i * 4 + 1]; // G
-      od[i * 4 + 2] = out[i * 4];     // B
-      od[i * 4 + 3] = out[i * 4 + 3];
-    }
-    const c = document.createElement("canvas");
-    c.width = outW; c.height = outH;
-    c.getContext("2d").putImageData(rgbaOut, 0, 0);
-    return { url: c.toDataURL("image/png"), ms: Math.round(performance.now() - t0), w: outW, h: outH };
+    const out = new Uint8Array(wasm.exports.memory.buffer, outPtr, outLen).slice();
+    const url = slabToUrl(out, outW, outH);
+    return { url, ms: Math.round(performance.now() - t0), w: outW, h: outH };
   } finally {
     wasm.exports.wasm_free(inPtr, bgra.length);
     wasm.exports.wasm_free(pPtr, pb.length);
     wasm.exports.wasm_free(outPtr, bgra.length);
+  }
+}
+
+// one BGRA slab -> PNG data URL (BGRA->RGBA swap + putImageData)
+function slabToUrl(bytes, w, h) {
+  const rgbaOut = new ImageData(w, h);
+  const od = rgbaOut.data;
+  for (let i = 0; i < w * h; i++) {
+    od[i * 4] = bytes[i * 4 + 2];     // R
+    od[i * 4 + 1] = bytes[i * 4 + 1]; // G
+    od[i * 4 + 2] = bytes[i * 4];     // B
+    od[i * 4 + 3] = bytes[i * 4 + 3];
+  }
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  c.getContext("2d").putImageData(rgbaOut, 0, 0);
+  return c.toDataURL("image/png");
+}
+
+// Multi-channel coherent paint (stroke replay): bgras[0] is the reference
+// (drives flow + strokes), the rest are painted with the SAME strokes.
+// Returns { urls: [png data URLs (reference first)], ms }. No resize in the
+// core for this path: all frames must be the same w*h already.
+async function wasmPaintMulti(bgras, w, h, params) {
+  await wasmReady;
+  if (!bgras.length) throw new Error("no channels");
+  const t0 = performance.now();
+  const k = bgras.length;
+  const frame = w * h * 4;
+  const blob = new Uint8Array(frame * k);
+  bgras.forEach((b, i) => { if (b.length !== frame) throw new Error("channel " + i + " size mismatch"); blob.set(b, i * frame); });
+  const pb = new TextEncoder().encode(JSON.stringify(params));
+
+  const inPtr = alloc(blob.length);
+  const pPtr = alloc(pb.length);
+  const outPtr = alloc(blob.length);
+  try {
+    new Uint8Array(wasm.exports.memory.buffer, inPtr, blob.length).set(blob);
+    new Uint8Array(wasm.exports.memory.buffer, pPtr, pb.length).set(pb);
+    const ret = wasm.exports.wasm_paint_multi(w, h, k, inPtr, outPtr, pPtr, pb.length);
+    if (ret > 0) {
+      // core wrote an error message at out_ptr (zero-padded UTF-8)
+      const msg = new TextDecoder().decode(
+        new Uint8Array(wasm.exports.memory.buffer, outPtr, ret));
+      throw new Error(msg || ("wasm_paint_multi failed: " + ret));
+    }
+    if (ret < 0) throw new Error("wasm_paint_multi failed: " + ret);
+    // snapshot out of wasm memory before decoding (buffer can detach)
+    const out = new Uint8Array(wasm.exports.memory.buffer, outPtr, blob.length).slice();
+    const urls = [];
+    for (let i = 0; i < k; i++)
+      urls.push(slabToUrl(out.subarray(i * frame, (i + 1) * frame), w, h));
+    return { urls, ms: Math.round(performance.now() - t0) };
+  } finally {
+    wasm.exports.wasm_free(inPtr, blob.length);
+    wasm.exports.wasm_free(pPtr, pb.length);
+    wasm.exports.wasm_free(outPtr, blob.length);
   }
 }
