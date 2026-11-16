@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 6, 0),
+    "version": (0, 6, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -268,7 +268,8 @@ class PN_OT_send_to_isophote(bpy.types.Operator):
 
         import os
         size = int(s.tex_size)
-        rows = _channel_rows(s)
+        _ensure_default_channel(s)
+        rows = s.channels
         baked = {}   # wire kind -> b64
         for ch in rows:
             if ch.mode == 'none':
@@ -496,12 +497,16 @@ _BAKE_TYPES = {
 
 
 def _bake_map(obj, size: int, kind: str, out_path: str):
-    """Bake one map via Blender's bake system. kind in _BAKE_TYPES;
-    'normal' is object space with swizzle +X +Y +Z, 'color' is the unlit
-    diffuse albedo (pass_filter COLOR). Returns error string or None."""
-    import os
+    """Bake one map via Blender's bake system.
+    'normal': object-space bake with swizzle +X +Y +Z (geometric; a stripped
+              temp material is fine).
+    'color'/'emission'/'rough': bake the REAL material with an added bake
+              image node (Cycles evaluates the full graph).
+    'metal': no METALLIC bake type exists — copy the material graph, reroute
+             whatever feeds Metallic into an Emission shader, and EMIT-bake
+             that as grayscale.
+    Returns error string or None."""
     try:
-        bake_type = _BAKE_TYPES[kind]
         if obj.type != 'MESH':
             return "active object is not a mesh"
         if not obj.data.uv_layers:
@@ -517,21 +522,40 @@ def _bake_map(obj, size: int, kind: str, out_path: str):
                                else (0.0, 0.0, 0.0, 1.0))  # neutral default
         img.update()
 
-        # temp bake material; bake writes into the ACTIVE image node
-        mat = bpy.data.materials.new("Painterly_BakeMat")
-        mat.use_nodes = True
-        nt = mat.node_tree
-        for n in list(nt.nodes):
-            if n.type != 'OUTPUT_MATERIAL':
-                nt.nodes.remove(n)
-        tex = nt.nodes.new('ShaderNodeTexImage')
-        tex.image = img
-        nt.nodes.active = tex
-        tex.select = True
-
-        saved_slots = [(ms.link, ms.material) for ms in obj.material_slots]
-        obj.data.materials.clear()
-        obj.data.materials.append(mat)
+        is_normal = kind == 'normal'
+        bake_mat = None
+        if is_normal:
+            # geometry-driven; a stripped temp material is correct here
+            bake_mat = bpy.data.materials.new("Painterly_BakeMat")
+            bake_mat.use_nodes = True
+            nt = bake_mat.node_tree
+            for n in list(nt.nodes):
+                if n.type != 'OUTPUT_MATERIAL':
+                    nt.nodes.remove(n)
+            tex = nt.nodes.new('ShaderNodeTexImage')
+            tex.image = img
+            nt.nodes.active = tex
+            tex.select = True
+            saved_slots = [(ms.link, ms.material) for ms in obj.material_slots]
+            obj.data.materials.clear()
+            obj.data.materials.append(bake_mat)
+        else:
+            # keep the REAL material so the full graph is evaluated; add a
+            # bake node into each used material
+            mats = [ms.material for ms in obj.material_slots
+                    if ms.material and ms.material.use_nodes]
+            if not mats:
+                return "object has no node material to bake from"
+            bake_nodes = []
+            for m in mats:
+                nt = m.node_tree
+                tex = nt.nodes.new('ShaderNodeTexImage')
+                tex.image = img
+                nt.nodes.active = tex
+                tex.select = True
+                bake_nodes.append((m, tex))
+                if kind == 'metal':
+                    _metal_to_emit(m, tex.name)
 
         scene = bpy.context.scene
         saved_engine = scene.render.engine
@@ -550,7 +574,6 @@ def _bake_map(obj, size: int, kind: str, out_path: str):
         bpy.context.view_layer.objects.active = obj
 
         b = scene.render.bake
-        is_normal = kind == 'normal'
         saved_bake = (b.normal_space, b.normal_r, b.normal_g, b.normal_b,
                       b.margin, b.use_clear, b.use_selected_to_active)
         b.margin = 8
@@ -564,25 +587,34 @@ def _bake_map(obj, size: int, kind: str, out_path: str):
         try:
             if is_normal:
                 bpy.ops.object.bake(type='NORMAL', use_clear=True)
-            elif bake_type == 'DIFFUSE':
+            elif kind == 'color':
                 # pass_filter=COLOR: unlit albedo (direct color only)
                 bpy.ops.object.bake(type='DIFFUSE', pass_filter={'COLOR'},
                                     use_clear=True)
+            elif kind == 'metal':
+                bpy.ops.object.bake(type='EMIT', use_clear=True)
+            elif kind == 'emission':
+                bpy.ops.object.bake(type='EMIT', use_clear=True)
             else:
-                bpy.ops.object.bake(type=bake_type, use_clear=True)
+                bpy.ops.object.bake(type=_BAKE_TYPES[kind], use_clear=True)
         finally:
             scene.render.engine = saved_engine
             scene.cycles.device = saved_device
             scene.cycles.samples = saved_samples
             (b.normal_space, b.normal_r, b.normal_g, b.normal_b, b.margin,
              b.use_clear, b.use_selected_to_active) = saved_bake
-            obj.data.materials.clear()
-            seen = set()
-            for link, m in saved_slots:
-                if m is None or m.name in seen:
-                    continue
-                seen.add(m.name)
-                obj.data.materials.append(m)
+            if is_normal:
+                obj.data.materials.clear()
+                seen = set()
+                for link, m in saved_slots:
+                    if m is None or m.name in seen:
+                        continue
+                    seen.add(m.name)
+                    obj.data.materials.append(m)
+            else:
+                # remove the bake nodes (and the emit copy) from real materials
+                for m, _tex in bake_nodes:
+                    _cleanup_bake_graph(m)
             if saved_active:
                 bpy.context.view_layer.objects.active = saved_active
             if saved_mode:
@@ -598,6 +630,9 @@ def _bake_map(obj, size: int, kind: str, out_path: str):
         img.pixels.foreach_get(buf)
         buf = buf.reshape(h, w, ch)[::-1]  # flip: Blender bottom-up -> top-down
         flat = bpy.data.images.new("Painterly_FlipTmp", w, h, alpha=True)
+        # set colorspace BEFORE writing pixels: changing it afterwards
+        # invalidates/clears the fresh datablock
+        flat.colorspace_settings.name = 'Non-Color'
         flat.pixels.foreach_set(buf[::-1].ravel())  # back to Blender order in datablock
         flat.filepath_raw = out_path
         flat.file_format = 'PNG'
@@ -608,7 +643,52 @@ def _bake_map(obj, size: int, kind: str, out_path: str):
         return str(e)
 
 
+def _metal_to_emit(mat, bake_node_name):
+    """Temp-edit `mat` so an EMIT bake outputs the Metallic value:
+    reroutes whatever feeds Metallic into an Emission shader on the output.
+    The original surface link is stored on the material for restore."""
+    nt = mat.node_tree
+    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    if bsdf is None or out is None:
+        return
+    saved = out.inputs['Surface'].links[0] if out.inputs['Surface'].is_linked else None
+    mat["PainterlySavedSurface"] = (
+        saved.from_node.name, saved.from_socket.name) if saved else ("", "")
 
+    emit = nt.nodes.new('ShaderNodeEmission')
+    emit.name = "PainterlyMetalEmit"
+    emit.location = (bsdf.location.x, bsdf.location.y + 300)
+    src = bsdf.inputs['Metallic']
+    if src.is_linked:
+        nt.links.new(src.links[0].from_socket, emit.inputs['Color'])
+    else:
+        g = float(src.default_value)
+        emit.inputs['Color'].default_value = (g, g, g, 1.0)
+    nt.links.new(emit.outputs['Emission'], out.inputs['Surface'])
+
+
+def _cleanup_bake_graph(mat):
+    """Undo _metal_to_emit: restore the original output surface, delete the
+    temp emission node and the added bake image nodes."""
+    nt = mat.node_tree
+    saved_node, saved_sock = mat.get("PainterlySavedSurface", ("", ""))
+    out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    if out is not None and saved_node:
+        src = next((n for n in nt.nodes if n.name == saved_node), None)
+        if src is not None:
+            sock = src.outputs.get(saved_sock) or next(
+                (s for s in src.outputs if s.name == saved_sock), None)
+            if sock is not None:
+                nt.links.new(sock, out.inputs['Surface'])
+    if mat.get("PainterlySavedSurface") is not None:
+        mat.pop("PainterlySavedSurface")
+    doomed = [n for n in nt.nodes
+              if n.name == "PainterlyMetalEmit"
+              or (n.type == 'TEX_IMAGE' and n.image
+                  and n.image.name.startswith("Painterly_Baked"))]
+    for n in doomed:
+        nt.nodes.remove(n)
 def _renormalize_file(path, result, base_name="painterly"):
     """Reproject painted pixels to valid normal vectors using numpy, no Image API."""
     import numpy as np, os
@@ -952,20 +1032,18 @@ class PN_PT_panel(bpy.types.Panel):
         mat = obj.active_material if obj else None
         layout.label(text="Material: " + (mat.name if mat else "none"))
         s = context.scene.painterly_settings
-        row = layout.row()
-        row.scale_y = 1.8
-        row.operator(PN_OT_send_to_isophote.bl_idname, text="Send to Isophote")
         if s.status:
             layout.label(text=s.status, icon='TIME')
 
 
-def _channel_rows(s):
-    """Active channel rows; lazily creates the single default Normal row."""
+def _ensure_default_channel(s):
+    """Create the single default Normal/Bake row. NEVER call from a draw
+    callback (ID-property writes are forbidden there) — the autofill timer
+    and the send operator use this."""
     if len(s.channels) == 0:
-        s.channels.add()          # default: one Normal / Bake row
+        s.channels.add()
         s.channels[0].kind = 'normal'
         s.channels[0].mode = 'bake'
-    return s.channels
 
 
 class PN_PT_to_isophote(bpy.types.Panel):
@@ -980,8 +1058,9 @@ class PN_PT_to_isophote(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         s = context.scene.painterly_settings
-        rows = _channel_rows(s)
-        for i, ch in enumerate(rows):
+        if len(s.channels) == 0:
+            layout.label(text="No channels — press + to add one", icon='INFO')
+        for i, ch in enumerate(s.channels):
             box = layout.box()
             row = box.row(align=True)
             row.prop(ch, "kind", text="")
@@ -992,6 +1071,9 @@ class PN_PT_to_isophote(bpy.types.Panel):
                 box.prop(ch, "image")
         row = layout.row(align=True)
         row.operator(PN_OT_channel_add.bl_idname, text="", icon='ADD')
+        send = layout.row()
+        send.scale_y = 1.8
+        send.operator(PN_OT_send_to_isophote.bl_idname, text="Send to Isophote")
         layout.prop(s, "strokes_coherent")
         layout.prop(s, "tex_name", text="Name")
         layout.prop(s, "tex_size")
@@ -1216,6 +1298,7 @@ def _autofill_name():
             if obj and (s.tex_name == last or not s.tex_name):
                 s.tex_name = obj.name or "Painterly"
             AUTO_NAME["last"] = s.tex_name
+            _ensure_default_channel(s)   # safe here: timer, not a draw callback
             # surface what the bridge is holding, so the user knows the
             # next step is Apply (the web app cannot apply by itself)
             kinds = _bridge_state.get("result_kinds")
