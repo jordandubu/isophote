@@ -76,7 +76,8 @@ fn multi_replay_same_strokes() {
         }
     }
     let p = Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
-                     base_radius: 3, flow_smooth: 4, seed: 7 };
+                     base_radius: 3, flow_smooth: 4, seed: 7,
+                     max_size: None };
     let outs = paint_bgra_multi(&ref_img, &[&chan], w, h, &p).unwrap();
     assert_eq!(outs.len(), 2);
     // determinism: same inputs -> identical bytes

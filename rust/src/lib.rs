@@ -59,6 +59,9 @@ mod tests {
 
 // ------------------------------------------------------- wasm C ABI exports
 
+/// Painted dims of the last wasm_paint call (packed (h << 16) | w as i64).
+static LAST_OUT_DIMS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
 /// Allocate `len` bytes in wasm linear memory. JS fills the returned buffer
 /// via `new Uint8Array(memory.buffer, ptr, len)`.
 #[no_mangle]
@@ -118,6 +121,7 @@ pub extern "C" fn wasm_paint(
             base_radius: 6,
             flow_smooth: 8,
             seed: 42,
+            max_size: None,
         }
     } else {
         match serde_json::from_str(&json) {
@@ -126,39 +130,37 @@ pub extern "C" fn wasm_paint(
         }
     };
 
-    // cv2-compatible downscale to max_size before painting (INTER_AREA path)
-    let max_size = 1400i32;
+    // cv2-compatible downscale before painting (INTER_AREA path).
+    // max_size param overrides the 1400 default (0 disables the cap).
+    let max_size = p.max_size.unwrap_or(1400).max(0) as i32;
     let src_buf;
     let (sw, sh);
-    if w.max(h) as i32 > max_size {
-        let scale = w.max(h) as f64 / max_size as f64;
-        let dw = ((w as f64 / scale) as usize).max(1);
-        let dh = ((h as f64 / scale) as usize).max(1);
-        src_buf = pipeline::resize_area(in_bytes, w, h, dw, dh, 4);
-        (sw, sh) = (dw, dh);
-    } else {
-        src_buf = in_bytes.to_vec();
-        (sw, sh) = (w, h);
+    match pipeline::downscale_dims(w, h, max_size) {
+        Some((dw, dh, _s)) => {
+            src_buf = pipeline::resize_area(in_bytes, w, h, dw, dh, 4);
+            (sw, sh) = (dw, dh);
+        }
+        None => {
+            src_buf = in_bytes.to_vec();
+            (sw, sh) = (w, h);
+        }
     }
 
     let (painted, _secs) = pipeline::paint_bgra(&src_buf, sw, sh, &p);
     let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, sw * sh * 4) };
     out.copy_from_slice(&painted);
+    LAST_OUT_DIMS.store(
+        (((sh as i64) << 32) | (sw as i64 & 0xffff_ffff)) as i64,
+        std::sync::atomic::Ordering::Relaxed);
     0 // timing measured on the JS side (performance.now)
 }
 
 /// Painted dimensions (after possible internal downscale) for the last call.
 /// Returns packed (sw << 16) | sh.
 #[no_mangle]
-pub extern "C" fn wasm_paint_out_dims(w: i32, h: i32) -> i64 {
-    let max_size = 1400i32;
-    if w.max(h) > max_size {
-        let scale = w.max(h) as f64 / max_size as f64;
-        let dw = ((w as f64 / scale) as usize).max(1);
-        let dh = ((h as f64 / scale) as usize).max(1);
-        return (((dh as i64) << 32) | (dw as i64 & 0xffff_ffff)) as i64;
-    }
-    ((h as i64) << 32) | (w as i64 & 0xffff_ffff)
+pub extern "C" fn wasm_paint_out_dims(_w: i32, _h: i32) -> i64 {
+    // painted dims of the last wasm_paint call (accounts for max_size cap)
+    LAST_OUT_DIMS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Multi-channel coherent paint ("stroke replay"). Blob at `in_ptr` is
@@ -208,6 +210,7 @@ pub extern "C" fn wasm_paint_multi(
             base_radius: 6,
             flow_smooth: 8,
             seed: 42,
+            max_size: None,
         }
     } else {
         match serde_json::from_str(&json) {

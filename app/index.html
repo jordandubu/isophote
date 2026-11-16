@@ -56,6 +56,10 @@ main { flex: 1; display: flex; min-height: 0; }
   padding: 7px 18px; cursor: pointer; font-size: 12.5px; transition: all .12s; }
 #viewBtns .vbtn:hover { color: var(--txt); }
 #viewBtns .vbtn.on { background: var(--elev); color: #fff; }
+#paintQuality { background: transparent; color: var(--txt2); border: none;
+  border-left: 1px solid var(--border); padding: 7px 10px; cursor: pointer;
+  font-size: 12.5px; outline: none; }
+#paintQuality option { background: var(--surface); color: var(--txt); }
 /* image hover actions (enlarge + close, close on the right) */
 #imgWrap { position: relative; display: flex; align-items: center;
   justify-content: center; max-width: 96%; max-height: 96%; }
@@ -207,8 +211,8 @@ input[type=file] { display: none; }
 </div>
 <div id="bridgeState" style="display:none; position:fixed; top:56px; left:50%; transform:translateX(-50%);
   z-index:45; background:var(--surface); border:1px solid var(--border); border-radius:999px;
-  padding:6px 16px; font-size:12px; color:var(--txt2);
-  box-shadow:0 4px 18px rgba(0,0,0,0.45); pointer-events:none;"></div>
+  padding:6px 16px; font-size:12px; color:var(--txt2); cursor:pointer;
+  box-shadow:0 4px 18px rgba(0,0,0,0.45);" title="Click to hide">&#10005;</div>
 <div id="animProgress" style="display:none; position:fixed; inset:0; z-index:60;
   background:rgba(10,10,10,0.75); align-items:center; justify-content:center;">
   <div style="background: var(--surface); border:1px solid var(--border); border-radius:12px;
@@ -225,6 +229,14 @@ input[type=file] { display: none; }
     <div id="viewBtns" style="display:none">
       <button class="vbtn on" id="viewOriginal">Input</button>
       <button class="vbtn" id="viewResult">Result</button>
+      <select id="paintQuality" title="Paint resolution (100% = cap at 1400px, higher keeps more detail, slower)">
+        <option value="1">100%</option>
+        <option value="1.5">150%</option>
+        <option value="2">200%</option>
+        <option value="2.5">250%</option>
+        <option value="3">300%</option>
+        <option value="0">Full</option>
+      </select>
     </div>
     <div id="imgWrap" style="display:none">
       <img id="solo">
@@ -564,6 +576,14 @@ function currentParams() {
     p[k] = parseFloat($(k).value);
   return p;
 }
+// paint resolution: quality multiplier over the 1400px reference cap
+// (1 = old behavior; higher keeps more detail, linearly slower; 0 = none)
+function paintMaxSize() {
+  const q = parseFloat($("paintQuality").value) || 1;
+  if (q <= 0) return 0;
+  return Math.max(1400, Math.round(1400 * q));
+}
+$("paintQuality").onchange = () => scheduleLive();
 async function livePaint() {
   if (liveBusy) { liveQueue = true; return; }
   liveBusy = true;
@@ -571,9 +591,10 @@ async function livePaint() {
   try {
     const params = currentParams();
     // strokes are sized in pixels; keep them proportional to the picture:
-    // the core downscales to 1400 long edge, and 720 is the reference size
-    // where the default sliders were tuned
-    const eff = Math.min(Math.max(srcW, srcH), 1400) / 720;
+    // the core downscales to max_size (default 1400) long edge, and 720 is
+    // the reference size where the default sliders were tuned
+    const ms_ = paintMaxSize();
+    const eff = (ms_ > 0 ? Math.min(Math.max(srcW, srcH), ms_) : Math.max(srcW, srcH)) / 720;
     const s = sscaleFromPos(params.sscale) * eff;
     const { url, ms } = await wasmPaint(srcBgrBytes, srcW, srcH, {
       brush_len: Math.max(4, Math.round(params.len * s)),
@@ -583,6 +604,7 @@ async function livePaint() {
       base_radius: Math.max(2, Math.round(params.base_radius * s)),
       flow_smooth: Math.max(2, Math.round(params.flow_smooth * s)),
       seed: Math.round(params.seed),
+      max_size: ms_,
     });
     paintedURL = url;
     if ($("imgWrap").style.display !== "none") $("solo").src = paintedURL;
@@ -637,6 +659,14 @@ function applyAddonState() {
   if (settings.addonBlender) startBridgePolling(); else stopBridgePolling();
 }
 $("addonBlender").onchange = applyAddonState;
+// pill shows its last message; click to hide until the next one arrives
+let bridgeMsg = "";
+$("bridgeState").onclick = () => { $("bridgeState").style.display = "none"; };
+$("bridgeState").__show = (txt) => {
+  bridgeMsg = txt;
+  $("bridgeState").textContent = txt;
+  $("bridgeState").style.display = "";
+};
 if (settings.addonBlender) { $("sendGroup").style.display = ""; $("bridgeState").style.display = ""; }
 /* ============ Blender bridge ============ */
 const bridge = { on: false, inFlight: false };
@@ -656,7 +686,7 @@ async function bridgePoll() {
   try {
     const r = await fetch(bridgeURL("/poll"), { method: "POST", body: "{}" });
     const d = await r.json();
-    if (d.status) $("bridgeState").textContent = d.status;
+    if (d.status) $("bridgeState").__show(d.status);
     // new multi-channel queue from the addon: {kind:"multi", kinds, pngs[0]=references}
     if (d.kind === "multi" && Array.isArray(d.kinds) && Array.isArray(d.pngs) && d.pngs.length === d.kinds.length && !bridgeImagePending) {
       let h = 0;
@@ -672,14 +702,14 @@ async function bridgePoll() {
           const b64 = d.pngs[i];
           bridgeImgs[k] = { b64, blob: b64ToBlob(b64, "image/png") };
         });
-        $("bridgeState").textContent =
-          `received ${kindList(d.kinds)} — painting ${KIND_LABEL[d.kinds[0]] || d.kinds[0]} in view, all on send…`;
+        $("bridgeState").__show(
+          `received ${kindList(d.kinds)} — painting ${KIND_LABEL[d.kinds[0]] || d.kinds[0]} in view, all on send…`);
         await load(bridgeImgs[d.kinds[0]].blob);   // reference through the normal path
         await livePaint();
         bridgeLastPainted = h;
         fetch(bridgeURL("/ack"), { method: "POST", body: "{}" }).catch(() => {});
-        $("bridgeState").textContent =
-          `received ${kindList(d.kinds)} — adjust sliders freely; ALL channels repaint on Send`;
+        $("bridgeState").__show(
+          `received ${kindList(d.kinds)} — adjust sliders freely; ALL channels repaint on Send`);
       } finally {
         bridgeImagePending = false;
       }
@@ -695,29 +725,29 @@ async function bridgePoll() {
       bridgeLastPainted = h;          // claim immediately: blocks sample load
       bridgeImagePending = true;
       try {
-        $("bridgeState").textContent = "received image — painting…";
+        $("bridgeState").__show("received image — painting…");
         const blob = b64ToBlob(d.bgr_png, "image/png");
         await load(blob);                 // reuse the normal load path
         await livePaint();                // paint now, don't wait for debounce
         bridgeLastPainted = h;
         // painted; ack so the bridge clears it (sticky /poll can't be stolen)
         fetch(bridgeURL("/ack"), { method: "POST", body: "{}" }).catch(() => {});
-        $("bridgeState").textContent = "painted — click Send to Blender when done";
+        $("bridgeState").__show("painted — click Send to Blender when done");
       } finally {
         bridgeImagePending = false;
       }
     }
   } catch (e) {
-    $("bridgeState").textContent = "bridge offline — restart Blender (runs the relay on 127.0.0.1:8778)";
+    $("bridgeState").__show("bridge offline — restart Blender (runs the relay on 127.0.0.1:8778)");
   }
   bridge.inFlight = false;
 }
 async function sendToBlender() {
-  if (!paintedURL) { $("bridgeState").textContent = "nothing painted yet"; return; }
+  if (!paintedURL) { $("bridgeState").__show("nothing painted yet"); return; }
   if (bridgeKinds && bridgeImgs) {
     // multi: repaint ALL queued channels with the current params, reference
     // first; falls back to reference-only (legacy payload) on failure
-    $("bridgeState").textContent = "painting all channels…";
+    $("bridgeState").__show("painting all channels…");
     try {
       const params = coreParamsForSize();
       const blobs = await Promise.all(Object.values(bridgeImgs).map(o => o.blob));
@@ -730,12 +760,12 @@ async function sendToBlender() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ kinds: bridgeKinds, pngs }),
       });
-      $("bridgeState").textContent =
-        `sent ${bridgeKinds.length} maps (${kindList(bridgeKinds)}) — now click 'Apply from Isophote' inside Blender`;
+      $("bridgeState").__show(
+        `sent ${bridgeKinds.length} maps (${kindList(bridgeKinds)}) — now click 'Apply from Isophote' inside Blender`);
       return;
     } catch (e) {
-      $("bridgeState").textContent =
-        `multi paint failed (${e.message || e}) — sending ${KIND_LABEL[bridgeKinds[0]]} only`;
+      $("bridgeState").__show(
+        `multi paint failed (${e.message || e}) — sending ${KIND_LABEL[bridgeKinds[0]]} only`);
       // fall through to the legacy single-channel send
     }
   }
@@ -746,13 +776,14 @@ async function sendToBlender() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ png: b64, kind: bridgeKinds ? bridgeKinds[0] : "normal" }),
   });
-  $("bridgeState").textContent = "sent — now click 'Apply from Isophote' inside Blender";
+  $("bridgeState").__show("sent — now click 'Apply from Isophote' inside Blender");
 }
 
 // current params in core scale (same math as livePaint/_sendAnimatedToBlender)
 function coreParamsForSize() {
   const params = currentParams();
-  const eff = Math.min(Math.max(srcW, srcH), 1400) / 720;
+  const ms_ = paintMaxSize();
+  const eff = (ms_ > 0 ? Math.min(Math.max(srcW, srcH), ms_) : Math.max(srcW, srcH)) / 720;
   const s = sscaleFromPos(params.sscale) * eff;
   return {
     brush_len: Math.max(4, Math.round(params.len * s)),
@@ -762,6 +793,7 @@ function coreParamsForSize() {
     base_radius: Math.max(2, Math.round(params.base_radius * s)),
     flow_smooth: Math.max(2, Math.round(params.flow_smooth * s)),
     seed: Math.round(params.seed),
+    max_size: ms_,
   };
 }
 
@@ -782,12 +814,12 @@ async function decodeToBgra(blob) {
 /* send animated: paint N extra seeds silently and post them all; Blender
    wires them into an image sequence so the paint flickers as strokes */
 async function sendAnimatedToBlender(count = 5) {
-  if (!srcBgrBytes) { $("bridgeState").textContent = "nothing to send"; return; }
+  if (!srcBgrBytes) { $("bridgeState").__show("nothing to send"); return; }
   try {
     await _sendAnimatedToBlender(count);
   } catch (e) {
     $("animProgress").style.display = "none";
-    $("bridgeState").textContent = "animated send failed: " + (e.message || e);
+    $("bridgeState").__show("animated send failed: " + (e.message || e));
   }
 }
 async function _sendAnimatedToBlender(count = 10) {
@@ -800,6 +832,7 @@ async function _sendAnimatedToBlender(count = 10) {
     relief: core0.relief,
     base_radius: core0.base_radius,
     flow_smooth: core0.flow_smooth,
+    max_size: core0.max_size,
   };
   $("animProgress").style.display = "flex";
   $("animBar").style.width = "0%";
@@ -829,8 +862,8 @@ async function _sendAnimatedToBlender(count = 10) {
       body: JSON.stringify({ kinds: bridgeKinds, anim: frames }),
     });
     $("animProgress").style.display = "none";
-    $("bridgeState").textContent =
-      `sent ${total} frames × ${k} maps — now click 'Apply from Isophote' (Animated checked) inside Blender`;
+    $("bridgeState").__show(
+      `sent ${total} frames × ${k} maps — now click 'Apply from Isophote' (Animated checked) inside Blender`);
     return;
   }
   const frames1 = [];
@@ -851,7 +884,7 @@ async function _sendAnimatedToBlender(count = 10) {
     body: JSON.stringify({ anim: frames1 }),
   });
   $("animProgress").style.display = "none";
-  $("bridgeState").textContent = `sent ${frames1.length} frames — now click 'Apply from Isophote' (Animated checked) inside Blender`;
+  $("bridgeState").__show(`sent ${frames1.length} frames — now click 'Apply from Isophote' (Animated checked) inside Blender`);
 }
 /* dropdown wiring */
 $("sendCaret").onclick = (e) => { e.stopPropagation();

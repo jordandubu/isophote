@@ -46,7 +46,7 @@ async function wasmPaint(bgra, w, h, params) {
   } finally {
     wasm.exports.wasm_free(inPtr, bgra.length);
     wasm.exports.wasm_free(pPtr, pb.length);
-    wasm.exports.wasm_free(outPtr, bgra.length);
+    wasm.exports.wasm_free(outPtr, bgra.length);  // allocation was input-size
   }
 }
 

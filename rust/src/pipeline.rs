@@ -12,9 +12,26 @@ pub struct Params {
     pub base_radius: i32,
     pub flow_smooth: i32,
     pub seed: u64,
+    // input downscale cap (long edge). Omitted -> 1400 (old behavior).
+    #[serde(default)]
+    pub max_size: Option<i32>,
 }
 
 // ---------------------------------------------------------------- image ops
+
+/// Long-edge downscale for max_size cap (None/0 = no cap).
+/// Returns Some((dw, dh, scale)) when the image exceeds the cap.
+pub fn downscale_dims(w: usize, h: usize, max_size: i32) -> Option<(usize, usize, f64)> {
+    if max_size <= 0 {
+        return None;
+    }
+    let ms = max_size as usize;
+    if w.max(h) <= ms {
+        return None;
+    }
+    let scale = w.max(h) as f64 / ms as f64;
+    Some((((w as f64 / scale) as usize).max(1), ((h as f64 / scale) as usize).max(1), scale))
+}
 
 /// GaussianBlur equivalent operating on one f32 plane, separable, REFLECT_101
 /// (matches cv2 BORDER_REFLECT). sigma <= 0 → cv2 formula for ksize.
