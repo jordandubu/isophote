@@ -570,7 +570,11 @@ def _bake_map(obj, size: int, kind: str, out_path: str):
             if img:
                 bpy.data.images.remove(img)
             img = bpy.data.images.new(img_name, size, size)
-        img.generated_color = ((0.5, 0.5, 1.0, 1.0) if kind == 'normal'
+        # normal bakes start MAGENTA (sentinel): pixels Cycles never writes
+        # (outside UV islands) are detected and replaced with the neutral
+        # normal afterwards; black (0,0,0) is an INVALID normal and would
+        # bleed black strokes into island interiors when painted
+        img.generated_color = ((1.0, 0.0, 1.0, 1.0) if kind == 'normal'
                                else (0.0, 0.0, 0.0, 1.0))  # neutral default
         img.update()
 
@@ -681,6 +685,16 @@ def _bake_map(obj, size: int, kind: str, out_path: str):
         buf = _np.empty(w * h * ch, dtype=_np.float32)
         img.pixels.foreach_get(buf)
         buf = buf.reshape(h, w, ch)[::-1]  # flip: Blender bottom-up -> top-down
+        if kind == 'normal':
+            # pixels Cycles never wrote keep the magenta sentinel; black is
+            # likewise never a valid object-space unit normal. Replace both
+            # with the neutral normal (0.5, 0.5, 1.0) so the painted map
+            # decodes them to "flat surface" instead of a black artifact.
+            rgb = buf[:, :, :3]
+            magenta = (_np.abs(rgb - _np.array([1.0, 0.0, 1.0],
+                                               dtype=_np.float32)) < 0.02).all(axis=-1)
+            black = (rgb < 1e-4).all(axis=-1)
+            rgb[magenta | black] = (0.5, 0.5, 1.0)
         flat = bpy.data.images.new("Painterly_FlipTmp", w, h, alpha=True)
         # set colorspace BEFORE writing pixels: changing it afterwards
         # invalidates/clears the fresh datablock
