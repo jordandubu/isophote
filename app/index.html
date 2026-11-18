@@ -1056,7 +1056,7 @@ async function _sendAnimatedToBlender(count = 10) {
   $("animBar").style.width = "0%";
   const multi = !!(bridgeKinds && bridgeImgs);
   const k = multi ? bridgeKinds.length : 1;
-  const total = count + 1;
+  const total = count;   // exactly N frames: user asked for N, not N+1
   $("animCount").textContent = multi
     ? `1 / ${total} × ${k} channels` : `1 / ${total}`;
   const frames = [];
@@ -1090,7 +1090,7 @@ async function _sendAnimatedToBlender(count = 10) {
     const ups = await Promise.all(jobs);
     const bgras = ups.map(u => u.bytes);
     const aw = refW, ah = refH;
-    for (let i = 0; i <= count; i++) {
+    for (let i = 0; i < count; i++) {
       const { urls } = await wasmPaintMulti(bgras, aw, ah, { ...core, seed: baseSeed + i });
       const one = [];
       for (const url of urls) one.push(await blobToB64(await (await fetch(url)).blob()));
@@ -1119,12 +1119,12 @@ async function _sendAnimatedToBlender(count = 10) {
     const up = await upscaleImage(srcBgrBytes, srcW, srcH, target1);
     abytes = up.bytes; aW = up.w; aH = up.h;
   }
-  for (let i = 1; i <= count; i++) {
+  for (let i = 1; i < count; i++) {
     const { url } = await wasmPaint(abytes, aW, aH, { ...core, seed: baseSeed + i });
     frames1.push(await blobToB64(await (await fetch(url)).blob()));
-    const pct = Math.round(i / count * 100);
+    const pct = Math.round((i + 1) / count * 100);
     $("animBar").style.width = pct + "%";
-    $("animCount").textContent = `${i + 1} / ${count + 1}`;
+    $("animCount").textContent = `${i + 1} / ${count}`;
   }
   $("animCount").textContent = "sending to Blender…";
   await fetch(bridgeURL("/send_to_blender"), {

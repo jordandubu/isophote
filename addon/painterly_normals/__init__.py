@@ -71,6 +71,7 @@ class PN_OT_apply_animated_from_isophote(bpy.types.Operator):
         tmp = bpy.app.tempdir
         norm_dir = os.path.join(tmp, base + "_anim")
         os.makedirs(norm_dir, exist_ok=True)
+        _clear_anim_dirs(tmp, base, [])
         obj = context.active_object
         mat = obj.active_material if obj else None
         if mat is None or not mat.use_nodes:
@@ -118,6 +119,7 @@ class PN_OT_apply_animated_from_isophote(bpy.types.Operator):
         _bridge_state["result_anim"] = None
         _bridge_state["result_anim_kinds"] = None
         tmp = bpy.app.tempdir
+        _clear_anim_dirs(tmp, base, kinds)
         obj = context.active_object
         mat = obj.active_material if obj else None
         if mat is None or not mat.use_nodes:
@@ -194,6 +196,20 @@ def _paint_targets_for(kind):
         # animated packed map: tex -> Separate Color -> Roughness/Metallic
         return ('Roughness', 'PainterlyOrmAnimTex', 'Non-Color')
     return _PAINT_TARGETS[kind]
+
+
+def _clear_anim_dirs(tmp, base, kinds):
+    """Delete stale sequence frames (<base>[_<kind>]_anim_*.png) so an older
+    larger send can't leave extra numbered files that the SEQUENCE loader
+    plays back as blank/garbage frames."""
+    import glob as _glob
+    for kind in [""] + list(kinds):
+        d = os.path.join(tmp, base + (f"_{kind}_anim" if kind else "_anim"))
+        for old in _glob.glob(os.path.join(d, "*.png")):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
 
 
 def _apply_animated_map(mat, img, start_frame=1, duration=10, kind='normal'):
