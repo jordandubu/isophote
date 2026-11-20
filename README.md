@@ -21,7 +21,7 @@ Most "oil paint" filters smudge pixels in place and look like noise. isophote pa
 
 ## Use it in the browser
 
-Open [jordandubu.github.io/isophote](https://jordandubu.github.io/isophote/), drop a photo (or paste one) → done. Live sliders re-render as you tweak; the hamburger menu holds the effects on phones. When it looks right, hit **Export** to save the PNG.
+Open [jordandubu.github.io/isophote](https://jordandubu.github.io/isophote/), drop a photo (or paste one) → done. Sliders repaint live (a fast low-res draft while you drag, full quality when you stop), and on phones the **Adjust** button opens them as a bottom sheet. Drag the divider in **Split** view (or hold `\`) to compare with the original; scroll to zoom, double-click for 1:1. Press **Boil** to loop an animated preview — a share of strokes repaints each frame, tuned in the *Animation* section. When it looks right, hit **Export** to save the PNG. Settings undo with Ctrl+Z; the **⋯** menu lists all shortcuts.
 
 The render runs on **Rust compiled to WebAssembly** — your browser does all the compute, and the site is fully static.
 
@@ -77,7 +77,7 @@ The browser core is a Rust port of the same pipeline ([`rust/`](rust/)); it's **
 | path | what |
 |---|---|
 | `addon/painterly_normals/` | Blender add-on (pure Python bridge to the web app) |
-| `app/` | static web app (index.html, wasm glue, compiled wasm) — **what the live site serves** |
+| `app/` | static web app (`index.html`, `style.css`, `js/` ES modules + paint worker, compiled wasm) — **what the live site serves** |
 | `rust/` | Rust crate: PCG64 + full pipeline, parity tests against fixtures |
 | `isophote.py` | standalone Python CLI |
 | `serve.py` | tiny static server used in development (`python3 serve.py` → :8799) |
