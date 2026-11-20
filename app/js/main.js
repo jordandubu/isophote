@@ -7,7 +7,7 @@ import { buildPanel } from "./controls.js";
 import { PaintClient, CANCELLED, makeSource, paint, draftUseful, bitmapToPngBlob } from "./engine.js";
 import { createViewer } from "./viewer.js";
 import { createAnim } from "./anim.js";
-import { createBlender } from "./blender.js";
+import { createBlender, KIND_LABEL } from "./blender.js";
 
 const store = createStore(DEFAULTS);
 const viewer = createViewer();
@@ -32,7 +32,7 @@ function toast(text, ms = 5000) {
 $("toast").onclick = () => { $("toast").hidden = true; };
 
 /* ---------- persisted settings (Blender bridge on/off) ---------- */
-const settings = { addonBlender: false, sendAnimated: false };
+const settings = { addonBlender: false, sendAnimated: false, sendHeight: false };
 try { Object.assign(settings, JSON.parse(localStorage.getItem("isophote_settings") || "{}")); } catch { /* corrupt: defaults */ }
 const saveSettings = () => { try { localStorage.setItem("isophote_settings", JSON.stringify(settings)); } catch { /* private mode */ } };
 // the add-on opens the site with ?bridge=1 -> force the bridge on
@@ -61,7 +61,7 @@ function applyResult(res) {
   $("status").textContent = res.draft ? "" : (res.ms / 1000).toFixed(2) + "s";
   viewer.setInfo(`${res.w}×${res.h}` + (res.g.workLong > res.g.outLong ? ` · painted at ${res.g.workLong}px` : "") + (res.draft ? " · draft" : ""));
   old?.close();
-  blender.refresh();
+  syncUi();
 }
 
 async function runDraft() {
@@ -144,7 +144,7 @@ function installSource(s) {
   document.body.classList.add("has-image");
   oldResult?.close();
   oldSource?.close();
-  blender.refresh();
+  syncUi();
 }
 
 async function loadFile(file) {
@@ -170,13 +170,28 @@ function clearSource() {
   viewer.setBusy(null);
   $("status").textContent = "";
   document.body.classList.remove("has-image");
-  blender.refresh();
+  syncUi();
 }
+
+/* channel dropdown: every channel of the current result (base color, normal map,
+   impasto height, relief preview...); all share stroke geometry */
+function syncUi() {
+  blender.refresh();
+  const sel = $("chSelect"), kinds = result && source && source.multi ? result.kinds : [];
+  sel.hidden = kinds.length < 2;
+  sel.replaceChildren(...kinds.map((k) => {
+    const o = document.createElement("option");
+    o.value = k; o.textContent = KIND_LABEL[k] || k;
+    return o;
+  }));
+  sel.value = activeKind;
+}
+$("chSelect").onchange = (e) => setKind(e.target.value);
 
 function setKind(k) {
   activeKind = k;
   viewer.setKind(k);
-  blender.refresh();
+  syncUi();
 }
 
 /* ---------- panel (the Blender section mounts into it) ---------- */
@@ -197,7 +212,7 @@ const anim = createAnim({
 
 const blender = createBlender({
   source: () => source, result: () => result, activeKind: () => activeKind,
-  setKind, loadQueue, ensureFinal, anim, toast,
+  setKind, loadQueue, ensureFinal, anim, toast, sendHeight: () => $("sendHeight").checked,
 });
 blender.setEnabled(settings.addonBlender);
 
@@ -228,6 +243,8 @@ document.addEventListener("click", (e) => {
 });
 $("sendAnimated").checked = settings.sendAnimated;
 $("sendAnimated").onchange = (e) => { settings.sendAnimated = e.target.checked; saveSettings(); };
+$("sendHeight").checked = settings.sendHeight;
+$("sendHeight").onchange = (e) => { settings.sendHeight = e.target.checked; saveSettings(); };
 $("sendBtn").onclick = () => { sendMenu.hidden = true; blender.send($("sendAnimated").checked); };
 $("addonBlender").checked = settings.addonBlender;
 $("addonBlender").onchange = (e) => {
@@ -268,7 +285,7 @@ async function pasteSettings() {
     else toast("clipboard has no isophote settings");
   } catch { toast("can't read the clipboard here — press Ctrl+V on the page instead"); }
 }
-blender.refresh();
+syncUi();
 
 window.addEventListener("paste", (e) => {
   if (e.target.closest("input[type=text],textarea")) return;

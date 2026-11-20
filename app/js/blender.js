@@ -21,10 +21,9 @@ export function createBlender(app) {
 
   const dot = h("span", { class: "conn", title: "" });
   const msg = h("div", { class: "bmsg" });
-  const seg = h("div", { class: "seg", hidden: true });
   const section = h("details", { class: "sec", id: "sec-blender", open: true },
     h("summary", {}, "Blender", dot),
-    h("div", { class: "secbody" }, msg, seg));
+    h("div", { class: "secbody" }, msg));
   section.hidden = true;
   $("blenderSlot").append(section);
 
@@ -41,15 +40,10 @@ export function createBlender(app) {
     dot.title = on ? "Connected to Blender" : "Blender relay offline";
   }
 
-  // channel tabs + enable state follow the current result
+  // send button enable state follows the current result
   function refresh() {
-    const src = app.source(), res = app.result();
-    const ready = !!res;
+        const ready = !!app.result();
     $("sendBtn").disabled = !ready;
-    const kinds = res && src && src.multi ? res.kinds : [];
-    seg.hidden = kinds.length < 2;
-    seg.replaceChildren(...kinds.map((k) =>
-      h("button", { type: "button", class: k === app.activeKind() ? "on" : "", onclick: () => app.setKind(k) }, KIND_LABEL[k] || k)));
   }
 
   async function send(animated) {
@@ -57,7 +51,9 @@ export function createBlender(app) {
     catch (e) { if (e !== CANCELLED) say("send failed: " + (e.message || e)); }
   }
 
-  const sendable = (res) => res.kinds.map((k, i) => [k, i]).filter(([k]) => k !== "preview");
+  // the relief preview is display-only; impasto height is opt-in (Send menu)
+  const sendable = (res) => res.kinds.map((k, i) => [k, i])
+    .filter(([k]) => k !== "preview" && (k !== "height" || app.sendHeight()));
 
   async function sendCurrent() {
     const res = await app.ensureFinal();

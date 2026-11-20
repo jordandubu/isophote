@@ -50,6 +50,7 @@
     <div id="sendMenu" class="pop right" hidden>
       <button type="button" id="sendBtn">Send to Blender</button>
       <label class="check" title="Sends Frames painted with Boil (Animation section) as an animation"><input type="checkbox" id="sendAnimated"> Animated</label>
+      <label class="check" title="Also send the impasto height map (wired as a Bump node; needs the latest add-on). The normal map already carries the relief."><input type="checkbox" id="sendHeight"> Include impasto height</label>
     </div>
   </div>
   <button class="btn icon" id="adjustBtn" title="Adjust" aria-label="Adjust settings">
@@ -70,6 +71,7 @@
         <div class="big">Drop a photo</div>
         <div class="small">or click to browse, or paste &middot; everything runs in your browser</div>
       </div>
+      <select id="chSelect" class="overlay only-image" title="Channel shown on the canvas" aria-label="Channel" hidden></select>
       <div id="viewSeg" class="seg overlay only-image">
         <button type="button" data-mode="orig" title="Original (1) — hold \ to peek">Original</button>
         <button type="button" data-mode="split" title="Compare (2)">Split</button>
