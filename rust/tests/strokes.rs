@@ -29,7 +29,7 @@ fn strokes_match_python_reference() {
     let flow = smooth_flow(flow0, 8);
     let n_strokes = (w * h) as i32 / 140;
     let strokes = generate_strokes(&bgr, w, h, &flow, n_strokes, 45, 3, 4, 0.6, 42);
-    let out_bgra = paint_from_strokes(&bgr, &base, w, h, &strokes, 0.0, 0.0);
+    let out_bgra = paint_from_strokes(&bgr, &base, w, h, &strokes, 0.0);
     struct OutWrap { bgra: Vec<u8> }
     let out = OutWrap { bgra: out_bgra };
     let (_, ref_painted) = read_npy("tests/painted_ref.npy");
@@ -77,7 +77,7 @@ fn multi_replay_same_strokes() {
     }
     let p = Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
                      base_radius: 3, flow_smooth: 4, seed: 7,
-                     max_size: None, impasto: 0.0, impasto_kind: None };
+                     max_size: None, impasto: 0.0 };
     let outs = paint_bgra_multi(&ref_img, &[&chan], w, h, &p, None).unwrap();
     assert_eq!(outs.len(), 2);
     // determinism: same inputs -> identical bytes
@@ -127,10 +127,64 @@ fn multi_replay_same_strokes() {
                          p.brush_len, p.brush_w, p.layers, 0.6, p.seed)
     };
     assert!(!strokes.is_empty());
-    let painted_ref2 = paint_from_strokes(&ref_bgr, &ref_base, w, h, &strokes, p.relief, 0.0);
+    let painted_ref2 = paint_from_strokes(&ref_bgr, &ref_base, w, h, &strokes, p.relief);
     assert_eq!(painted_ref2, outs[0], "generate+paint path != paint_bgra_multi ref");
 
     // validation errors
     assert!(paint_bgra_multi(&ref_img, &[&chan], 0, 32, &p, None).is_err());
     assert!(paint_bgra_multi(&ref_img, &[&chan[..chan.len() - 4]], w, h, &p, None).is_err());
+}
+
+/// Synthetic 48x32 reference + second channel (same images as the replay test).
+fn synth_pair() -> (usize, usize, Vec<u8>, Vec<u8>) {
+    let (w, h) = (48usize, 32usize);
+    let mut ref_img = vec![0u8; w * h * 4];
+    let mut chan = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            ref_img[i] = (x * 5) as u8;
+            ref_img[i + 1] = (y * 7) as u8;
+            ref_img[i + 2] = 128;
+            ref_img[i + 3] = 255;
+            chan[i] = 200u8.saturating_sub((x * 3 % 201) as u8);
+            chan[i + 1] = ((x * x / 4 + y * 3) % 256) as u8;
+            chan[i + 2] = ((x + y * 11) % 256) as u8;
+            chan[i + 3] = 255;
+        }
+    }
+    (w, h, ref_img, chan)
+}
+
+#[test]
+fn impasto_multi_frames() {
+    let (w, h, ref_img, chan) = synth_pair();
+    let params = |impasto: f64| Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
+                                         base_radius: 3, flow_smooth: 4, seed: 7,
+                                         max_size: None, impasto };
+    let kinds = |a: &str, b: &str| vec![Some(a.to_string()), Some(b.to_string())];
+    let cn = kinds("color", "normal");
+    let off = paint_bgra_multi(&ref_img, &[&chan], w, h, &params(0.0), Some(&cn)).unwrap();
+    assert_eq!(off.len(), 2, "impasto 0 must not add a height frame");
+
+    let on = paint_bgra_multi(&ref_img, &[&chan], w, h, &params(1.0), Some(&cn)).unwrap();
+    assert_eq!(on.len(), 3, "impasto > 0 appends the height frame");
+    assert_ne!(on[0], off[0], "color reference not shaded by impasto");
+    assert_eq!(on[1], off[1], "normal channel must not be touched by impasto");
+    let hf = &on[2];
+    assert!(hf.chunks(4).all(|p| p[0] == p[1] && p[1] == p[2] && p[3] == 255), "height not gray");
+    let (lo, hi) = hf.chunks(4).fold((255u8, 0u8), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
+    assert!(hi > lo, "height frame is flat");
+
+    // frame-aligned kinds: [normal, color] shades frame 1, never the reference
+    let nc = kinds("normal", "color");
+    let on2 = paint_bgra_multi(&ref_img, &[&chan], w, h, &params(1.0), Some(&nc)).unwrap();
+    assert_eq!(on2[0], off[0], "normal-kind reference was shaded");
+    assert_ne!(on2[1], off[1], "color-kind channel not shaded");
+
+    // single-image path honours impasto
+    let (single_off, _) = paint_bgra(&ref_img, w, h, &params(0.0));
+    let (single_on, _) = paint_bgra(&ref_img, w, h, &params(1.0));
+    assert_eq!(single_off, off[0], "single path diverged from multi reference at impasto 0");
+    assert_ne!(single_on, single_off, "single path ignores impasto");
 }

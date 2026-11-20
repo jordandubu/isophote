@@ -57,6 +57,7 @@ All knobs with defaults:
 3. **Coherent smoothing** — orientations averaged weighted by coherence, so flat regions inherit nearby directions instead of turning noisy
 4. **Strokes** — polylines walking the flow with direction inertia, color sampled from the original under the stroke midpoint, per-stroke luminance jitter, gradient-first ordering
 5. **Canvas relief** — procedural weave heightmap → normal map → Lambert shading
+6. **Impasto** (web slider, 0 = off) — each stroke becomes a raised, bristle-grooved paint bead in a height field; the base color is lit by it, and a gray height map is sent to Blender
 
 ## Use it inside Blender
 
@@ -64,6 +65,7 @@ The repo ships a Blender add-on (`addon/painterly_normals/`) that bridges the we
 
 - **Send to Isophote** — bakes the object's normal map and opens it in the isophote web app
 - **Apply from Isophote** — pulls the painted result back and wires it into the material as a normal map
+- **Impasto** — when the Impasto slider is above 0, an extra *impasto height* map comes back and is wired through a Bump node (`PainterlyImpastoBump`) after the normal map, so the strokes have real relief; bump distance scales with the mesh's UV density
 - **Apply animated (seeds)** — receives multiple seed-variations the app painted (Send dropdown → *Send animated (10 seeds)*) and wires them as a playing image sequence, giving a flickering hand-painted animation when you play the timeline
 
 Install: download [painterly_normals-0.4.0-isophote.zip](../../releases) (or zip the `addon/painterly_normals/` folder yourself), then Blender → *Preferences → Add-ons → Install from Disk*. The add-on is pure Python — no numpy/cv2 required; all painting happens in your browser.

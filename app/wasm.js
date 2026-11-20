@@ -68,7 +68,8 @@ function slabToUrl(bytes, w, h) {
 
 // Multi-channel coherent paint (stroke replay): bgras[0] is the reference
 // (drives flow + strokes), the rest are painted with the SAME strokes.
-// Returns { urls: [png data URLs (reference first)], ms }. No resize in the
+// Returns { urls: [png data URLs (reference first, plus a trailing gray
+// impasto height map when params.impasto > 0)], ms }. No resize in the
 // core for this path: all frames must be the same w*h already.
 async function wasmPaintMulti(bgras, w, h, params) {
   await wasmReady;
@@ -82,7 +83,8 @@ async function wasmPaintMulti(bgras, w, h, params) {
 
   const inPtr = alloc(blob.length);
   const pPtr = alloc(pb.length);
-  const outPtr = alloc(blob.length);
+  const outLen = frame * (k + 1);  // room for the trailing impasto height frame
+  const outPtr = alloc(outLen);
   try {
     new Uint8Array(wasm.exports.memory.buffer, inPtr, blob.length).set(blob);
     new Uint8Array(wasm.exports.memory.buffer, pPtr, pb.length).set(pb);
@@ -95,14 +97,15 @@ async function wasmPaintMulti(bgras, w, h, params) {
     }
     if (ret < 0) throw new Error("wasm_paint_multi failed: " + ret);
     // snapshot out of wasm memory before decoding (buffer can detach)
-    const out = new Uint8Array(wasm.exports.memory.buffer, outPtr, blob.length).slice();
+    const nOut = wasm.exports.wasm_paint_multi_frames();
+    const out = new Uint8Array(wasm.exports.memory.buffer, outPtr, nOut * frame).slice();
     const urls = [];
-    for (let i = 0; i < k; i++)
+    for (let i = 0; i < nOut; i++)
       urls.push(slabToUrl(out.subarray(i * frame, (i + 1) * frame), w, h));
     return { urls, ms: Math.round(performance.now() - t0) };
   } finally {
     wasm.exports.wasm_free(inPtr, blob.length);
     wasm.exports.wasm_free(pPtr, pb.length);
-    wasm.exports.wasm_free(outPtr, blob.length);
+    wasm.exports.wasm_free(outPtr, outLen);
   }
 }

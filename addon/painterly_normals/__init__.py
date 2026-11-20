@@ -23,7 +23,7 @@ AUTO_NAME = {}   # tracks the last auto-filled Name so user edits are kept
 KIND_LABELS = {
     'normal': 'normal map', 'color': 'base color', 'rough': 'roughness',
     'metal': 'metallic', 'emission': 'emission', 'orm': 'ORM',
-    'other': 'custom',
+    'other': 'custom', 'height': 'impasto height',
 }
 
 
@@ -188,6 +188,8 @@ def _apply_other(mat, path):
 
 def _paint_targets_for(kind):
     """(socket, node_name, colorspace) for a kind; normal gets its chain."""
+    if kind == 'height':
+        return ('Normal', 'PainterlyHeightTex', 'Non-Color')
     if kind == 'normal':
         return ('Normal', 'PainterlyNormalsTex', 'Non-Color')
     if kind == 'other':
@@ -242,6 +244,15 @@ def _apply_animated_map(mat, img, start_frame=1, duration=10, kind='normal'):
         nmap.location = (bsdf.location.x - 200, bsdf.location.y + 200)
         nt.links.new(tex.outputs['Color'], nmap.inputs['Color'])
         nt.links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])
+        return
+
+    if kind == 'height':
+        tex = _apply_height(mat, img, bpy.context.active_object)
+        tex.image_user.frame_duration = duration
+        tex.image_user.frame_start = start_frame
+        tex.image_user.frame_offset = 0
+        tex.image_user.use_cyclic = True
+        tex.image_user.use_auto_refresh = True
         return
 
     target_socket, node_name, _cs = _paint_targets_for(kind)
@@ -466,6 +477,15 @@ class PN_OT_apply_from_isophote(bpy.types.Operator):
                             fb.location = (0, 0)
                             self.report({'WARNING'},
                                         "No Principled BSDF at the top of the material — ORM image on 'PainterlyOrmTex', wire it manually")
+                    elif kind == 'height':
+                        dname = "Painterly_" + os.path.basename(final)
+                        prev = bpy.data.images.get(dname)
+                        if prev:
+                            bpy.data.images.remove(prev)
+                        img = bpy.data.images.load(final, check_existing=False)
+                        img.name = dname
+                        img.colorspace_settings.name = 'Non-Color'
+                        _apply_height(mat, img, obj)
                     elif kind == 'other':
                         _apply_other(mat, final)
                     else:
@@ -834,6 +854,64 @@ def _apply_normal(mat, path):
     # ensure wiring exists (idempotent)
     nt.links.new(tex.outputs['Color'], nmap.inputs['Color'])
     nt.links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])
+
+
+# pairs with the core's height-frame scale (20 / long edge): ridge height
+# ≈ 0.5 × stroke half-width at impasto 1
+IMPASTO_UV_DIVISOR = 40.0
+
+
+def _uv_world_scale(obj):
+    """World units per UV unit: sqrt(mesh area / UV area) of the active UV
+    layer; falls back to max(obj.dimensions) (or 1.0) when no UVs / zero UV
+    area."""
+    fallback = max(obj.dimensions) if obj and max(obj.dimensions) > 0 else 1.0
+    me = obj.data if obj and obj.type == 'MESH' else None
+    if me is None or me.uv_layers.active is None:
+        return fallback
+    uv = me.uv_layers.active.data
+    sc = obj.matrix_world.to_scale()
+    s = (abs(sc.x) + abs(sc.y) + abs(sc.z)) / 3.0
+    area3d = sum(p.area for p in me.polygons) * s * s
+    uva = 0.0
+    for p in me.polygons:
+        li = list(p.loop_indices)
+        acc = 0.0
+        for a, b in zip(li, li[1:] + li[:1]):
+            (x0, y0), (x1, y1) = uv[a].uv, uv[b].uv
+            acc += x0 * y1 - x1 * y0
+        uva += abs(acc) * 0.5
+    if uva <= 1e-12 or area3d <= 0.0:
+        return fallback
+    return (area3d / uva) ** 0.5
+
+
+def _apply_height(mat, img, obj):
+    """Insert the impasto Bump between whatever feeds the Principled Normal
+    and the BSDF. Returns the height tex node."""
+    nt = mat.node_tree
+    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if bsdf is None:
+        bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
+    tex = next((n for n in nt.nodes if n.type == 'TEX_IMAGE' and n.name == "PainterlyHeightTex"), None)
+    if tex is None:
+        tex = nt.nodes.new('ShaderNodeTexImage')
+        tex.name = "PainterlyHeightTex"
+    tex.image = img
+    tex.location = (bsdf.location.x - 600, bsdf.location.y - 520)
+    bump = next((n for n in nt.nodes if n.type == 'BUMP' and n.name == "PainterlyImpastoBump"), None)
+    if bump is None:
+        bump = nt.nodes.new('ShaderNodeBump')
+        bump.name = "PainterlyImpastoBump"
+    bump.location = (bsdf.location.x - 200, bsdf.location.y - 420)
+    bump.inputs['Strength'].default_value = 1.0
+    bump.inputs['Distance'].default_value = _uv_world_scale(obj) / IMPASTO_UV_DIVISOR
+    feed = bsdf.inputs['Normal'].links
+    if feed and feed[0].from_node is not bump:
+        nt.links.new(feed[0].from_socket, bump.inputs['Normal'])
+    nt.links.new(tex.outputs['Color'], bump.inputs['Height'])
+    nt.links.new(bump.outputs['Normal'], bsdf.inputs['Normal'])
+    return tex
 
 
 # non-normal kinds -> (socket, tex node name, colorspace). Roughness and

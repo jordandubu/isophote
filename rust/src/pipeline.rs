@@ -15,31 +15,24 @@ pub struct Params {
     // input downscale cap (long edge). Omitted -> 1400 (old behavior).
     #[serde(default)]
     pub max_size: Option<i32>,
-    /// Impasto ridge strength (0 = off). Tilts the painted normal channel's
-    /// normals along the stroke height gradient ("too much paint").
+    /// Impasto strength (0 = off, bit-identical). Shades color channels by a
+    /// stroke height field; multi path also emits a trailing height frame for
+    /// the Blender Bump node.
     #[serde(default)]
     pub impasto: f64,
-    /// Which queued channel is the normal map (receives the impasto tilt).
-    /// None on color-only painting.
-    #[serde(default)]
-    pub impasto_kind: Option<String>,
 }
 
-/// Companion struct: optional per-channel kind names, same params JSON
-/// (index 0 = reference may be null).
+/// Companion struct: optional per-frame kind names, same params JSON.
+/// Frame-aligned: index 0 = reference kind, index i = chans[i-1].
 #[derive(serde::Deserialize, Default)]
 pub struct KindsHint {
     #[serde(default)]
     pub kinds: Vec<Option<String>>,
 }
 
-/// True when `kinds[chan_index]` names the normal channel.
-pub fn kinds_is_normal(kinds: Option<&[Option<String>]>, chan_index: usize) -> bool {
-    kinds
-        .and_then(|ks| ks.get(chan_index))
-        .and_then(|k| k.as_deref())
-        .map(|k| k == "normal")
-        .unwrap_or(false)
+/// Kind name of frame `i` (kinds are frame-aligned: kinds[0] = reference).
+pub fn kind_at(kinds: Option<&[Option<String>]>, i: usize) -> Option<&str> {
+    kinds.and_then(|ks| ks.get(i)).and_then(|k| k.as_deref())
 }
 
 // ---------------------------------------------------------------- image ops
@@ -669,7 +662,6 @@ pub fn paint_from_strokes(
     h: usize,
     strokes: &[Stroke],
     relief: f64,
-    impasto: f64,
 ) -> Vec<u8> {
     // canvas starts as base (BGRA out)
     let mut canvas: Vec<[f32; 3]> = base
@@ -725,80 +717,145 @@ pub fn paint_from_strokes(
             }
         }
     }
-    if impasto > 0.0 {
-        apply_impasto(&mut out, w, h, strokes, impasto);
-    }
     out
 }
 
-/// Impasto: ridges where strokes were laid. Rasterize each stroke into a
-/// height buffer (soft bumps along the centerline, height ~ brush width),
-/// Sobel it, and tilt the painted normal map's XY by the gradient. Applied
-/// ONLY to the normal channel; the painted RGB is reprojected back to unit
-/// normals in 0..1 space (same math as the addon's `_renormalize_file`).
-fn apply_impasto(out: &mut [u8], w: usize, h: usize, strokes: &[Stroke], impasto: f64) {
+/// Paint-thickness height field in PIXEL units from the stroke list
+/// (deterministic: uses only stroke geometry + s.lum, consumes no RNG).
+/// Each stroke is a rounded bead (sqrt cross profile) with bristle grooves,
+/// thinning along the drag and piling up where the brush lifts; later
+/// strokes sit on top of earlier paint.
+pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke]) -> Vec<f32> {
+    use std::f32::consts::TAU;
     let mut height = vec![0f32; w * h];
+    let mut scratch: Vec<f32> = Vec::new();
+    let mut cum: Vec<f32> = Vec::new();
     for s in strokes {
         let poly = &s.pts[..];
-        let half = if s.th <= 1 {
-            0.5
-        } else {
-            ((s.th + 1) / 2) as f64 + 0.5
-        };
-        let peak = half as f32 * 2.0; // taller strokes for wider brushes
-        for seg in 0..poly.len().saturating_sub(1) {
-            let (ax, ay) = (poly[seg].0 as f64, poly[seg].1 as f64);
-            let (bx, by) = (poly[seg + 1].0 as f64, poly[seg + 1].1 as f64);
-            let dx = bx - ax;
-            let dy = by - ay;
+        if poly.len() < 2 {
+            continue;
+        }
+        let half: f32 = if s.th <= 1 { 1.5 } else { ((s.th + 1) / 2) as f32 + 0.5 };
+        cum.clear();
+        cum.push(0.0);
+        for k in 1..poly.len() {
+            let (dx, dy) = (poly[k].0 - poly[k - 1].0, poly[k].1 - poly[k - 1].1);
+            cum.push(cum[k - 1] + (dx * dx + dy * dy).sqrt());
+        }
+        let total = cum[poly.len() - 1];
+        if total < 1e-3 {
+            continue;
+        }
+        // stroke bbox (pixel indices, inclusive)
+        let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for &(x, y) in poly {
+            minx = minx.min(x);
+            miny = miny.min(y);
+            maxx = maxx.max(x);
+            maxy = maxy.max(y);
+        }
+        let pad = half + 1.0;
+        let bx0 = (minx - pad).floor().max(0.0) as usize;
+        let by0 = (miny - pad).floor().max(0.0) as usize;
+        let bx1 = ((maxx + pad).ceil().max(0.0) as usize).min(w - 1);
+        let by1 = ((maxy + pad).ceil().max(0.0) as usize).min(h - 1);
+        if bx0 > bx1 || by0 > by1 {
+            continue;
+        }
+        let bw = bx1 - bx0 + 1;
+        let bh = by1 - by0 + 1;
+        scratch.clear();
+        scratch.resize(bw * bh, 0.0);
+
+        let period = (0.4 * half).max(3.0);
+        let phase = (s.lum * 61.7).fract() * TAU;
+        for seg in 0..poly.len() - 1 {
+            let (ax, ay) = poly[seg];
+            let (bx, by) = poly[seg + 1];
+            let (dx, dy) = (bx - ax, by - ay);
             let len = (dx * dx + dy * dy).sqrt();
             let (ux, uy) = if len > 0.0 { (dx / len, dy / len) } else { (0.0, 0.0) };
-            let lo_x = ((ax.min(bx) - half - 2.0).floor().max(0.0)) as usize;
-            let lo_y = ((ay.min(by) - half - 2.0).floor().max(0.0)) as usize;
-            let hi_x = ((ax.max(bx) + half + 2.0).ceil().min(w as f64 - 1.0)) as usize;
-            let hi_y = ((ay.max(by) + half + 2.0).ceil().min(h as f64 - 1.0)) as usize;
-            for y in lo_y..=hi_y {
-                let py = y as f64 + 0.5;
-                for x in lo_x..=hi_x {
-                    let px = x as f64 + 0.5;
-                    let proj = (px - ax) * ux + (py - ay) * uy;
-                    if proj < -1.0 || proj > len + 1.0 { continue; }
-                    let perp = (-(px - ax) * uy + (py - ay) * ux).abs();
-                    if perp >= half { continue; }
-                    // ridge profile: cos falloff from the centerline
-                    let bump = ((1.0 - (perp / half) * (perp / half)) as f64)
-                        .max(0.0).sqrt() as f32
-                        * peak;
-                    let i = y * w + x;
-                    if bump > height[i] {
-                        height[i] = bump;
+            let sx0 = ((ax.min(bx) - pad).floor().max(bx0 as f32)) as usize;
+            let sy0 = ((ay.min(by) - pad).floor().max(by0 as f32)) as usize;
+            let sx1 = ((ax.max(bx) + pad).ceil().max(0.0) as usize).min(bx1);
+            let sy1 = ((ay.max(by) + pad).ceil().max(0.0) as usize).min(by1);
+            for y in sy0..=sy1 {
+                let py = y as f32 + 0.5;
+                for x in sx0..=sx1 {
+                    let px = x as f32 + 0.5;
+                    let t = ((px - ax) * ux + (py - ay) * uy).clamp(0.0, len);
+                    let (cx, cy) = (ax + ux * t, ay + uy * t);
+                    let dist = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+                    if dist >= half {
+                        continue;
+                    }
+                    let r = dist / half;
+                    let body = (1.0 - r * r).sqrt();
+                    let sd = -(px - ax) * uy + (py - ay) * ux;
+                    let groove = 1.0 - 0.3 * (0.5 + 0.5 * (TAU * sd / period + phase).cos());
+                    let a = cum[seg] + t;
+                    let along = (1.0 - 0.35 * a / total)
+                        + 0.45 * (-((total - a) / half).powi(2)).exp();
+                    let bump = half * body * groove * along;
+                    let j = (y - by0) * bw + (x - bx0);
+                    if bump > scratch[j] {
+                        scratch[j] = bump;
                     }
                 }
             }
         }
+        for yy in 0..bh {
+            for xx in 0..bw {
+                let bump = scratch[yy * bw + xx];
+                if bump > 0.0 {
+                    let i = (by0 + yy) * w + bx0 + xx;
+                    height[i] = height[i].max(0.5 * height[i] + bump);
+                }
+            }
+        }
     }
-    // tilt the painted normals by the height gradient
-    let gx = sobel3(&height, w, h, 1, 0);
-    let gy = sobel3(&height, w, h, 0, 1);
-    let k = 0.35 * (impasto as f32);
+    gaussian_blur_plane(&height, w, h, 0.8)
+}
+
+/// Shade a BGRA color frame in place by the impasto height (light from
+/// upper-left + wet specular). Flat height leaves pixels unchanged.
+fn shade_impasto(out: &mut [u8], w: usize, h: usize, height: &[f32], impasto: f64) {
+    let gx = sobel3(height, w, h, 1, 0);
+    let gy = sobel3(height, w, h, 0, 1);
+    let g = 0.5 * impasto as f32 / 8.0; // sobel3 = 8x derivative
+    let norm3 = |v: [f32; 3]| {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / l, v[1] / l, v[2] / l]
+    };
+    // image coords, y down: light from upper-left, toward the viewer
+    let l = norm3([-0.5, -0.5, 0.7]);
+    let hv = norm3([l[0], l[1], l[2] + 1.0]);
+    let spec0 = hv[2].powi(40);
     for i in 0..w * h {
-        // BGRA out: B=nx, G=ny, R=nz
-        let nx = out[i * 4] as f32 / 255.0 * 2.0 - 1.0;
-        let ny = out[i * 4 + 1] as f32 / 255.0 * 2.0 - 1.0;
-        let nz = out[i * 4 + 2] as f32 / 255.0 * 2.0 - 1.0;
-        // normalize the painted vector first so the tilt adds evenly
-        let l = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-4);
-        let (nnx, nny, nnz) = (nx / l, ny / l, nz / l);
-        // ridge slopes up left-of-peak: subtract gradient from XY
-        let tx = (nnx - gx[i] * k).clamp(-0.99, 0.99);
-        let ty = (nny - gy[i] * k).clamp(-0.99, 0.99);
-        let tl = (tx * tx + ty * ty + nnz * nnz).sqrt() + 1e-6;
-        out[i * 4] = ((tx / tl * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
-        out[i * 4 + 1] = ((ty / tl * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
-        // keep the sign of nz positive (up-facing)
-        let zn = (nnz.abs() / tl * 0.5 + 0.5) * 255.0;
-        out[i * 4 + 2] = zn.round().clamp(0.0, 255.0) as u8;
+        let n = norm3([-g * gx[i], -g * gy[i], 1.0]);
+        let diff = (n[0] * l[0] + n[1] * l[1] + n[2] * l[2]).max(0.0) / l[2];
+        let nh = (n[0] * hv[0] + n[1] * hv[1] + n[2] * hv[2]).max(0.0);
+        let spec = (nh.powi(40) - spec0).max(0.0);
+        for c in 0..3 {
+            let v = out[i * 4 + c] as f32 * (1.0 + 0.85 * (diff - 1.0)) + 255.0 * 0.22 * spec;
+            out[i * 4 + c] = v.round().clamp(0.0, 255.0) as u8;
+        }
     }
+}
+
+/// Height as gray BGRA for the Blender Bump node:
+/// v = clamp(height_px * impasto * 20 / max(w,h), 0, 1). The 20 pairs with
+/// the addon's IMPASTO_UV_DIVISOR (ridge ≈ 0.5 × half-width at impasto 1).
+fn height_frame(height: &[f32], w: usize, h: usize, impasto: f64) -> Vec<u8> {
+    let k = impasto as f32 * 20.0 / w.max(h) as f32;
+    let mut out = vec![255u8; w * h * 4];
+    for i in 0..w * h {
+        let v = ((height[i] * k).clamp(0.0, 1.0) * 255.0).round() as u8;
+        out[i * 4] = v;
+        out[i * 4 + 1] = v;
+        out[i * 4 + 2] = v;
+    }
+    out
 }
 
 /// cv2.LINE_AA-ish polyline with thickness (anti-aliased coverage).
@@ -952,7 +1009,11 @@ pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, Stri
         0.6,
         p.seed,
     );
-    let out = paint_from_strokes(&bgr, &base, w, h, &strokes, p.relief, 0.0);
+    let mut out = paint_from_strokes(&bgr, &base, w, h, &strokes, p.relief);
+    if p.impasto > 0.0 {
+        let hgt = impasto_height(w, h, &strokes);
+        shade_impasto(&mut out, w, h, &hgt, p.impasto);
+    }
     (out, String::new())
 }
 
@@ -969,12 +1030,14 @@ fn bgra_to_bgr(bgra: &[u8], w: usize, h: usize) -> Vec<u8> {
 
 /// Multi-channel coherent paint: flow + strokes derived from `ref_bgra`
 /// only, then the SAME strokes are stamped on every channel in `chans`
-/// (stroke replay). `chans[0]` is treated as the reference and included in
-/// the returned Vec (element 0 = painted reference), so callers pass ONLY
-/// the other channels: returned.len() == chans.len() + 1 with the reference
-/// first. Every channel gets identical stem/brush geometry and identical
-/// per-stroke lum only when seeded alike; the per-channel color sampling
-/// makes each map its own painting. relief is applied to all.
+/// (stroke replay). The painted reference is element 0 of the returned Vec,
+/// so callers pass ONLY the other channels: returned.len() == chans.len() + 1,
+/// or chans.len() + 2 when impasto > 0 (trailing gray height frame for the
+/// Blender Bump node). `kinds` is frame-aligned (kinds[0] = reference); with
+/// impasto > 0 frames of kind "color" are shaded by the stroke height.
+/// Every channel gets identical stroke geometry and per-stroke lum; the
+/// per-channel color sampling makes each map its own painting. relief is
+/// applied to all.
 pub fn paint_bgra_multi(
     ref_bgra: &[u8],
     chans: &[&[u8]],
@@ -1020,19 +1083,22 @@ pub fn paint_bgra_multi(
         0.6,
         p.seed,
     );
-    let mut out = Vec::with_capacity(chans.len() + 1);
-    out.push(paint_from_strokes(&ref_bgr, &base, w, h, &strokes, p.relief, 0.0));
-    // painted ref is BGRA already (paint_from_strokes emits BGRA); the
-    // result above is the painted reference.
-    for (ci, c) in chans.iter().enumerate() {
-        let is_normal = p.impasto > 0.0 && kinds_is_normal(kinds, ci + 1);
+    let hgt = if p.impasto > 0.0 { Some(impasto_height(w, h, &strokes)) } else { None };
+    let mut out = Vec::with_capacity(chans.len() + 2);
+    // painted reference (BGRA) is frame 0
+    out.push(paint_from_strokes(&ref_bgr, &base, w, h, &strokes, p.relief));
+    for c in chans {
         let cgr = bgra_to_bgr(c, w, h);
         let cbase = kuwahara(&cgr, w, h, p.base_radius);
-        let painted = paint_from_strokes(
-            &cgr, &cbase, w, h, &strokes, p.relief,
-            if is_normal { p.impasto } else { 0.0 },
-        );
-        out.push(painted);
+        out.push(paint_from_strokes(&cgr, &cbase, w, h, &strokes, p.relief));
+    }
+    if let Some(hgt) = hgt {
+        for (i, frame) in out.iter_mut().enumerate() {
+            if kind_at(kinds, i) == Some("color") {
+                shade_impasto(frame, w, h, &hgt, p.impasto);
+            }
+        }
+        out.push(height_frame(&hgt, w, h, p.impasto));
     }
     Ok(out)
 }

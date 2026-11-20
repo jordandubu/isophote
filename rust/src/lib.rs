@@ -62,6 +62,9 @@ mod tests {
 /// Painted dims of the last wasm_paint call (packed (h << 16) | w as i64).
 static LAST_OUT_DIMS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
+/// Frame count written by the last successful wasm_paint_multi call.
+static LAST_MULTI_FRAMES: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 /// Allocate `len` bytes in wasm linear memory. JS fills the returned buffer
 /// via `new Uint8Array(memory.buffer, ptr, len)`.
 #[no_mangle]
@@ -123,7 +126,6 @@ pub extern "C" fn wasm_paint(
             seed: 42,
             max_size: None,
             impasto: 0.0,
-            impasto_kind: None,
         }
     } else {
         match serde_json::from_str(&json) {
@@ -170,10 +172,13 @@ pub extern "C" fn wasm_paint_out_dims(_w: i32, _h: i32) -> i64 {
 /// (drives flow + strokes), frames 1..k are the other channels painted with
 /// the same strokes. Params JSON identical to `wasm_paint`.
 ///
-/// `out_ptr` must hold up to `k*w*h*4` bytes (no downscale here: JS sends
-/// already-decoded same-size frames). On success all `k` painted BGRA
-/// frames are written sequentially at `out_ptr` (reference first, same
-/// order as input) and the return value is `0`.
+/// `out_ptr` must hold `(k+1)*w*h*4` bytes (no downscale here: JS sends
+/// already-decoded same-size frames). On success the painted BGRA frames
+/// are written sequentially at `out_ptr` (reference first, same order as
+/// input) and the return value is `0`; read `wasm_paint_multi_frames()`
+/// frames: `k`, or `k+1` when impasto > 0 (the extra last frame is the gray
+/// impasto height map). Params may carry frame-aligned `"kinds"`
+/// (kinds[0] = reference) so impasto shades only "color" frames.
 ///
 /// On failure returns `N > 0`: the caller must then read the first `N`
 /// bytes at `out_ptr` as the UTF-8 error message. Returns `-1` only for
@@ -214,7 +219,6 @@ pub extern "C" fn wasm_paint_multi(
             seed: 42,
             max_size: None,
             impasto: 0.0,
-            impasto_kind: None,
         }
     } else {
         match serde_json::from_str(&json) {
@@ -223,22 +227,30 @@ pub extern "C" fn wasm_paint_multi(
         }
     };
     let frames: Vec<&[u8]> = (0..k).map(|i| &blob[i * frame..(i + 1) * frame]).collect();
-    // channel kind names (["<ref>", ...]) from the same params JSON; used
-    // only to locate the normal channel for the impasto pass
+    // frame-aligned kind names (kinds[0] = reference) from the same params
+    // JSON; impasto shades only "color" frames
     let kinds: Option<Vec<Option<String>>> = serde_json::from_str::<pipeline::KindsHint>(&json)
         .ok()
         .map(|h| h.kinds);
     match pipeline::paint_bgra_multi(frames[0], &frames[1..], w, h, &p, kinds.as_deref()) {
         Ok(painted) => {
             // no downscale in the multi path: same dims in/out
-            let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, frame * k) };
+            let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, frame * painted.len()) };
             for (dst, src) in out.chunks_exact_mut(frame).zip(painted.iter()) {
                 dst.copy_from_slice(src);
             }
+            LAST_MULTI_FRAMES.store(painted.len() as i32, std::sync::atomic::Ordering::Relaxed);
             0
         }
         Err(e) => write_err(out_ptr, frame * k, e),
     }
+}
+
+/// Painted frame count of the last successful wasm_paint_multi call
+/// (k, or k+1 with the trailing impasto height frame).
+#[no_mangle]
+pub extern "C" fn wasm_paint_multi_frames() -> i32 {
+    LAST_MULTI_FRAMES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Write a UTF-8 error message at `out_ptr`, truncated/zero-padded to `cap`
