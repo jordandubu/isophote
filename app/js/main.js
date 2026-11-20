@@ -32,7 +32,7 @@ function toast(text, ms = 5000) {
 $("toast").onclick = () => { $("toast").hidden = true; };
 
 /* ---------- persisted settings (Blender bridge on/off) ---------- */
-const settings = { addonBlender: false };
+const settings = { addonBlender: false, sendAnimated: false };
 try { Object.assign(settings, JSON.parse(localStorage.getItem("isophote_settings") || "{}")); } catch { /* corrupt: defaults */ }
 const saveSettings = () => { try { localStorage.setItem("isophote_settings", JSON.stringify(settings)); } catch { /* private mode */ } };
 // the add-on opens the site with ?bridge=1 -> force the bridge on
@@ -202,7 +202,7 @@ const blender = createBlender({
 blender.setEnabled(settings.addonBlender);
 
 /* ---------- header ---------- */
-$("openBtn").onclick = $("stageEmpty").onclick = () => $("file").click();
+$("stageEmpty").onclick = () => $("file").click();
 $("file").onchange = (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); e.target.value = ""; };
 $("clearBtn").onclick = clearSource;
 
@@ -219,9 +219,16 @@ async function exportPng() {
 }
 $("exportBtn").onclick = exportPng;
 
-const menu = $("menu");
-$("menuBtn").onclick = (e) => { e.stopPropagation(); menu.hidden = !menu.hidden; };
-document.addEventListener("click", (e) => { if (!e.target.closest("#menu")) menu.hidden = true; });
+const menu = $("menu"), sendMenu = $("sendMenu");
+$("settingsBtn").onclick = (e) => { e.stopPropagation(); sendMenu.hidden = true; menu.hidden = !menu.hidden; };
+$("sendCaret").onclick = (e) => { e.stopPropagation(); menu.hidden = true; sendMenu.hidden = !sendMenu.hidden; };
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#menu")) menu.hidden = true;
+  if (!e.target.closest("#sendMenu")) sendMenu.hidden = true;
+});
+$("sendAnimated").checked = settings.sendAnimated;
+$("sendAnimated").onchange = (e) => { settings.sendAnimated = e.target.checked; saveSettings(); };
+$("sendBtn").onclick = () => { sendMenu.hidden = true; blender.send($("sendAnimated").checked); };
 $("addonBlender").checked = settings.addonBlender;
 $("addonBlender").onchange = (e) => {
   settings.addonBlender = e.target.checked;
@@ -285,7 +292,7 @@ center.addEventListener("drop", (e) => {
 window.addEventListener("keydown", (e) => {
   const typing = e.target.closest("input[type=text],textarea,select");
   const mod = e.ctrlKey || e.metaKey;
-  if (e.key === "Escape") { menu.hidden = true; document.body.classList.remove("sheet"); return; }
+  if (e.key === "Escape") { menu.hidden = true; sendMenu.hidden = true; document.body.classList.remove("sheet"); return; }
   if (mod) {
     if (typing) return;
     const k = e.key.toLowerCase();

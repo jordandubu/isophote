@@ -22,19 +22,17 @@ export function createBlender(app) {
   const dot = h("span", { class: "conn", title: "" });
   const msg = h("div", { class: "bmsg" });
   const seg = h("div", { class: "seg", hidden: true });
-  const sendBtn = h("button", { class: "primary", type: "button", disabled: true, onclick: () => guard(sendCurrent) }, "Send to Blender");
-  const animBtn = h("button", { class: "ghost", type: "button", disabled: true, onclick: () => guard(sendAnimated),
-    title: "Uses Frames and Boil from the Animation section" }, "Send animated");
   const section = h("details", { class: "sec", id: "sec-blender", open: true },
     h("summary", {}, "Blender", dot),
-    h("div", { class: "secbody" }, msg, seg, h("div", { class: "btnrow" }, sendBtn, animBtn)));
+    h("div", { class: "secbody" }, msg, seg));
   section.hidden = true;
   $("blenderSlot").append(section);
 
-  function say(text) {
+  function say(text, ms) {
     if (text === B.msg) return;      // the relay repeats its status on every poll
-    B.msg = text; msg.textContent = text; app.toast(text);
+    B.msg = text; msg.textContent = text; app.toast(text, ms);
   }
+  const SENT_MS = 3000;              // "sent" confirmations are brief
 
   function setConnected(on) {
     if (B.connected === on) return;
@@ -47,16 +45,15 @@ export function createBlender(app) {
   function refresh() {
     const src = app.source(), res = app.result();
     const ready = !!res;
-    sendBtn.disabled = !ready;
-    animBtn.disabled = !ready;
+    $("sendBtn").disabled = !ready;
     const kinds = res && src && src.multi ? res.kinds : [];
     seg.hidden = kinds.length < 2;
     seg.replaceChildren(...kinds.map((k) =>
       h("button", { type: "button", class: k === app.activeKind() ? "on" : "", onclick: () => app.setKind(k) }, KIND_LABEL[k] || k)));
   }
 
-  async function guard(fn) {
-    try { await fn(); }
+  async function send(animated) {
+    try { await (animated ? sendAnimated() : sendCurrent()); }
     catch (e) { if (e !== CANCELLED) say("send failed: " + (e.message || e)); }
   }
 
@@ -71,10 +68,10 @@ export function createBlender(app) {
       for (const [, i] of items) pngs.push(await bitmapToB64(res.bitmaps[i]));
       const kinds = items.map(([k]) => k);
       await post({ kinds, pngs, height_scale: res.heightScale });
-      say(`sent ${kinds.length} maps (${kindList(kinds)}) — now click 'Apply from Isophote' inside Blender`);
+      say(`sent ${kinds.length} maps (${kindList(kinds)}) — now click 'Apply from Isophote' inside Blender`, SENT_MS);
     } else {
       await post({ png: await bitmapToB64(res.bitmaps[0]), kind: "normal" });
-      say("sent — now click 'Apply from Isophote' inside Blender");
+      say("sent — now click 'Apply from Isophote' inside Blender", SENT_MS);
     }
   }
 
@@ -97,12 +94,12 @@ export function createBlender(app) {
         const anim = [];
         for (const f of frames) anim.push(await Promise.all(items.map(([, i]) => bitmapToB64(f.bitmaps[i]))));
         await post({ kinds, anim, height_scale: frames[0].heightScale });
-        say(`sent ${frames.length} frames × ${kinds.length} maps (${kindList(kinds)}) — now click 'Apply from Isophote' (Animated checked) inside Blender`);
+        say(`sent ${frames.length} frames × ${kinds.length} maps (${kindList(kinds)}) — now click 'Apply from Isophote' (Animated checked) inside Blender`, SENT_MS);
       } else {
         const anim = [];
         for (const f of frames) anim.push(await bitmapToB64(f.bitmaps[0]));
         await post({ anim });
-        say(`sent ${frames.length} frames — now click 'Apply from Isophote' (Animated checked) inside Blender`);
+        say(`sent ${frames.length} frames — now click 'Apply from Isophote' (Animated checked) inside Blender`, SENT_MS);
       }
     } finally {
       overlay.hidden = true;
@@ -152,10 +149,11 @@ export function createBlender(app) {
   }
 
   return {
-    refresh,
+    refresh, send,
     setEnabled(on) {
       B.enabled = on;
       section.hidden = !on;
+      $("sendCaret").hidden = !on;
       clearInterval(B.timer); B.timer = null;
       if (on) { poll(); B.timer = setInterval(poll, 1500); refresh(); }
     },
