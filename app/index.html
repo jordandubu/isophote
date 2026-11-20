@@ -671,15 +671,26 @@ async function multiRefRect() {
   multiRef = { refW: dims[best].w, refH: dims[best].h, refLong: Math.max(dims[best].w, dims[best].h) };
   return multiRef;
 }
-function paintTargetLong(refW) {
-  // refW: optional long edge of the multi reference rect (multi mode);
-  // null/undefined = use the page's loaded source (single-image mode)
-  const L = refW == null ? Math.max(srcW, srcH) : refW;
-  // unchecked: image scale disabled — paint at the source's own resolution
-  if (!$("imgscaleOn").checked) return L;
-  const target = imgscaleFromPos(+$("imgscale").value);
-  if (target <= 0) return L;                      // MAX: paint at native size
-  return Math.max(target, Math.min(L, 1400));
+const LOOK_REF = 1024;   // long edge at which the default brushwork is defined
+// Image Scale = output resolution only. out = what the slider asks for;
+// work = what the core paints at (then area-downscales to out). Work never
+// drops below LOOK_REF/strokeScale, so the brushwork keeps one look at any out.
+// ref: multi reference rect ({refW, refH}) or null (single image mode).
+function paintGeom(ref) {
+  const sw = ref ? ref.refW : srcW, sh = ref ? ref.refH : srcH;
+  const L = Math.max(sw, sh);
+  let outLong = L;                                   // unchecked or MAX: source size
+  if ($("imgscaleOn").checked) {
+    const t = imgscaleFromPos(+$("imgscale").value);
+    if (t > 0) outLong = t;
+  }
+  const ss = sscaleFromPos(parseFloat($("sscale").value));
+  const need = Math.min(LOOK_REF, LOOK_REF / ss);
+  const shrink = Math.max(1, Math.ceil(need / outLong - 1e-9));   // integer: exact box filter
+  const workLong = outLong * shrink;
+  return { outLong, workLong, look: ss * workLong / LOOK_REF,
+           workW: Math.max(1, Math.round(sw * workLong / L)),
+           workH: Math.max(1, Math.round(sh * workLong / L)) };
 }
 $("imgscaleOn").onchange = () => scheduleLive();
 $("impastoKnife").onchange = () => scheduleLive();
@@ -695,36 +706,20 @@ async function livePaint() {
   $("status").textContent = "painting…";
   try {
     const params = currentParams();
-    // strokes are sized in pixels; keep them proportional to the picture:
-    // the core downscales the input to max_size (long edge) before painting,
-    // 720 is the reference size where the default sliders were tuned
+    // strokes are sized in pixels; coreParamsForSize keeps them proportional
+    // to the painted size (720 = reference size the default sliders were tuned at)
     const ref = multiRefVal();
-    const t_ = paintTargetLong(ref ? ref.refLong : null);
+    const g = paintGeom(ref);
     // the core only downsizes; to paint ABOVE source res, pre-upscale here
     let inBytes = srcBgrBytes, inW = srcW, inH = srcH;
     if (ref) {
-      // multi: working rect = reference rect, aspect-true when scaled
-      inW = ref.refLong > t_ ? Math.round(ref.refW * (t_ / ref.refLong)) : ref.refW;
-      inH = ref.refLong > t_ ? Math.round(ref.refH * (t_ / ref.refLong)) : ref.refH;
-    } else if (t_ > Math.max(srcW, srcH)) {
-      const up = await upscaleImage(srcBgrBytes, srcW, srcH, t_);
+      // multi: working rect = reference rect scaled to the work size
+      inW = g.workW; inH = g.workH;
+    } else if (g.workLong > Math.max(srcW, srcH)) {
+      const up = await upscaleImage(srcBgrBytes, srcW, srcH, g.workLong);
       inBytes = up.bytes; inW = up.w; inH = up.h;
     }
-    const eff = t_ / 720;
-    const s = sscaleFromPos(params.sscale) * eff;
-    const core = {
-      brush_len: Math.max(4, Math.round(params.len * s)),
-      brush_w: Math.max(1, Math.round(params.width * s)),
-      layers: Math.round(params.layers),
-      relief: params.relief,
-      base_radius: Math.max(2, Math.round(params.base_radius * s)),
-      flow_smooth: Math.max(2, Math.round(params.flow_smooth * s)),
-      seed: Math.round(params.seed),
-      max_size: t_,
-      // impasto shades color maps; multi adds a trailing height map
-      impasto: params.impasto || 0,
-      impasto_knife: $("impastoKnife").checked,
-    };
+    const core = coreParamsForSize(g);
     let url, ms, outW_, outH_;
     if (bridgeKinds && bridgeImgs) {
       // stroke replay: paint EVERY channel with the same strokes, keep
@@ -744,7 +739,7 @@ async function livePaint() {
         const d = dimsPerKind[i];
         if (d.w !== inW || d.h !== inH) {
           // exact destination = reference working dims (aspect-true)
-          jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, t_, inW, inH);
+          jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, g.workLong, inW, inH);
         } else {
           jobs[i] = decodeToBgra(blobs[i]).then(b => ({ bytes: b, w: d.w, h: d.h }));
         }
@@ -768,7 +763,7 @@ async function livePaint() {
       }
       buildChannelTabs();
       url = paintedByKind[activeKind].url;
-      outW_ = mw; outH_ = mh;
+      outW_ = r.w; outH_ = r.h;
     } else {
       ({ url, ms, w: outW_, h: outH_ } = await wasmPaint(inBytes, inW, inH, core));
     }
@@ -778,7 +773,7 @@ async function livePaint() {
     $("export").disabled = false;
     $("bridgeSend").disabled = false;
     // painted resolution, bottom-right of the canvas
-    $("outRes").textContent = `${outW_}×${outH_}`;
+    $("outRes").textContent = `${outW_}×${outH_}` + (g.workLong > g.outLong ? ` · painted at ${g.workLong}px` : "");
     $("outRes").style.display = "";
     $("status").textContent = (ms / 1000).toFixed(2) + "s";
   } catch (e) { $("status").textContent = "error: " + (e.message || e); }
@@ -920,7 +915,6 @@ async function sendToBlender() {
     // first; falls back to reference-only (legacy payload) on failure
     $("bridgeState").__show("painting all channels…");
     try {
-      const params = coreParamsForSize();
       // derive STRICTLY from bridgeKinds order (Object.values insertion order
     // may diverge from kinds after mixed legacy/multi sessions)
     const blobs = await Promise.all(bridgeKinds.map(k => bridgeImgs[k].blob));
@@ -932,15 +926,16 @@ async function sendToBlender() {
         bm.close(); return d;
       }));
       const ref = multiRefVal() || await multiRefRect();
-      const t_ = paintTargetLong(ref ? ref.refLong : null);
+      const g = paintGeom(ref);
+      const params = coreParamsForSize(g);
       // reference working size = livePaint's inW×inH for the reference rect
-      const refW2 = ref && ref.refLong > t_ ? Math.round(ref.refW * (t_ / ref.refLong)) : (ref ? ref.refW : srcW);
-      const refH2 = ref && ref.refLong > t_ ? Math.round(ref.refH * (t_ / ref.refLong)) : (ref ? ref.refH : srcH);
+      const refW2 = g.workW;
+      const refH2 = g.workH;
       const jobs = [];
       for (let i = 0; i < bridgeKinds.length; i++) {
         const d = dimsK[i];
         if (d.w !== refW2 || d.h !== refH2) {
-          jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, t_, refW2, refH2);
+          jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, g.workLong, refW2, refH2);
         } else {
           jobs[i] = decodeToBgra(blobs[i]).then(b => ({ bytes: b, w: d.w, h: d.h }));
         }
@@ -987,13 +982,10 @@ async function sendToBlender() {
   $("bridgeState").__show("sent — now click 'Apply from Isophote' inside Blender");
 }
 
-// current params in core scale (same math as livePaint/_sendAnimatedToBlender)
-function coreParamsForSize() {
+// core params for a paintGeom() result (same math for live paint and sends)
+function coreParamsForSize(g) {
   const params = currentParams();
-  const ref = multiRefVal();
-  const ms_ = paintTargetLong(ref ? ref.refLong : null);
-  const eff = ms_ / 720;
-  const s = sscaleFromPos(params.sscale) * eff;
+  const s = sscaleFromPos(params.sscale) * g.workLong / 720;
   return {
     brush_len: Math.max(4, Math.round(params.len * s)),
     brush_w: Math.max(1, Math.round(params.width * s)),
@@ -1002,7 +994,9 @@ function coreParamsForSize() {
     base_radius: Math.max(2, Math.round(params.base_radius * s)),
     flow_smooth: Math.max(2, Math.round(params.flow_smooth * s)),
     seed: Math.round(params.seed),
-    max_size: ms_,
+    max_size: g.workLong,
+    out_size: g.outLong,
+    look_scale: g.look,
     impasto: params.impasto || 0,
     impasto_knife: $("impastoKnife").checked,
   };
@@ -1068,7 +1062,10 @@ async function sendAnimatedToBlender(count = 5) {
 }
 async function _sendAnimatedToBlender(count = 10) {
   const baseSeed = Math.round(parseFloat($("seed").value));
-  const { seed: _seed, ...core } = coreParamsForSize();   // incl. impasto + knife look
+  const multi = !!(bridgeKinds && bridgeImgs);
+  const ref = multi ? (multiRefVal() || await multiRefRect()) : null;
+  const g = paintGeom(ref);
+  const { seed: _seed, ...core } = coreParamsForSize(g);   // incl. impasto + knife look
   // Boil: share of strokes repainted per frame; the rest hold still.
   // 100% = a fresh seed every frame (all strokes reshuffle).
   const boil = +$("animBoil").value / 100;
@@ -1076,7 +1073,6 @@ async function _sendAnimatedToBlender(count = 10) {
                                        : { seed: baseSeed, boil, boil_frame: i };
   $("animProgress").style.display = "flex";
   $("animBar").style.width = "0%";
-  const multi = !!(bridgeKinds && bridgeImgs);
   const k = multi ? bridgeKinds.length : 1;
   const total = count;   // exactly N frames: user asked for N, not N+1
   $("animCount").textContent = multi
@@ -1096,15 +1092,13 @@ async function _sendAnimatedToBlender(count = 10) {
       const d = { w: bm.width, h: bm.height };
       bm.close(); return d;
     }));
-    const ref = multiRefVal() || await multiRefRect();
-    const tA = paintTargetLong(ref ? ref.refLong : null);
-    const refW = ref && ref.refLong > tA ? Math.round(ref.refW * (tA / ref.refLong)) : (ref ? ref.refW : srcW);
-    const refH = ref && ref.refLong > tA ? Math.round(ref.refH * (tA / ref.refLong)) : (ref ? ref.refH : srcH);
+    const refW = g.workW;
+    const refH = g.workH;
     const jobs = [];
     for (let i = 0; i < bridgeKinds.length; i++) {
       const d = dimsA[i];
       if (d.w !== refW || d.h !== refH) {
-        jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, tA, refW, refH);
+        jobs[i] = upscaleImage(await decodeToBgra(blobs[i]), d.w, d.h, g.workLong, refW, refH);
       } else {
         jobs[i] = decodeToBgra(blobs[i]).then(b => ({ bytes: b, w: d.w, h: d.h }));
       }
@@ -1138,7 +1132,7 @@ async function _sendAnimatedToBlender(count = 10) {
   // frame 0 is the current painting
   const blob0 = await (await fetch(paintedURL)).blob();
   frames1.push(await blobToB64(blob0));
-  const target1 = paintTargetLong();
+  const target1 = g.workLong;
   let abytes = srcBgrBytes, aW = srcW, aH = srcH;
   if (target1 > Math.max(srcW, srcH)) {
     const up = await upscaleImage(srcBgrBytes, srcW, srcH, target1);

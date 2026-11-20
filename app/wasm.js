@@ -70,9 +70,9 @@ function slabToUrl(bytes, w, h) {
 // (drives flow + strokes), the rest are painted with the SAME strokes.
 // Returns { urls: [png data URLs (reference first, plus a gray impasto
 // height map and a display-only relief preview when params.impasto > 0)],
-// ms, heightScale (UV thickness of a white height pixel; 0 = no height) }.
-// No resize in the
-// core for this path: all frames must be the same w*h already.
+// ms, heightScale (UV thickness of a white height pixel; 0 = no height),
+// w, h (frame dims: params.out_size area-downscales the painted frames in the core) }.
+// All input frames must be the same w*h already.
 async function wasmPaintMulti(bgras, w, h, params) {
   await wasmReady;
   if (!bgras.length) throw new Error("no channels");
@@ -100,11 +100,14 @@ async function wasmPaintMulti(bgras, w, h, params) {
     if (ret < 0) throw new Error("wasm_paint_multi failed: " + ret);
     // snapshot out of wasm memory before decoding (buffer can detach)
     const nOut = wasm.exports.wasm_paint_multi_frames();
-    const out = new Uint8Array(wasm.exports.memory.buffer, outPtr, nOut * frame).slice();
+    const dims = wasm.exports.wasm_paint_out_dims(w, h);
+    const oh = Number(dims >> 32n), ow = Number(dims & 0xffffffffn);
+    const fo = ow * oh * 4;
+    const out = new Uint8Array(wasm.exports.memory.buffer, outPtr, nOut * fo).slice();
     const urls = [];
     for (let i = 0; i < nOut; i++)
-      urls.push(slabToUrl(out.subarray(i * frame, (i + 1) * frame), w, h));
-    return { urls, ms: Math.round(performance.now() - t0),
+      urls.push(slabToUrl(out.subarray(i * fo, (i + 1) * fo), ow, oh));
+    return { urls, ms: Math.round(performance.now() - t0), w: ow, h: oh,
              heightScale: wasm.exports.wasm_paint_multi_height_scale() };
   } finally {
     wasm.exports.wasm_free(inPtr, blob.length);

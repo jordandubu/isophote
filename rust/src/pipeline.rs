@@ -29,6 +29,24 @@ pub struct Params {
     /// Animation frame index; 0 = base painting (boil has no effect).
     #[serde(default)]
     pub boil_frame: u32,
+    /// Brushwork zoom: multiplies the pixel-unit constants of the paint path.
+    /// 0/omitted = 1.0 (Python-reference behaviour).
+    #[serde(default)]
+    pub look_scale: f64,
+    /// Long edge of the returned frames; painted frames are area-downscaled to
+    /// it. 0/omitted or >= painted long edge = no resize.
+    #[serde(default)]
+    pub out_size: i32,
+}
+
+impl Params {
+    pub fn look(&self) -> f64 {
+        if self.look_scale > 0.0 {
+            self.look_scale
+        } else {
+            1.0
+        }
+    }
 }
 
 /// Companion struct: optional per-frame kind names, same params JSON.
@@ -555,11 +573,20 @@ pub struct Stroke {
 
 /// Walk a stroke polyline from (x0, y0) along the flow field (f32 math like
 /// the python reference). Shared by generate_strokes and boil_strokes.
-fn trace_stroke(x0: f32, y0: f32, flow: &Flow, w: usize, h: usize, length: i32) -> Vec<(f32, f32)> {
+fn trace_stroke(
+    x0: f32,
+    y0: f32,
+    flow: &Flow,
+    w: usize,
+    h: usize,
+    length: i32,
+    look: f64,
+) -> Vec<(f32, f32)> {
     let xi = (x0 as i64).clamp(0, w as i64 - 1) as usize;
     let yi = (y0 as i64).clamp(0, h as i64 - 1) as usize;
     let a = (flow.angle[yi * w + xi] as f32).to_radians();
-    let steps = (length as i64 / 2).max(2) as usize;
+    let step = (2.0 * look) as f32;
+    let steps = ((length as f64 / (2.0 * look)) as i64).max(2) as usize;
     let mut poly: Vec<(f32, f32)> = vec![(x0, y0)];
     let (mut cx, mut cy) = (x0, y0);
     let (mut dx0, mut dy0) = (a.cos(), a.sin());
@@ -582,8 +609,8 @@ fn trace_stroke(x0: f32, y0: f32, flow: &Flow, w: usize, h: usize, length: i32) 
         let nrm = (dx0 * dx0 + dy0 * dy0).sqrt() + 1e-8;
         dx0 /= nrm;
         dy0 /= nrm;
-        cx += 2.0 * dx0;
-        cy += 2.0 * dy0;
+        cx += step * dx0;
+        cy += step * dy0;
         if !(cx >= 0.0 && cx < w as f32 && cy >= 0.0 && cy < h as f32) {
             break;
         }
@@ -607,6 +634,7 @@ pub fn boil_strokes(
     seed: u64,
     frame: u32,
     boil: f64,
+    look: f64,
 ) {
     let mut rng = Pcg64::new(seed ^ (frame as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let step = (h as i32 / (strokes_per_layer as f64).sqrt() as i32).max(2);
@@ -626,6 +654,7 @@ pub fn boil_strokes(
             w,
             h,
             length,
+            look,
         );
         if poly.len() < 3 {
             continue;
@@ -653,6 +682,7 @@ pub fn generate_strokes(
     layers: i32,
     jitter: f64,
     seed: u64,
+    look: f64,
 ) -> Vec<Stroke> {
     let mut rng = Pcg64::new(seed);
     // gradient magnitude of gray
@@ -693,7 +723,7 @@ pub fn generate_strokes(
         });
 
         for (x0, y0) in &pts {
-            let poly = trace_stroke(*x0, *y0, flow, w, h, length);
+            let poly = trace_stroke(*x0, *y0, flow, w, h, length, look);
             if poly.len() < 3 {
                 continue;
             }
@@ -719,6 +749,7 @@ pub fn paint_from_strokes(
     h: usize,
     strokes: &[Stroke],
     relief: f64,
+    look: f64,
 ) -> Vec<u8> {
     // canvas starts as base (BGRA out)
     let mut canvas: Vec<[f32; 3]> = base
@@ -754,7 +785,7 @@ pub fn paint_from_strokes(
     }
 
     // blend: a = clip(blur(updated) * 1.4, 0, 1) * opacity
-    let blurred = gaussian_blur_plane(&updated, w, h, 0.6);
+    let blurred = gaussian_blur_plane(&updated, w, h, 0.6 * look);
     let mut out = vec![0u8; w * h * 4];
     for i in 0..w * h {
         let a = (blurred[i] * 1.4).clamp(0.0, 1.0) * 0.9f32;
@@ -765,7 +796,7 @@ pub fn paint_from_strokes(
         out[i * 4 + 3] = 255;
     }
     if relief > 0.0 {
-        let (shade, _h) = canvas_relief(w, h, 12, relief);
+        let (shade, _h) = canvas_relief(w, h, 12, relief, look);
         for i in 0..w * h {
             let sh = shade[i];
             for c in 0..4 {
@@ -842,7 +873,8 @@ const KNIFE: ImpastoStyle = ImpastoStyle {
 /// blob where the brush lands and a ragged tail where it lifts; a new stroke
 /// flattens what is beneath it to its mean and keeps `keep` of it.
 /// Deterministic (hashes of lum + index), consumes no RNG.
-pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool) -> Vec<f32> {
+pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool, look: f64) -> Vec<f32> {
+    let lk = look as f32;
     let st = if knife { &KNIFE } else { &BRISTLE };
     let mut height = vec![0f32; w * h];
     let mut best: Vec<f32> = Vec::new();
@@ -929,7 +961,7 @@ pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool) -> Ve
 
         // per-stroke randoms from hashes (no RNG consumed)
         let seed = s.lum.to_bits() ^ (idx as u32).wrapping_mul(0x9E37_79B9);
-        let kn = (((2.0 * half / 2.2).round()) as usize).clamp(3, 24);
+        let kn = (((2.0 * half / (2.2 * lk)).round()) as usize).clamp(3, 24);
         let mut gb = [0f32; 24];
         let mut ge = [0f32; 24];
         for i in 0..kn {
@@ -956,7 +988,7 @@ pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool) -> Ve
             let ne = ge[i0] * (1.0 - fr) + ge[i0 + 1] * fr;
             let au = u.abs();
             let cross = (1.0 - au.powi(6)) * (1.0 + st.rim * (-((au - 0.78) / 0.13).powi(2)).exp());
-            let edge = smoothstep(0.0, 1.4, half - sd.abs());
+            let edge = smoothstep(0.0, 1.4 * lk, half - sd.abs());
             let ac = a.clamp(0.0, total);
             let q = ac / total;
             let leff = total - st.rag * half * ne;
@@ -990,16 +1022,25 @@ pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool) -> Ve
             }
         }
     }
-    gaussian_blur_plane(&height, w, h, st.blur as f64)
+    gaussian_blur_plane(&height, w, h, st.blur as f64 * look)
 }
 
 /// Shade a BGRA color frame in place by the impasto height (light from
 /// upper-left + wet specular + darkening in the cavities between strokes).
 /// Flat height leaves pixels unchanged.
-fn shade_impasto(out: &mut [u8], w: usize, h: usize, height: &[f32], impasto: f64, ref_half: f32) {
+fn shade_impasto(
+    out: &mut [u8],
+    w: usize,
+    h: usize,
+    height: &[f32],
+    impasto: f64,
+    ref_half: f32,
+    look: f64,
+) {
+    let lk = look as f32;
     let gx = sobel3(height, w, h, 1, 0);
     let gy = sobel3(height, w, h, 0, 1);
-    let low = gaussian_blur_plane(height, w, h, (0.28 * ref_half).clamp(1.0, 6.0) as f64);
+    let low = gaussian_blur_plane(height, w, h, (0.28 * ref_half).clamp(1.0 * lk, 6.0 * lk) as f64);
     let g = 0.6 * impasto as f32 / 8.0; // sobel3 = 8x derivative
     let norm3 = |v: [f32; 3]| {
         let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
@@ -1039,12 +1080,12 @@ fn height_frame(height: &[f32], w: usize, h: usize, norm_px: f32) -> Vec<u8> {
 
 /// Display-only clay render: mid-gray canvas lit by the impasto shading, so
 /// the relief is visible on the page when no color map is loaded.
-fn preview_frame(w: usize, h: usize, height: &[f32], impasto: f64, ref_half: f32) -> Vec<u8> {
+fn preview_frame(w: usize, h: usize, height: &[f32], impasto: f64, ref_half: f32, look: f64) -> Vec<u8> {
     let mut out = vec![170u8; w * h * 4];
     for i in 0..w * h {
         out[i * 4 + 3] = 255;
     }
-    shade_impasto(&mut out, w, h, height, impasto, ref_half);
+    shade_impasto(&mut out, w, h, height, impasto, ref_half, look);
     out
 }
 
@@ -1148,12 +1189,13 @@ fn draw_polyline(
 
 // ---------------------------------------------------------------- relief
 
-pub fn canvas_relief(w: usize, h: usize, scale: i32, strength: f64) -> (Vec<f32>, Vec<f32>) {
+pub fn canvas_relief(w: usize, h: usize, scale: i32, strength: f64, look: f64) -> (Vec<f32>, Vec<f32>) {
     let mut height = vec![0f32; w * h];
+    let period = scale as f64 * look;
     for y in 0..h {
         for x in 0..w {
-            height[y * w + x] = (0.5 * (x as f64 * std::f64::consts::PI / scale as f64).sin()
-                * (y as f64 * std::f64::consts::PI / scale as f64).sin())
+            height[y * w + x] = (0.5 * (x as f64 * std::f64::consts::PI / period).sin()
+                * (y as f64 * std::f64::consts::PI / period).sin())
                 as f32;
         }
     }
@@ -1167,7 +1209,7 @@ pub fn canvas_relief(w: usize, h: usize, scale: i32, strength: f64) -> (Vec<f32>
     for i in 0..w * h {
         let nx = gx[i] as f64;
         let ny = gy[i] as f64;
-        let nz = 10.0;
+        let nz = 10.0 / look;
         let nl = (nx * nx + ny * ny + nz * nz).sqrt() + 1e-6;
         let v = (nx * lx + ny * ly + nz * lz) / nl;
         let s = v.clamp(-1.0, 1.0) * 0.5 + 0.5;
@@ -1179,14 +1221,15 @@ pub fn canvas_relief(w: usize, h: usize, scale: i32, strength: f64) -> (Vec<f32>
 // ---------------------------------------------------------------- pipeline
 
 pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, String) {
+    let look = p.look();
     // BGRA -> BGR
     let bgr = bgra_to_bgr(bgra, w, h);
     // resize handled by JS (canvas); here we assume already-resized
     let base = kuwahara(&bgr, w, h, p.base_radius);
     let gray = gray_from_bgr(&bgr, w, h);
-    let flow0 = flow_field(&gray, w, h, 2.5);
+    let flow0 = flow_field(&gray, w, h, 2.5 * look);
     let flow = smooth_flow(flow0, p.flow_smooth);
-    let n_strokes = (w * h) as i32 / 140;
+    let n_strokes = (((w * h) as f64 / (140.0 * look * look)) as i32).max(1);
     let mut strokes = generate_strokes(
         &bgr,
         w,
@@ -1198,14 +1241,15 @@ pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, Stri
         p.layers,
         0.6,
         p.seed,
+        look,
     );
     if p.boil_frame > 0 && p.boil > 0.0 {
-        boil_strokes(&mut strokes, w, h, &flow, n_strokes, p.brush_len, p.brush_w, 0.6, p.seed, p.boil_frame, p.boil);
+        boil_strokes(&mut strokes, w, h, &flow, n_strokes, p.brush_len, p.brush_w, 0.6, p.seed, p.boil_frame, p.boil, look);
     }
-    let mut out = paint_from_strokes(&bgr, &base, w, h, &strokes, p.relief);
+    let mut out = paint_from_strokes(&bgr, &base, w, h, &strokes, p.relief, look);
     if p.impasto > 0.0 {
-        let hgt = impasto_height(w, h, &strokes, p.impasto_knife);
-        shade_impasto(&mut out, w, h, &hgt, p.impasto, impasto_ref_half(p.brush_w));
+        let hgt = impasto_height(w, h, &strokes, p.impasto_knife, look);
+        shade_impasto(&mut out, w, h, &hgt, p.impasto, impasto_ref_half(p.brush_w), look);
     }
     (out, String::new())
 }
@@ -1259,12 +1303,13 @@ pub fn paint_bgra_multi(
         ));
     }
 
+    let look = p.look();
     let ref_bgr = bgra_to_bgr(ref_bgra, w, h);
     let base = kuwahara(&ref_bgr, w, h, p.base_radius);
     let gray = gray_from_bgr(&ref_bgr, w, h);
-    let flow0 = flow_field(&gray, w, h, 2.5);
+    let flow0 = flow_field(&gray, w, h, 2.5 * look);
     let flow = smooth_flow(flow0, p.flow_smooth);
-    let n_strokes = (w * h) as i32 / 140;
+    let n_strokes = (((w * h) as f64 / (140.0 * look * look)) as i32).max(1);
     let mut strokes = generate_strokes(
         &ref_bgr,
         w,
@@ -1276,28 +1321,29 @@ pub fn paint_bgra_multi(
         p.layers,
         0.6,
         p.seed,
+        look,
     );
     if p.boil_frame > 0 && p.boil > 0.0 {
-        boil_strokes(&mut strokes, w, h, &flow, n_strokes, p.brush_len, p.brush_w, 0.6, p.seed, p.boil_frame, p.boil);
+        boil_strokes(&mut strokes, w, h, &flow, n_strokes, p.brush_len, p.brush_w, 0.6, p.seed, p.boil_frame, p.boil, look);
     }
-    let hgt = if p.impasto > 0.0 { Some(impasto_height(w, h, &strokes, p.impasto_knife)) } else { None };
+    let hgt = if p.impasto > 0.0 { Some(impasto_height(w, h, &strokes, p.impasto_knife, look)) } else { None };
     let mut out = Vec::with_capacity(chans.len() + 3);
     // painted reference (BGRA) is frame 0
-    out.push(paint_from_strokes(&ref_bgr, &base, w, h, &strokes, p.relief));
+    out.push(paint_from_strokes(&ref_bgr, &base, w, h, &strokes, p.relief, look));
     for c in chans {
         let cgr = bgra_to_bgr(c, w, h);
         let cbase = kuwahara(&cgr, w, h, p.base_radius);
-        out.push(paint_from_strokes(&cgr, &cbase, w, h, &strokes, p.relief));
+        out.push(paint_from_strokes(&cgr, &cbase, w, h, &strokes, p.relief, look));
     }
     if let Some(hgt) = hgt {
         let ref_half = impasto_ref_half(p.brush_w);
         for (i, frame) in out.iter_mut().enumerate() {
             if kind_at(kinds, i) == Some("color") {
-                shade_impasto(frame, w, h, &hgt, p.impasto, ref_half);
+                shade_impasto(frame, w, h, &hgt, p.impasto, ref_half, look);
             }
         }
         out.push(height_frame(&hgt, w, h, impasto_norm_px(p.brush_w)));
-        out.push(preview_frame(w, h, &hgt, p.impasto, ref_half));
+        out.push(preview_frame(w, h, &hgt, p.impasto, ref_half, look));
     }
     Ok(out)
 }

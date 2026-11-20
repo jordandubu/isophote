@@ -109,7 +109,7 @@ mod verify {
     #[test]
     fn relief_matches_python() {
         use isophote_core::pipeline::canvas_relief;
-        let (shade, _) = canvas_relief(135, 180, 12, 0.1);
+        let (shade, _) = canvas_relief(135, 180, 12, 0.1, 1.0);
         let (_, ref_shade) = read_npy("tests/relief_ref.npy");
         let mut max = 0i32;
         for (a, b) in shade.iter().zip(ref_shade.iter()) {

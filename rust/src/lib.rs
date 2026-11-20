@@ -132,6 +132,8 @@ pub extern "C" fn wasm_paint(
             impasto_knife: false,
             boil: 0.0,
             boil_frame: 0,
+            look_scale: 0.0,
+            out_size: 0,
         }
     } else {
         match serde_json::from_str(&json) {
@@ -157,10 +159,16 @@ pub extern "C" fn wasm_paint(
     }
 
     let (painted, _secs) = pipeline::paint_bgra(&src_buf, sw, sh, &p);
-    let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, sw * sh * 4) };
-    out.copy_from_slice(&painted);
+    // out_size: area-downscale the painted frame (brushwork was laid at sw x sh)
+    let (ow, oh) = out_dims(sw, sh, p.out_size);
+    let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, ow * oh * 4) };
+    if (ow, oh) == (sw, sh) {
+        out.copy_from_slice(&painted);
+    } else {
+        out.copy_from_slice(&pipeline::resize_area(&painted, sw, sh, ow, oh, 4));
+    }
     LAST_OUT_DIMS.store(
-        (((sh as i64) << 32) | (sw as i64 & 0xffff_ffff)) as i64,
+        (((oh as i64) << 32) | (ow as i64 & 0xffff_ffff)) as i64,
         std::sync::atomic::Ordering::Relaxed);
     0 // timing measured on the JS side (performance.now)
 }
@@ -178,11 +186,14 @@ pub extern "C" fn wasm_paint_out_dims(_w: i32, _h: i32) -> i64 {
 /// (drives flow + strokes), frames 1..k are the other channels painted with
 /// the same strokes. Params JSON identical to `wasm_paint`.
 ///
-/// `out_ptr` must hold `(k+2)*w*h*4` bytes (no downscale here: JS sends
-/// already-decoded same-size frames). On success the painted BGRA frames
-/// are written sequentially at `out_ptr` (reference first, same order as
-/// input) and the return value is `0`; read `wasm_paint_multi_frames()`
-/// frames: `k`, or `k+2` when impasto > 0 (gray impasto height map, then
+/// `out_ptr` must hold `(k+2)*w*h*4` bytes (JS sends already-decoded
+/// same-size frames; `out_size` in the params area-downscales the painted
+/// frames to that long edge, so the output never exceeds this). On success
+/// the painted BGRA frames
+/// are written sequentially at `out_ptr`, each `ow*oh*4` bytes (dims from
+/// `wasm_paint_out_dims`; reference first, same order as
+/// input) and the return value is `0`; read `wasm_paint_multi_frames()` for the
+/// frame count: `k`, or `k+2` when impasto > 0 (gray impasto height map, then
 /// the display-only relief preview). Params may carry frame-aligned
 /// `"kinds"` (kinds[0] = reference) so impasto shades only "color" frames.
 ///
@@ -228,6 +239,8 @@ pub extern "C" fn wasm_paint_multi(
             impasto_knife: false,
             boil: 0.0,
             boil_frame: 0,
+            look_scale: 0.0,
+            out_size: 0,
         }
     } else {
         match serde_json::from_str(&json) {
@@ -243,11 +256,20 @@ pub extern "C" fn wasm_paint_multi(
         .map(|h| h.kinds);
     match pipeline::paint_bgra_multi(frames[0], &frames[1..], w, h, &p, kinds.as_deref()) {
         Ok(painted) => {
-            // no downscale in the multi path: same dims in/out
-            let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, frame * painted.len()) };
-            for (dst, src) in out.chunks_exact_mut(frame).zip(painted.iter()) {
-                dst.copy_from_slice(src);
+            // out_size: area-downscale each painted frame to the requested long edge
+            let (ow, oh) = out_dims(w, h, p.out_size);
+            let fo = ow * oh * 4;
+            let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, fo * painted.len()) };
+            for (dst, src) in out.chunks_exact_mut(fo).zip(painted.iter()) {
+                if (ow, oh) == (w, h) {
+                    dst.copy_from_slice(src);
+                } else {
+                    dst.copy_from_slice(&pipeline::resize_area(src, w, h, ow, oh, 4));
+                }
             }
+            LAST_OUT_DIMS.store(
+                (((oh as i64) << 32) | (ow as i64 & 0xffff_ffff)) as i64,
+                std::sync::atomic::Ordering::Relaxed);
             LAST_MULTI_FRAMES.store(painted.len() as i32, std::sync::atomic::Ordering::Relaxed);
             LAST_HEIGHT_SCALE.store(
                 pipeline::impasto_height_scale(w, h, &p).to_bits(),
@@ -271,6 +293,11 @@ pub extern "C" fn wasm_paint_multi_frames() -> i32 {
 #[no_mangle]
 pub extern "C" fn wasm_paint_multi_height_scale() -> f32 {
     f32::from_bits(LAST_HEIGHT_SCALE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Output dims for a painted `w x h` frame under `out_size` (0 / >= long edge = unchanged).
+fn out_dims(w: usize, h: usize, out_size: i32) -> (usize, usize) {
+    pipeline::downscale_dims(w, h, out_size).map_or((w, h), |(dw, dh, _)| (dw, dh))
 }
 
 /// Write a UTF-8 error message at `out_ptr`, truncated/zero-padded to `cap`
