@@ -68,6 +68,93 @@ static LAST_MULTI_FRAMES: std::sync::atomic::AtomicI32 = std::sync::atomic::Atom
 /// f32 bits of the last wasm_paint_multi height scale (see wasm_paint_multi_height_scale).
 static LAST_HEIGHT_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Largest PaintStage (+ height field) kept between calls; bigger ones are
+/// dropped right after use so wasm memory does not stay pinned.
+const CACHE_MAX_BYTES: usize = 128 << 20;
+
+/// Last paint stage + impasto height, keyed by everything that shapes the
+/// painting except impasto strength/knife/out_size/kinds (those only change
+/// the final shading or output size, so tweaking them skips the repaint).
+struct StageCache {
+    key: u64,
+    stage: pipeline::PaintStage,
+    /// (knife, height field) for the last impasto look computed on this stage
+    height: Option<(bool, Vec<f32>)>,
+}
+
+static CACHE: std::sync::Mutex<Option<StageCache>> = std::sync::Mutex::new(None);
+
+/// 64-bit multiply-xorshift hash over 8-byte little-endian words (std's
+/// SipHash is ~10x slower on wasm32 and inputs reach hundreds of MB).
+fn hash_words(mut h: u64, bytes: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut chunks = bytes.chunks_exact(8);
+    for c in &mut chunks {
+        h = (h ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(K);
+        h ^= h >> 32;
+    }
+    for &b in chunks.remainder() {
+        h = (h ^ b as u64).wrapping_mul(K);
+        h ^= h >> 32;
+    }
+    h
+}
+
+/// Cache key: entry kind, dims, frame count, every painting param, then the raw input bytes.
+fn stage_key(tag: u8, w: usize, h: usize, k: usize, p: &pipeline::Params, input: &[u8]) -> u64 {
+    let mut key = hash_words(0xcbf2_9ce4_8422_2325, &[tag]);
+    for v in [
+        w as u64,
+        h as u64,
+        k as u64,
+        p.brush_len as i64 as u64,
+        p.brush_w as i64 as u64,
+        p.layers as i64 as u64,
+        p.relief.to_bits(),
+        p.base_radius as i64 as u64,
+        p.flow_smooth as i64 as u64,
+        p.seed,
+        p.max_size.unwrap_or(-1) as i64 as u64,
+        p.boil.to_bits(),
+        p.boil_frame as u64,
+        p.look().to_bits(),
+    ] {
+        key = hash_words(key, &v.to_le_bytes());
+    }
+    hash_words(key, input)
+}
+
+/// Run `f` on the cached stage for `key` (built with `build` on a miss) and,
+/// when `p.impasto > 0`, the impasto height for `p.impasto_knife` (computed
+/// once per stage and look).
+fn with_stage<R>(
+    key: u64,
+    p: &pipeline::Params,
+    build: impl FnOnce() -> pipeline::PaintStage,
+    f: impl FnOnce(&pipeline::PaintStage, Option<&[f32]>) -> R,
+) -> R {
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.as_ref().map_or(true, |c| c.key != key) {
+        *guard = None; // free the old stage before building the new one
+        *guard = Some(StageCache { key, stage: build(), height: None });
+    }
+    let c = guard.as_mut().unwrap();
+    if p.impasto > 0.0 && c.height.as_ref().map_or(true, |(knife, _)| *knife != p.impasto_knife) {
+        let hf = pipeline::impasto_height(c.stage.w, c.stage.h, &c.stage.strokes, p.impasto_knife, p.look());
+        c.height = Some((p.impasto_knife, hf));
+    }
+    let hgt = if p.impasto > 0.0 { c.height.as_ref().map(|(_, v)| &v[..]) } else { None };
+    let r = f(&c.stage, hgt);
+    let px = c.stage.w * c.stage.h;
+    let bytes = (c.stage.frames.len() + 1) * px * 4
+        + c.height.as_ref().map_or(0, |_| px * 4)
+        + c.stage.strokes.iter().map(|s| s.pts.len() * 8 + 32).sum::<usize>();
+    if bytes > CACHE_MAX_BYTES {
+        *guard = None;
+    }
+    r
+}
+
 /// Allocate `len` bytes in wasm linear memory. JS fills the returned buffer
 /// via `new Uint8Array(memory.buffer, ptr, len)`.
 #[no_mangle]
@@ -145,31 +232,33 @@ pub extern "C" fn wasm_paint(
     // cv2-compatible downscale before painting (INTER_AREA path).
     // max_size param overrides the 1400 default (0 disables the cap).
     let max_size = p.max_size.unwrap_or(1400).max(0) as i32;
-    let src_buf;
-    let (sw, sh);
-    match pipeline::downscale_dims(w, h, max_size) {
-        Some((dw, dh, _s)) => {
-            src_buf = pipeline::resize_area(in_bytes, w, h, dw, dh, 4);
-            (sw, sh) = (dw, dh);
+    let key = stage_key(1, w, h, 1, &p, in_bytes);
+    let build = || {
+        let resized;
+        let (src, sw, sh): (&[u8], usize, usize) = match pipeline::downscale_dims(w, h, max_size) {
+            Some((dw, dh, _s)) => {
+                resized = pipeline::resize_area(in_bytes, w, h, dw, dh, 4);
+                (&resized[..], dw, dh)
+            }
+            None => (in_bytes, w, h),
+        };
+        pipeline::paint_stage(src, &[], sw, sh, &p)
+    };
+    with_stage(key, &p, build, |stage, hgt| {
+        let painted = pipeline::finish_single(stage, hgt, &p);
+        let (sw, sh) = (stage.w, stage.h);
+        // out_size: area-downscale the painted frame (brushwork was laid at sw x sh)
+        let (ow, oh) = out_dims(sw, sh, p.out_size);
+        let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, ow * oh * 4) };
+        if (ow, oh) == (sw, sh) {
+            out.copy_from_slice(&painted);
+        } else {
+            out.copy_from_slice(&pipeline::resize_area(&painted, sw, sh, ow, oh, 4));
         }
-        None => {
-            src_buf = in_bytes.to_vec();
-            (sw, sh) = (w, h);
-        }
-    }
-
-    let (painted, _secs) = pipeline::paint_bgra(&src_buf, sw, sh, &p);
-    // out_size: area-downscale the painted frame (brushwork was laid at sw x sh)
-    let (ow, oh) = out_dims(sw, sh, p.out_size);
-    let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, ow * oh * 4) };
-    if (ow, oh) == (sw, sh) {
-        out.copy_from_slice(&painted);
-    } else {
-        out.copy_from_slice(&pipeline::resize_area(&painted, sw, sh, ow, oh, 4));
-    }
-    LAST_OUT_DIMS.store(
-        (((oh as i64) << 32) | (ow as i64 & 0xffff_ffff)) as i64,
-        std::sync::atomic::Ordering::Relaxed);
+        LAST_OUT_DIMS.store(
+            (((oh as i64) << 32) | (ow as i64 & 0xffff_ffff)) as i64,
+            std::sync::atomic::Ordering::Relaxed);
+    });
     0 // timing measured on the JS side (performance.now)
 }
 
@@ -254,31 +343,33 @@ pub extern "C" fn wasm_paint_multi(
     let kinds: Option<Vec<Option<String>>> = serde_json::from_str::<pipeline::KindsHint>(&json)
         .ok()
         .map(|h| h.kinds);
-    match pipeline::paint_bgra_multi(frames[0], &frames[1..], w, h, &p, kinds.as_deref()) {
-        Ok(painted) => {
-            // out_size: area-downscale each painted frame to the requested long edge
-            let (ow, oh) = out_dims(w, h, p.out_size);
-            let fo = ow * oh * 4;
-            let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, fo * painted.len()) };
-            for (dst, src) in out.chunks_exact_mut(fo).zip(painted.iter()) {
-                if (ow, oh) == (w, h) {
-                    dst.copy_from_slice(src);
-                } else {
-                    dst.copy_from_slice(&pipeline::resize_area(src, w, h, ow, oh, 4));
-                }
-            }
-            LAST_OUT_DIMS.store(
-                (((oh as i64) << 32) | (ow as i64 & 0xffff_ffff)) as i64,
-                std::sync::atomic::Ordering::Relaxed);
-            LAST_MULTI_FRAMES.store(painted.len() as i32, std::sync::atomic::Ordering::Relaxed);
-            LAST_HEIGHT_SCALE.store(
-                pipeline::impasto_height_scale(w, h, &p).to_bits(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            0
-        }
-        Err(e) => write_err(out_ptr, frame * k, e),
+    if let Err(e) = pipeline::validate_multi(frames[0], &frames[1..], w, h) {
+        return write_err(out_ptr, frame * k, e);
     }
+    let key = stage_key(2, w, h, k, &p, blob);
+    with_stage(key, &p, || pipeline::paint_stage(frames[0], &frames[1..], w, h, &p), |stage, hgt| {
+        let painted = pipeline::finish_multi(stage, hgt, &p, kinds.as_deref());
+        // out_size: area-downscale each painted frame to the requested long edge
+        let (ow, oh) = out_dims(w, h, p.out_size);
+        let fo = ow * oh * 4;
+        let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, fo * painted.len()) };
+        for (dst, src) in out.chunks_exact_mut(fo).zip(painted.iter()) {
+            if (ow, oh) == (w, h) {
+                dst.copy_from_slice(src);
+            } else {
+                dst.copy_from_slice(&pipeline::resize_area(src, w, h, ow, oh, 4));
+            }
+        }
+        LAST_OUT_DIMS.store(
+            (((oh as i64) << 32) | (ow as i64 & 0xffff_ffff)) as i64,
+            std::sync::atomic::Ordering::Relaxed);
+        LAST_MULTI_FRAMES.store(painted.len() as i32, std::sync::atomic::Ordering::Relaxed);
+        LAST_HEIGHT_SCALE.store(
+            pipeline::impasto_height_scale(w, h, &p).to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    });
+    0
 }
 
 /// Painted frame count of the last successful wasm_paint_multi call

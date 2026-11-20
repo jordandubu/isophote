@@ -1,0 +1,17 @@
+single_art	fe489d5e8e1c46b8
+single_norelief	ecdc7a183df10ba8
+single_look15	1aa99e4206c43013
+single_look04	1824e962be1c25b3
+single_w1	5b980cb63cfefba4
+single_bold	d0b05b4c5bfe2aac
+single_tiny	34043747261fc4f8
+single_boil	36b93d39967a05cc
+multi3/0	bab5780828306bc4
+multi3/1	a6a6a27d6276c687
+multi3/2	af5f52b378e405bc
+kuwahara_r3	097cb78683cdf38a
+kuwahara_r11	c65759b1bce84156
+kuwahara_tiny	dfbc5f85ba64763d
+flow_angle	1c627bdc63c97f15
+flow_coh	47b4df773630a812
+relief_shade	7d04e14f8e4e85cb

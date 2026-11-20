@@ -2,6 +2,7 @@
 //! All buffers are HxWx4 BGRA u8 (alpha ignored on input, 255 on output).
 
 use crate::pcg64::Pcg64;
+use std::borrow::Cow;
 
 #[derive(serde::Deserialize)]
 pub struct Params {
@@ -133,6 +134,57 @@ fn reflect_101(p: i64, n: i64) -> i64 {
     }
 }
 
+/// Separable convolution with a symmetric odd kernel `k`. Per output pixel the
+/// accumulator starts at 0.0 and adds taps in ascending order (bit-identical to
+/// the per-pixel reference loop); interior columns run tap-outer so the inner
+/// loop is a plain elementwise multiply-add the compiler can vectorize.
+fn conv_separable(
+    src: &[f32],
+    w: usize,
+    h: usize,
+    k: &[f32],
+    reflect: impl Fn(i64, i64) -> i64 + Copy,
+) -> Vec<f32> {
+    let half = k.len() / 2;
+    let mut tmp = vec![0f32; w * h];
+    let interior = w > 2 * half;
+    for y in 0..h {
+        let srow = &src[y * w..(y + 1) * w];
+        let trow = &mut tmp[y * w..(y + 1) * w];
+        if interior {
+            let n = w - 2 * half;
+            let dst = &mut trow[half..half + n];
+            for (ki, &kc) in k.iter().enumerate() {
+                let s = &srow[ki..ki + n];
+                for (d, &v) in dst.iter_mut().zip(s) {
+                    *d += v * kc;
+                }
+            }
+        }
+        let (bl, br) = if interior { (half, half) } else { (w, 0) };
+        for x in (0..bl).chain(w - br..w) {
+            let mut acc = 0f32;
+            for (ki, &kc) in k.iter().enumerate() {
+                let sx = reflect(x as i64 + ki as i64 - half as i64, w as i64) as usize;
+                acc += srow[sx] * kc;
+            }
+            trow[x] = acc;
+        }
+    }
+    let mut out = vec![0f32; w * h];
+    for y in 0..h {
+        let orow = &mut out[y * w..(y + 1) * w];
+        for (ki, &kc) in k.iter().enumerate() {
+            let sy = reflect(y as i64 + ki as i64 - half as i64, h as i64) as usize;
+            let trow = &tmp[sy * w..(sy + 1) * w];
+            for (o, &v) in orow.iter_mut().zip(trow) {
+                *o += v * kc;
+            }
+        }
+    }
+    out
+}
+
 /// Gaussian blur on a single f32 plane (separable, reflect101).
 pub fn gaussian_blur_plane(src: &[f32], w: usize, h: usize, sigma_x: f64) -> Vec<f32> {
     if sigma_x <= 0.0 {
@@ -140,66 +192,62 @@ pub fn gaussian_blur_plane(src: &[f32], w: usize, h: usize, sigma_x: f64) -> Vec
     }
     let ksize = (((sigma_x * 4.0 * 2.0 + 1.0).round() as usize) | 1);
     let k = gaussian_kernel(ksize, sigma_x);
-    let half = k.size / 2;
-    let mut tmp = vec![0f32; w * h];
-    // horizontal (GaussianBlur default border = REFLECT_101)
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0f32;
-            for (ki, kx) in (-((half as i64))..=(half as i64)).enumerate() {
-                let sx = reflect_101(x as i64 + kx, w as i64) as usize;
-                acc += src[y * w + sx] * k.coeffs[ki];
-            }
-            tmp[y * w + x] = acc;
-        }
-    }
-    let mut out = vec![0f32; w * h];
-    // vertical
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0f32;
-            for (ki, ky) in (-((half as i64))..=(half as i64)).enumerate() {
-                let sy = reflect_101(y as i64 + ky, h as i64) as usize;
-                acc += tmp[sy * w + x] * k.coeffs[ki];
-            }
-            out[y * w + x] = acc;
-        }
-    }
-    out
+    conv_separable(src, w, h, &k.coeffs, reflect_101)
 }
 
 /// Sobel 3x3 on f32 plane, cv2 default border REFLECT_101 (cv2.Sobel).
+/// Taps are added in row-major order skipping the zero-weight ones (exact:
+/// the accumulator starts at +0.0 and can never become -0.0).
 pub fn sobel3(src: &[f32], w: usize, h: usize, dx: i32, dy: i32) -> Vec<f32> {
     let mut out = vec![0f32; w * h];
-    // kernels (cv2):
-    let kx: [[f32; 3]; 3] = [
-        [-1.0, 0.0, 1.0],
-        [-2.0, 0.0, 2.0],
-        [-1.0, 0.0, 1.0],
-    ]; // dx=1
-    let ky: [[f32; 3]; 3] = [
-        [-1.0, -2.0, -1.0],
-        [0.0, 0.0, 0.0],
-        [1.0, 2.0, 1.0],
-    ]; // dy=1
+    if dx != 1 && dy != 1 {
+        return out;
+    }
+    let kernel = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| -> f32 {
+        // a/b/c = rows y-1 / y / y+1, each as [left, centre, right]
+        let mut acc = 0f32;
+        if dx == 1 {
+            acc += a[0] * -1.0;
+            acc += a[2] * 1.0;
+            acc += b[0] * -2.0;
+            acc += b[2] * 2.0;
+            acc += c[0] * -1.0;
+            acc += c[2] * 1.0;
+        } else {
+            acc += a[0] * -1.0;
+            acc += a[1] * -2.0;
+            acc += a[2] * -1.0;
+            acc += c[0] * 1.0;
+            acc += c[1] * 2.0;
+            acc += c[2] * 1.0;
+        }
+
+        acc
+    };
     for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0f32;
-            for j in -1i64..=1 {
-                for i in -1i64..=1 {
-                    let sy = reflect_101(y as i64 + j, h as i64) as usize;
-                    let sx = reflect_101(x as i64 + i, w as i64) as usize;
-                    let v = src[sy * w + sx];
-                    let kw = j + 1;
-                    let kh = i + 1;
-                    if dx == 1 {
-                        acc += v * kx[kw as usize][kh as usize];
-                    } else if dy == 1 {
-                        acc += v * ky[kw as usize][kh as usize];
-                    }
-                }
+        let y0 = reflect_101(y as i64 - 1, h as i64) as usize;
+        let y2 = reflect_101(y as i64 + 1, h as i64) as usize;
+        let (r0, r1, r2) = (&src[y0 * w..(y0 + 1) * w], &src[y * w..(y + 1) * w], &src[y2 * w..(y2 + 1) * w]);
+        let orow = &mut out[y * w..(y + 1) * w];
+        let edge = |x: usize| -> f32 {
+            let l = reflect_101(x as i64 - 1, w as i64) as usize;
+            let r = reflect_101(x as i64 + 1, w as i64) as usize;
+            kernel([r0[l], r0[x], r0[r]], [r1[l], r1[x], r1[r]], [r2[l], r2[x], r2[r]])
+        };
+        if w < 3 {
+            for x in 0..w {
+                orow[x] = edge(x);
             }
-            out[y * w + x] = acc;
+            continue;
+        }
+        orow[0] = edge(0);
+        orow[w - 1] = edge(w - 1);
+        for x in 1..w - 1 {
+            orow[x] = kernel(
+                [r0[x - 1], r0[x], r0[x + 1]],
+                [r1[x - 1], r1[x], r1[x + 1]],
+                [r2[x - 1], r2[x], r2[x + 1]],
+            );
         }
     }
     out
@@ -275,13 +323,21 @@ pub fn resize_area(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, c: us
 pub fn bgr_to_lab(src: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut out = vec![0u8; w * h * 3];
     // cv2 8-bit Lab uses: L in 0..255 (L*255/100), a/b offset +128
+    // sRGB 8-bit -> linear table (same expression as the former per-pixel call)
+    let lin: [f64; 256] = std::array::from_fn(|v| {
+        let c = v as f64 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    });
     for y in 0..h {
         for x in 0..w {
             let idx = (y * w + x) * 3;
-            let b = src[idx] as f64 / 255.0;
-            let g = src[idx + 1] as f64 / 255.0;
-            let r = src[idx + 2] as f64 / 255.0;
-            let (rl, gl, bl) = srgb_linear(r, g, b);
+            let bl = lin[src[idx] as usize];
+            let gl = lin[src[idx + 1] as usize];
+            let rl = lin[src[idx + 2] as usize];
             // XYZ (D65)
             let xx = 0.412453 * rl + 0.357580 * gl + 0.180423 * bl;
             let yy = 0.212671 * rl + 0.715160 * gl + 0.072169 * bl;
@@ -311,18 +367,8 @@ pub fn bgr_to_lab(src: &[u8], w: usize, h: usize) -> Vec<u8> {
     out
 }
 
-fn srgb_linear(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
-    let lin = |c: f64| -> f64 {
-        if c <= 0.04045 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    (lin(r), lin(g), lin(b))
-}
-
 pub fn lab_to_bgr(lab: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let bins = gamma_bins();
     let mut out = vec![0u8; w * h * 3];
     for y in 0..h {
         for x in 0..w {
@@ -358,6 +404,10 @@ pub fn lab_to_bgr(lab: &[u8], w: usize, h: usize) -> Vec<u8> {
             let bl = 0.055648 * xr - 0.204043 * yr + 1.057311 * zr;
             let gamma = |c: f64| -> u8 {
                 let c = c.clamp(0.0, 1.0);
+                let t = bins[((c * GAMMA_N as f64) as usize).min(GAMMA_N - 1)];
+                if t != 0xFFFF {
+                    return t as u8;
+                }
                 let v = if c <= 0.0031308 {
                     12.92 * c
                 } else {
@@ -371,6 +421,34 @@ pub fn lab_to_bgr(lab: &[u8], w: usize, h: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+const GAMMA_N: usize = 16384;
+
+/// sRGB gamma (f64 [0,1] -> 8-bit) lookup: a bin holds its value only when the
+/// function rounds to the same byte at both bin edges with a 1e-6 margin from
+/// a rounding boundary (monotone => exact inside); 0xFFFF = compute directly.
+fn gamma_bins() -> &'static [u16] {
+    static BINS: std::sync::LazyLock<Box<[u16]>> = std::sync::LazyLock::new(|| {
+        let g = |c: f64| -> f64 {
+            let v = if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+            v * 255.0
+        };
+        let e: Vec<f64> = (0..=GAMMA_N).map(|i| g(i as f64 / GAMMA_N as f64)).collect();
+        let safe = |v: f64| (v - v.floor() - 0.5).abs() > 1e-6;
+        let branch_bin = (0.0031308 * GAMMA_N as f64) as usize;
+        (0..GAMMA_N)
+            .map(|i| {
+                let (a, b) = (e[i], e[i + 1]);
+                if i != branch_bin && a.round() == b.round() && safe(a) && safe(b) {
+                    a.round().clamp(0.0, 255.0) as u16
+                } else {
+                    0xFFFF
+                }
+            })
+            .collect()
+    });
+    &BINS
 }
 
 // ---------------------------------------------------------------- flow field
@@ -454,8 +532,8 @@ pub fn smooth_flow(mut flow: Flow, r: i32) -> Flow {
     let sigma = (r as f64) / 2.0;
     let k1 = gaussian_kernel(ks, sigma);
     // 2D separable kernel
-    let avgx = separable(&vx, w, h, &k1);
-    let avgy = separable(&vy, w, h, &k1);
+    let avgx = conv_separable(&vx, w, h, &k1.coeffs, reflect101);
+    let avgy = conv_separable(&vy, w, h, &k1.coeffs, reflect101);
     let mut angle = vec![0f32; n];
     let mut mag = vec![0f32; n];
     for i in 0..n {
@@ -472,71 +550,105 @@ pub fn smooth_flow(mut flow: Flow, r: i32) -> Flow {
     flow
 }
 
-fn separable(src: &[f32], w: usize, h: usize, k: &Gauss1D) -> Vec<f32> {
-    let half = k.size / 2;
-    let mut tmp = vec![0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0f32;
-            for (ki, kx) in (-((half as i64))..=(half as i64)).enumerate() {
-                let sx = reflect101(x as i64 + kx, w as i64) as usize;
-                acc += src[y * w + sx] * k.coeffs[ki];
-            }
-            tmp[y * w + x] = acc;
-        }
-    }
-    let mut out = vec![0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0f32;
-            for (ki, ky) in (-((half as i64))..=(half as i64)).enumerate() {
-                let sy = reflect101(y as i64 + ky, h as i64) as usize;
-                acc += tmp[sy * w + x] * k.coeffs[ki];
-            }
-            out[y * w + x] = acc;
-        }
-    }
-    out
-}
-
 // ---------------------------------------------------------------- kuwahara
 
+/// Column sums of Lab over a window of padded rows (see `kuwahara`).
+struct ColSums {
+    l: Vec<u32>,
+    l2: Vec<u64>,
+    a: Vec<u32>,
+    b: Vec<u32>,
+}
+
+impl ColSums {
+    fn new(cols: usize) -> Self {
+        ColSums { l: vec![0; cols], l2: vec![0; cols], a: vec![0; cols], b: vec![0; cols] }
+    }
+    /// Add (`add`) or remove one source row of Lab, expanded through `xmap`.
+    fn row(&mut self, lab: &[u8], w: usize, srow: usize, xmap: &[usize], add: bool) {
+        let base = srow * w;
+        for (xi, &sx) in xmap.iter().enumerate() {
+            let p = (base + sx) * 3;
+            let l = lab[p] as u32;
+            let (l2, a, b) = ((l * l) as u64, lab[p + 1] as u32, lab[p + 2] as u32);
+            if add {
+                self.l[xi] += l;
+                self.l2[xi] += l2;
+                self.a[xi] += a;
+                self.b[xi] += b;
+            } else {
+                self.l[xi] -= l;
+                self.l2[xi] -= l2;
+                self.a[xi] -= a;
+                self.b[xi] -= b;
+            }
+        }
+    }
+    /// Sliding window sums [l, l2, a, b] of `n` consecutive columns for every start.
+    fn windows(&self, n: usize, out: &mut Vec<[u64; 4]>) {
+        out.clear();
+        let m = self.l.len() - n + 1;
+        let mut acc = [0u64; 4];
+        for i in 0..n {
+            acc[0] += self.l[i] as u64;
+            acc[1] += self.l2[i];
+            acc[2] += self.a[i] as u64;
+            acc[3] += self.b[i] as u64;
+        }
+        out.push(acc);
+        for i in 0..m - 1 {
+            acc[0] = acc[0] + self.l[i + n] as u64 - self.l[i] as u64;
+            acc[1] = acc[1] + self.l2[i + n] - self.l2[i];
+            acc[2] = acc[2] + self.a[i + n] as u64 - self.a[i] as u64;
+            acc[3] = acc[3] + self.b[i + n] as u64 - self.b[i] as u64;
+            out.push(acc);
+        }
+    }
+}
+
+/// Kuwahara filter on Lab with four (r+1)x(r+1) quadrants around each pixel.
+/// Integer box sums over a reflect101-padded frame (exact, so identical to
+/// summing each window directly): `top` = padded rows [y, y+n), `bot` =
+/// [y+r, y+r+n); quadrant column starts are x and x+r.
 pub fn kuwahara(bgr: &[u8], w: usize, h: usize, radius: i32) -> Vec<u8> {
     let lab = bgr_to_lab(bgr, w, h);
-    let n = radius + 1;
+    let r = radius as usize;
+    let n = r + 1;
+    let hw = n / 2;
+    let pt = (r + hw) as i64;
+    let cols = w + 2 * r;
     let area = n * n;
+    let xmap: Vec<usize> = (0..cols).map(|x| reflect101(x as i64 - pt, w as i64) as usize).collect();
+    let rmap: Vec<usize> = (0..h + 2 * r).map(|y| reflect101(y as i64 - pt, h as i64) as usize).collect();
+    let mut top = ColSums::new(cols);
+    let mut bot = ColSums::new(cols);
+    for yy in 0..n {
+        top.row(&lab, w, rmap[yy], &xmap, true);
+        bot.row(&lab, w, rmap[r + yy], &xmap, true);
+    }
     let mut out = vec![0u8; w * h * 3];
+    let (mut wt, mut wb) = (Vec::new(), Vec::new());
     for y in 0..h {
+        if y > 0 {
+            top.row(&lab, w, rmap[y - 1], &xmap, false);
+            top.row(&lab, w, rmap[y - 1 + n], &xmap, true);
+            bot.row(&lab, w, rmap[y - 1 + r], &xmap, false);
+            bot.row(&lab, w, rmap[y - 1 + r + n], &xmap, true);
+        }
+        top.windows(n, &mut wt);
+        bot.windows(n, &mut wb);
         for x in 0..w {
             let mut best_var = f32::INFINITY;
             let mut best_mean = [0f32; 3];
-            for qi in 0..4 {
-                let (y0, x0) = quadrant_origin(qi, radius);
-                let half_win = (n / 2) as i64;
-                let top = y as i64 + y0 - half_win;
-                let left = x as i64 + x0 - half_win;
-                let mut sum = [0f64; 3];
-                let mut sum2 = 0f64;
-                for yy in 0..n {
-                    let py = reflect101(top + yy as i64, h as i64) as usize;
-                    for xx in 0..n {
-                        let px = reflect101(left + xx as i64, w as i64) as usize;
-                        let pidx = (py * w + px) * 3;
-                        let l = lab[pidx];
-                        sum[0] += l as f64;
-                        sum2 += (l as f64) * (l as f64);
-                        sum[1] += lab[pidx + 1] as f64;
-                        sum[2] += lab[pidx + 2] as f64;
-                    }
-                }
-                let mean = sum[0] / area as f64;
-                let var = sum2 / area as f64 - mean * mean;
+            for s in [wt[x], wt[x + r], wb[x], wb[x + r]] {
+                let mean = s[0] as f64 / area as f64;
+                let var = s[1] as f64 / area as f64 - mean * mean;
                 if (var as f32) < best_var {
                     best_var = var as f32;
                     // NOTE python quirk: colors channel 0 = a, 1 = b, 2 unused; out[0]=mean L
                     best_mean[0] = mean as f32;
-                    best_mean[1] = sum[1] as f32 / area as f32;
-                    best_mean[2] = sum[2] as f32 / area as f32;
+                    best_mean[1] = (s[2] as f64) as f32 / area as f32;
+                    best_mean[2] = (s[3] as f64) as f32 / area as f32;
                 }
             }
             let idx = (y * w + x) * 3;
@@ -546,16 +658,6 @@ pub fn kuwahara(bgr: &[u8], w: usize, h: usize, radius: i32) -> Vec<u8> {
         }
     }
     lab_to_bgr(&out, w, h)
-}
-
-fn quadrant_origin(q: i32, n: i32) -> (i64, i64) {
-    // python offs = [(-r,-r), (-r, 0), (0, -r), (0, 0)]
-    match q {
-        0 => (-(n as i64), -(n as i64)),
-        1 => (-(n as i64), 0),
-        2 => (0, -(n as i64)),
-        _ => (0, 0),
-    }
 }
 
 // ---------------------------------------------------------------- strokes
@@ -737,28 +839,144 @@ pub fn generate_strokes(
     out_strokes
 }
 
-/// Draw pre-generated strokes on `base` sampling colors from `bgr`. With the
-/// same `strokes` the output is bit-identical to the pre-split
-/// render_strokes for the single-channel case: same patch means (f64 sums),
-/// same lum/th, same draw order, same blend, same relief.
-/// `relief` = Params.relief; >0 multiplies in the canvas plane shading.
-pub fn paint_from_strokes(
+/// Result of rasterizing every stroke once: which stroke painted each pixel
+/// last, and the soft blend alpha derived from the coverage mask. Shared by
+/// every channel painted with the same strokes (alpha is always 1.0 per stroke,
+/// so a pixel's canvas colour is exactly the colour of its last stroke).
+pub struct Coverage {
+    /// 0 = untouched, else (stroke index + 1) of the last stroke covering the pixel
+    pub owner: Vec<u32>,
+    /// blend alpha: clip(blur(mask) * 1.4, 0, 1) * 0.9
+    pub alpha: Vec<f32>,
+    /// strokes that own at least one pixel
+    pub used: Vec<bool>,
+}
+
+pub fn rasterize_strokes(w: usize, h: usize, strokes: &[Stroke], look: f64) -> Coverage {
+    let mut owner = vec![0u32; w * h];
+    for (si, s) in strokes.iter().enumerate() {
+        stamp_stroke(&mut owner, w, h, &s.pts, s.th, si as u32 + 1);
+    }
+    let mut used = vec![false; strokes.len()];
+    let mask: Vec<f32> = owner
+        .iter()
+        .map(|&o| {
+            if o != 0 {
+                used[o as usize - 1] = true;
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let blurred = gaussian_blur_plane(&mask, w, h, 0.6 * look);
+    let alpha = blurred.iter().map(|&b| (b * 1.4).clamp(0.0, 1.0) * 0.9f32).collect();
+    Coverage { owner, alpha, used }
+}
+
+/// cv2.LINE_AA-ish polyline with thickness, recorded as stroke ownership.
+/// cv2 thick AA with int32 endpoints renders hard 0/1 coverage; effective
+/// half-width = ceil(th/2) for th>=2 (th=3 spans 5 rows, th=5 spans 7, th=6
+/// spans 7); pixel centre within half+0.5. Each segment scans its own bbox,
+/// narrowed per row to the x-interval that can pass the proj/perp tests (the
+/// tests themselves are unchanged); radius-2 caps at both polyline ends.
+fn stamp_stroke(owner: &mut [u32], w: usize, h: usize, poly: &[(f32, f32)], thickness: i32, id: u32) {
+    let half = if thickness <= 1 {
+        0.5 // th=1 cv2 thin AA line: single-pixel error-diffusion band
+    } else {
+        ((thickness + 1) / 2) as f64 + 0.5
+    };
+    for s in 0..poly.len() - 1 {
+        let (ax, ay) = (poly[s].0.round() as f64, poly[s].1.round() as f64);
+        let (bx, by) = (poly[s + 1].0.round() as f64, poly[s + 1].1.round() as f64);
+        let lo_x = (ax.min(bx) - half - 2.0).floor().max(0.0) as usize;
+        let lo_y = (ay.min(by) - half - 2.0).floor().max(0.0) as usize;
+        let hi_x = (ax.max(bx) + half + 2.0).ceil().min(w as f64 - 1.0) as usize;
+        let hi_y = (ay.max(by) + half + 2.0).ceil().min(h as f64 - 1.0) as usize;
+        let dx = bx - ax;
+        let dy = by - ay;
+        let len = (dx * dx + dy * dy).sqrt();
+        let (ux, uy) = if len > 0.0 { (dx / len, dy / len) } else { (0.0, 0.0) };
+        for y in lo_y..=hi_y {
+            let py = y as f64 + 0.5;
+            if len == 0.0 {
+                // zero-length segment: every pixel of the bbox passes both tests
+                for x in lo_x..=hi_x {
+                    owner[y * w + x] = id;
+                }
+                continue;
+            }
+            let dyv = py - ay;
+            let (mut xl, mut xr) = (lo_x as f64, hi_x as f64);
+            if ux.abs() > 0.01 {
+                let p0 = (-1.0 - dyv * uy) / ux;
+                let p1 = (len + 1.0 - dyv * uy) / ux;
+                let (a, b) = if p0 < p1 { (p0, p1) } else { (p1, p0) };
+                xl = xl.max((ax + a - 0.5 - 1e-6).ceil());
+                xr = xr.min((ax + b - 0.5 + 1e-6).floor());
+            }
+            if uy.abs() > 0.01 {
+                let q0 = (dyv * ux - half) / uy;
+                let q1 = (dyv * ux + half) / uy;
+                let (a, b) = if q0 < q1 { (q0, q1) } else { (q1, q0) };
+                xl = xl.max((ax + a - 0.5 - 1e-6).ceil());
+                xr = xr.min((ax + b - 0.5 + 1e-6).floor());
+            }
+            if xl > xr {
+                continue;
+            }
+            for x in xl as usize..=xr as usize {
+                let px = x as f64 + 0.5;
+                let proj = (px - ax) * ux + (py - ay) * uy;
+                if proj < -1.0 || proj > len + 1.0 {
+                    continue;
+                }
+                let perp = (-(px - ax) * uy + (py - ay) * ux).abs();
+                if perp > half {
+                    continue;
+                }
+                owner[y * w + x] = id;
+            }
+        }
+    }
+    // end caps: radius-2 circles at the two polyline ends
+    for (ex, ey) in [
+        (poly[0].0.round() as f64, poly[0].1.round() as f64),
+        (poly[poly.len() - 1].0.round() as f64, poly[poly.len() - 1].1.round() as f64),
+    ] {
+        let lo_x = (ex - 2.5).floor().max(0.0) as usize;
+        let hi_x = (ex + 2.5).ceil().min(w as f64 - 1.0) as usize;
+        let lo_y = (ey - 2.5).floor().max(0.0) as usize;
+        let hi_y = (ey + 2.5).ceil().min(h as f64 - 1.0) as usize;
+        for y in lo_y..=hi_y {
+            for x in lo_x..=hi_x {
+                let px = x as f64 + 0.5;
+                let py = y as f64 + 0.5;
+                if ((px - ex).powi(2) + (py - ey).powi(2)).sqrt() <= 2.0 {
+                    owner[y * w + x] = id;
+                }
+            }
+        }
+    }
+}
+
+/// Colour every used stroke from `bgr` (f32 patch mean at the stroke midpoint,
+/// f64 accumulation, times lum) and blend the stroke layer over `base`; then
+/// multiply all four bytes by the canvas `shade` plane when present.
+pub fn compose(
     bgr: &[u8],
     base: &[u8],
     w: usize,
     h: usize,
     strokes: &[Stroke],
-    relief: f64,
-    look: f64,
+    cov: &Coverage,
+    shade: Option<&[f32]>,
 ) -> Vec<u8> {
-    // canvas starts as base (BGRA out)
-    let mut canvas: Vec<[f32; 3]> = base
-        .chunks(3)
-        .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
-        .collect();
-    let mut updated = vec![0f32; w * h];
-
-    for s in strokes {
+    let mut cols = vec![[0f32; 3]; strokes.len()];
+    for (si, s) in strokes.iter().enumerate() {
+        if !cov.used[si] {
+            continue;
+        }
         let poly = &s.pts[..];
         // python: f32 patch mean (f64 accumulation in rust, cast to f32),
         // then *lum f32
@@ -776,27 +994,25 @@ pub fn paint_from_strokes(
                 cnt += 1;
             }
         }
-        let col = [
+        cols[si] = [
             ((sb / cnt as f64) as f32 * s.lum).clamp(0.0, 255.0),
             ((sg / cnt as f64) as f32 * s.lum).clamp(0.0, 255.0),
             ((sr / cnt as f64) as f32 * s.lum).clamp(0.0, 255.0),
         ];
-        draw_polyline(&mut canvas, &mut updated, w, h, &poly, col, s.th, 1.0);
     }
-
-    // blend: a = clip(blur(updated) * 1.4, 0, 1) * opacity
-    let blurred = gaussian_blur_plane(&updated, w, h, 0.6 * look);
     let mut out = vec![0u8; w * h * 4];
     for i in 0..w * h {
-        let a = (blurred[i] * 1.4).clamp(0.0, 1.0) * 0.9f32;
+        let a = cov.alpha[i];
+        let o = cov.owner[i];
         for c in 0..3 {
-            let v = canvas[i][c] * a + base[i * 3 + c] as f32 * (1.0 - a);
+            let b = base[i * 3 + c] as f32;
+            let canvas = if o != 0 { cols[o as usize - 1][c] } else { b };
+            let v = canvas * a + b * (1.0 - a);
             out[i * 4 + c] = v.round().clamp(0.0, 255.0) as u8;
         }
         out[i * 4 + 3] = 255;
     }
-    if relief > 0.0 {
-        let (shade, _h) = canvas_relief(w, h, 12, relief, look);
+    if let Some(shade) = shade {
         for i in 0..w * h {
             let sh = shade[i];
             for c in 0..4 {
@@ -808,9 +1024,26 @@ pub fn paint_from_strokes(
     out
 }
 
+/// Draw pre-generated strokes on `base` sampling colors from `bgr`: same patch
+/// means, lum/th, draw order, blend and relief as the single-channel reference.
+/// `relief` = Params.relief; >0 multiplies in the canvas plane shading.
+pub fn paint_from_strokes(
+    bgr: &[u8],
+    base: &[u8],
+    w: usize,
+    h: usize,
+    strokes: &[Stroke],
+    relief: f64,
+    look: f64,
+) -> Vec<u8> {
+    let cov = rasterize_strokes(w, h, strokes, look);
+    let shade = (relief > 0.0).then(|| canvas_relief(w, h, 12, relief, look).0);
+    compose(bgr, base, w, h, strokes, &cov, shade.as_deref())
+}
+
 // ---------------------------------------------------------------- impasto
 
-/// Footprint half-width of a stroke of thickness `th` (matches draw_polyline for th >= 2).
+/// Footprint half-width of a stroke of thickness `th` (matches stamp_stroke for th >= 2).
 fn stroke_half(th: i32) -> f32 {
     if th <= 1 { 1.5 } else { ((th + 1) / 2) as f32 + 0.5 }
 }
@@ -868,20 +1101,57 @@ const KNIFE: ImpastoStyle = ImpastoStyle {
     t_k: 0.8, keep: 0.30, rim: 0.7, groove0: 0.04, groove1: 0.15, rag: 0.5, blur: 0.7, lip: 0.5, deplete: 0.25,
 };
 
+/// exp(-z^2) by table (1024 intervals over |z| < 4.25, linear interpolation,
+/// max error ~4e-6; beyond that the true value is < 1.5e-8 and returns 0).
+fn gauss_table() -> &'static [f32] {
+    static TAB: std::sync::LazyLock<Box<[f32]>> = std::sync::LazyLock::new(|| {
+        (0..=1024).map(|i| (-((i as f64 * 4.25 / 1024.0).powi(2))).exp() as f32).collect()
+    });
+    &TAB
+}
+
+#[inline]
+fn gauss(tab: &[f32], z: f32) -> f32 {
+    let x = z.abs() * (1024.0 / 4.25);
+    if x >= 1024.0 {
+        return 0.0;
+    }
+    let i = x as usize;
+    let f = x - i as f32;
+    tab[i] + (tab[i + 1] - tab[i]) * f
+}
+
+/// smoothstep on an already-normalized coordinate.
+#[inline]
+fn smooth01(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// Paint-thickness field in PIXEL units from the stroke list. Each stroke is
 /// a slab with steep shoulders, raised side rims, hashed bristle grooves, a
 /// blob where the brush lands and a ragged tail where it lifts; a new stroke
 /// flattens what is beneath it to its mean and keeps `keep` of it.
 /// Deterministic (hashes of lum + index), consumes no RNG.
+///
+/// Only pixels within the stroke half-width of the polyline are visited: each
+/// segment scans the parallelogram of its own rectangle (extended past a joint
+/// by the bend wedge) and records the nearest segment per pixel; the profile
+/// is then evaluated on those pixels only.
 pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool, look: f64) -> Vec<f32> {
     let lk = look as f32;
     let st = if knife { &KNIFE } else { &BRISTLE };
+    let tab = gauss_table();
     let mut height = vec![0f32; w * h];
-    let mut best: Vec<f32> = Vec::new();
+    // Scratch over the stroke bbox. Invariant: every `best2` entry is f32::MAX
+    // between strokes (reset through `touched`).
+    let mut best2: Vec<f32> = Vec::new();
     let mut sdv: Vec<f32> = Vec::new();
     let mut av: Vec<f32> = Vec::new();
-    let mut tv: Vec<f32> = Vec::new();
+    let mut touched: Vec<u32> = Vec::new();
+    let mut hits: Vec<(u32, f32)> = Vec::new();
     let mut cum: Vec<f32> = Vec::new();
+    let mut dirs: Vec<(f32, f32, f32)> = Vec::new();
     for (idx, s) in strokes.iter().enumerate() {
         let poly = &s.pts[..];
         if poly.len() < 2 {
@@ -890,9 +1160,13 @@ pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool, look:
         let half = stroke_half(s.th);
         cum.clear();
         cum.push(0.0);
+        dirs.clear();
         for k in 1..poly.len() {
             let (dx, dy) = (poly[k].0 - poly[k - 1].0, poly[k].1 - poly[k - 1].1);
-            cum.push(cum[k - 1] + (dx * dx + dy * dy).sqrt());
+            let len = (dx * dx + dy * dy).sqrt();
+            cum.push(cum[k - 1] + len);
+            // (ux, uy, len); len <= 1e-6 marks a degenerate segment
+            dirs.push(if len <= 1e-6 { (0.0, 0.0, len) } else { (dx / len, dy / len, len) });
         }
         let total = cum[poly.len() - 1];
         if total < 1e-3 {
@@ -916,42 +1190,97 @@ pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool, look:
         }
         let bw = bx1 - bx0 + 1;
         let bh = by1 - by0 + 1;
-        best.clear();
-        best.resize(bw * bh, f32::MAX);
-        sdv.clear();
-        sdv.resize(bw * bh, 0.0);
-        av.clear();
-        av.resize(bw * bh, 0.0);
-        tv.clear();
-        tv.resize(bw * bh, 0.0);
+        if best2.len() < bw * bh {
+            best2.resize(bw * bh, f32::MAX);
+            sdv.resize(bw * bh, 0.0);
+            av.resize(bw * bh, 0.0);
+        }
+        let half2 = half * half;
+
+        // How far past a joint (along the segment axis) a pixel can still be
+        // nearest to this segment: the outer wedge of the bend reaches
+        // half * sin(turn angle); a turn of 90 degrees or more reaches half.
+        let ext = |u: (f32, f32, f32), v: (f32, f32, f32)| -> f32 {
+            if u.2 <= 1e-6 || v.2 <= 1e-6 {
+                return half;
+            }
+            if u.0 * v.0 + u.1 * v.1 <= 0.0 {
+                half
+            } else {
+                (half * (u.0 * v.1 - u.1 * v.0).abs() + 1.0).min(half)
+            }
+        };
 
         // nearest segment per pixel: signed perpendicular offset + arclength
-        for seg in 0..poly.len() - 1 {
-            let (ax, ay) = poly[seg];
-            let (bx, by) = poly[seg + 1];
-            let (dx, dy) = (bx - ax, by - ay);
-            let len = (dx * dx + dy * dy).sqrt();
+        let nseg = poly.len() - 1;
+        for seg in 0..nseg {
+            let (ux, uy, len) = dirs[seg];
             if len <= 1e-6 {
                 continue;
             }
-            let (ux, uy) = (dx / len, dy / len);
+            let (ax, ay) = poly[seg];
             let lo = if seg == 0 { -1.0 } else { 0.0 };
-            let hi = if seg == poly.len() - 2 { len + 1.0 } else { len };
-            let sx0 = ((ax.min(bx) - pad).floor().max(bx0 as f32)) as usize;
-            let sy0 = ((ay.min(by) - pad).floor().max(by0 as f32)) as usize;
-            let sx1 = ((ax.max(bx) + pad).ceil().max(0.0) as usize).min(bx1);
-            let sy1 = ((ay.max(by) + pad).ceil().max(0.0) as usize).min(by1);
-            for y in sy0..=sy1 {
+            let hi = if seg == nseg - 1 { len + 1.0 } else { len };
+            // end caps (proj beyond lo/hi - 1 px) can still be the nearest point
+            // of a pixel; they must occupy it so farther segments cannot claim it
+            let e_lo = if seg == 0 { half } else { ext(dirs[seg - 1], dirs[seg]) };
+            let e_hi = if seg == nseg - 1 { half } else { ext(dirs[seg], dirs[seg + 1]) };
+            let (p0, p1) = ((lo - e_lo) as f64, (hi + e_hi) as f64);
+            let (axd, ayd, uxd, uyd, hd) = (ax as f64, ay as f64, ux as f64, uy as f64, half as f64);
+            // rows: corners of the candidate parallelogram
+            let (mut cy_min, mut cy_max) = (f64::MAX, f64::MIN);
+            for p in [p0, p1] {
+                for sgn in [-1.0f64, 1.0] {
+                    let cy = ayd + uyd * p + uxd * hd * sgn;
+                    cy_min = cy_min.min(cy);
+                    cy_max = cy_max.max(cy);
+                }
+            }
+            let ry0 = (cy_min.floor() as i64 - 1).max(by0 as i64);
+            let ry1 = (cy_max.ceil() as i64 + 1).min(by1 as i64);
+            for y in ry0..=ry1 {
+                let y = y as usize;
                 let py = y as f32 + 0.5;
-                for x in sx0..=sx1 {
+                let dyv = y as f64 + 0.5 - ayd;
+                let (mut xl, mut xr) = (bx0 as f64, bx1 as f64);
+                // x-interval where proj in [p0, p1] and |perp| <= half (0.05 px slack)
+                if uxd.abs() > 0.05 {
+                    let a = (p0 - dyv * uyd) / uxd;
+                    let b = (p1 - dyv * uyd) / uxd;
+                    let (a, b) = if a < b { (a, b) } else { (b, a) };
+                    xl = xl.max((axd + a - 0.5 - 0.05).ceil());
+                    xr = xr.min((axd + b - 0.5 + 0.05).floor());
+                }
+                if uyd.abs() > 0.05 {
+                    let a = (dyv * uxd - hd) / uyd;
+                    let b = (dyv * uxd + hd) / uyd;
+                    let (a, b) = if a < b { (a, b) } else { (b, a) };
+                    xl = xl.max((axd + a - 0.5 - 0.05).ceil());
+                    xr = xr.min((axd + b - 0.5 + 0.05).floor());
+                }
+                if xl > xr {
+                    continue;
+                }
+                for x in xl as usize..=xr as usize {
                     let px = x as f32 + 0.5;
                     let proj = (px - ax) * ux + (py - ay) * uy;
                     let perp = -(px - ax) * uy + (py - ay) * ux;
+                    if perp.abs() >= half {
+                        continue;
+                    }
                     let t = proj.clamp(lo, hi);
-                    let dist = perp.hypot(proj - t);
+                    let d = proj - t;
+                    let d2 = perp * perp + d * d;
+                    if d2 >= half2 {
+                        continue;
+                    }
                     let j = (y - by0) * bw + (x - bx0);
-                    if dist < best[j] {
-                        best[j] = dist;
+                    // earlier segment keeps near-ties
+                    if d2 < best2[j] * (1.0 - 1e-5) {
+                        if best2[j] == f32::MAX {
+                            touched.push(j as u32);
+                        }
+                        best2[j] = d2;
                         sdv[j] = perp;
                         av[j] = cum[seg] + t;
                     }
@@ -970,73 +1299,75 @@ pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool, look:
         }
         let load = 0.6 + 0.8 * hash01(seed, (2 * kn) as u32);
         let tmax = st.t_k * half * load;
+        let inv_half = 1.0 / half;
+        let inv_total = 1.0 / total;
+        let inv_edge = 1.0 / (1.4 * lk);
+        let inv_tail = 1.0 / (0.8 * half);
+        let inv_head = 1.0 / (0.5 * half + 1.0);
+        let inv_lip = 1.0 / (0.45 * half);
+        let inv_blob = 1.0 / (0.9 * half);
+        let inv_rim = 1.0 / 0.13;
 
+        // profile on the touched pixels only
         let mut sum = 0f64;
-        let mut cnt = 0usize;
-        for j in 0..bw * bh {
-            if best[j] >= half {
-                continue;
-            }
+        hits.clear();
+        for &jj in &touched {
+            let j = jj as usize;
+            best2[j] = f32::MAX;
             let sd = sdv[j];
             let a = av[j];
-            let u = (sd / half).clamp(-1.0, 1.0);
+            let u = (sd * inv_half).clamp(-1.0, 1.0);
             let fx = (u * 0.5 + 0.5) * (kn - 1) as f32;
             let i0 = (fx.floor() as usize).min(kn - 2);
             let mut fr = fx - i0 as f32;
             fr = fr * fr * (3.0 - 2.0 * fr);
             let nb = gb[i0] * (1.0 - fr) + gb[i0 + 1] * fr;
             let ne = ge[i0] * (1.0 - fr) + ge[i0 + 1] * fr;
-            let au = u.abs();
-            let cross = (1.0 - au.powi(6)) * (1.0 + st.rim * (-((au - 0.78) / 0.13).powi(2)).exp());
-            let edge = smoothstep(0.0, 1.4 * lk, half - sd.abs());
             let ac = a.clamp(0.0, total);
-            let q = ac / total;
             let leff = total - st.rag * half * ne;
-            let tail = smoothstep(0.0, 0.8 * half, leff - a);
-            let head = smoothstep(-1.0, 0.5 * half, a);
-            let lip = if leff - a > 0.0 {
-                st.lip * (-((leff - a) / (0.45 * half)).powi(2)).exp()
-            } else {
-                0.0
-            };
-            let along = (1.0 - st.deplete * q) * (1.0 + 0.25 * (-(ac / (0.9 * half)).powi(2)).exp()) + lip;
+            let rem = leff - a;
+            if rem <= 0.0 {
+                continue; // past the ragged tail: tail == 0
+            }
+            let head = smooth01((a + 1.0) * inv_head);
+            let tail = smooth01(rem * inv_tail);
+            if head <= 0.0 || tail <= 0.0 {
+                continue;
+            }
+            let au = u.abs();
+            let cross = (1.0 - au.powi(6)) * (1.0 + st.rim * gauss(tab, (au - 0.78) * inv_rim));
+            let edge = smooth01((half - sd.abs()) * inv_edge);
+            let q = ac * inv_total;
+            let lip = st.lip * gauss(tab, rem * inv_lip);
+            let along = (1.0 - st.deplete * q) * (1.0 + 0.25 * gauss(tab, ac * inv_blob)) + lip;
             let groove = 1.0 - (st.groove0 + (st.groove1 - st.groove0) * q) * nb;
             let t = tmax * cross * edge * groove * along * tail * head;
-            tv[j] = t;
             if t > 0.0 {
                 let i = (by0 + j / bw) * w + bx0 + j % bw;
                 sum += height[i] as f64;
-                cnt += 1;
+                hits.push((i as u32, t));
             }
         }
-        if cnt == 0 {
+        touched.clear();
+        if hits.is_empty() {
             continue;
         }
-        let mean_under = (sum / cnt as f64) as f32;
-        for j in 0..bw * bh {
-            let t = tv[j];
-            if t > 0.0 {
-                let i = (by0 + j / bw) * w + bx0 + j % bw;
-                let c = smoothstep(0.0, 0.45 * tmax, t);
-                height[i] = height[i] * (1.0 - c) + st.keep * mean_under * c + t;
-            }
+        let mean_under = (sum / hits.len() as f64) as f32;
+        for &(i, t) in &hits {
+            let i = i as usize;
+            let c = smooth01(t / (0.45 * tmax));
+            height[i] = height[i] * (1.0 - c) + st.keep * mean_under * c + t;
         }
     }
     gaussian_blur_plane(&height, w, h, st.blur as f64 * look)
 }
 
-/// Shade a BGRA color frame in place by the impasto height (light from
-/// upper-left + wet specular + darkening in the cavities between strokes).
-/// Flat height leaves pixels unchanged.
-fn shade_impasto(
-    out: &mut [u8],
-    w: usize,
-    h: usize,
-    height: &[f32],
-    impasto: f64,
-    ref_half: f32,
-    look: f64,
-) {
+/// Per-pixel impasto shading from the height field (light from upper-left +
+/// wet specular + darkening in the cavities between strokes): `[m, s, dark]`
+/// so a colour byte `v` becomes `(v * m + s) * dark`. Flat height gives
+/// m = 1, s = 0, dark = 1 (pixels unchanged). Computed once and applied to
+/// every colour frame and the preview.
+fn impasto_shade_field(w: usize, h: usize, height: &[f32], impasto: f64, ref_half: f32, look: f64) -> Vec<[f32; 3]> {
     let lk = look as f32;
     let gx = sobel3(height, w, h, 1, 0);
     let gy = sobel3(height, w, h, 0, 1);
@@ -1050,16 +1381,25 @@ fn shade_impasto(
     let l = norm3([-0.5, -0.5, 0.7]);
     let hv = norm3([l[0], l[1], l[2] + 1.0]);
     let spec0 = hv[2].powi(40);
-    for i in 0..w * h {
-        let n = norm3([-g * gx[i], -g * gy[i], 1.0]);
-        let diff = (n[0] * l[0] + n[1] * l[1] + n[2] * l[2]).max(0.0) / l[2];
-        let nh = (n[0] * hv[0] + n[1] * hv[1] + n[2] * hv[2]).max(0.0);
-        let spec = (nh.powi(40) - spec0).max(0.0);
-        let cav = (low[i] - height[i]).max(0.0) / ref_half;
-        let dark = 1.0 - (0.7 * impasto as f32 * cav).min(0.6);
+    (0..w * h)
+        .map(|i| {
+            let n = norm3([-g * gx[i], -g * gy[i], 1.0]);
+            let diff = (n[0] * l[0] + n[1] * l[1] + n[2] * l[2]).max(0.0) / l[2];
+            let nh = (n[0] * hv[0] + n[1] * hv[1] + n[2] * hv[2]).max(0.0);
+            let spec = (nh.powi(40) - spec0).max(0.0);
+            let cav = (low[i] - height[i]).max(0.0) / ref_half;
+            let dark = 1.0 - (0.7 * impasto as f32 * cav).min(0.6);
+            [1.0 + 0.85 * (diff - 1.0), 255.0 * 0.22 * spec, dark]
+        })
+        .collect()
+}
+
+/// Shade the B/G/R bytes of a BGRA frame in place with a shade field.
+fn apply_shade(frame: &mut [u8], field: &[[f32; 3]]) {
+    for (px, f) in frame.chunks_exact_mut(4).zip(field) {
         for c in 0..3 {
-            let v = (out[i * 4 + c] as f32 * (1.0 + 0.85 * (diff - 1.0)) + 255.0 * 0.22 * spec) * dark;
-            out[i * 4 + c] = v.round().clamp(0.0, 255.0) as u8;
+            let v = (px[c] as f32 * f[0] + f[1]) * f[2];
+            px[c] = v.round().clamp(0.0, 255.0) as u8;
         }
     }
 }
@@ -1080,111 +1420,13 @@ fn height_frame(height: &[f32], w: usize, h: usize, norm_px: f32) -> Vec<u8> {
 
 /// Display-only clay render: mid-gray canvas lit by the impasto shading, so
 /// the relief is visible on the page when no color map is loaded.
-fn preview_frame(w: usize, h: usize, height: &[f32], impasto: f64, ref_half: f32, look: f64) -> Vec<u8> {
+fn preview_frame(w: usize, h: usize, field: &[[f32; 3]]) -> Vec<u8> {
     let mut out = vec![170u8; w * h * 4];
     for i in 0..w * h {
         out[i * 4 + 3] = 255;
     }
-    shade_impasto(&mut out, w, h, height, impasto, ref_half, look);
+    apply_shade(&mut out, field);
     out
-}
-
-/// cv2.LINE_AA-ish polyline with thickness (anti-aliased coverage).
-fn draw_polyline(
-    canvas: &mut [[f32; 3]],
-    updated: &mut [f32],
-    w: usize,
-    h: usize,
-    poly: &[(f32, f32)],
-    col: [f32; 3],
-    thickness: i32,
-    alpha: f32,
-) {
-    // cv2 thick AA with int32 endpoints renders hard 0/1 coverage;
-    // effective half-width = ceil(th/2) for th>=2 (verified: th=3 spans 5
-    // rows, th=5 spans 7, th=6 spans 7). Pixel center within half+0.5.
-    let half = if thickness <= 1 {
-        0.5 // th=1 cv2 thin AA line: single-pixel error-diffusion band
-    } else {
-        ((thickness + 1) / 2) as f64 + 0.5
-    };
-    // Per-segment bbox scan: each segment painted within its own tight box
-    // (plus caps at polyline ends). O(total_ink) instead of O(poly*strokebox).
-    let (ex0, ey0) = (poly[0].0.round() as f64, poly[0].1.round() as f64);
-    let (fx0, fy0) = (
-        poly[poly.len() - 1].0.round() as f64,
-        poly[poly.len() - 1].1.round() as f64,
-    );
-    // Per-segment direct rasterization with per-segment bbox: pixels paint
-    // via the segment's own rectangle (fast bulk path for interior pixels).
-    let seg_bbx = |s: usize| -> (usize, usize, usize, usize) {
-        let (ax, ay) = (poly[s].0.round() as f64, poly[s].1.round() as f64);
-        let (bx, by) = (poly[s + 1].0.round() as f64, poly[s + 1].1.round() as f64);
-        (
-            (ax.min(bx) - half - 2.0).floor().max(0.0) as usize,
-            (ay.min(by) - half - 2.0).floor().max(0.0) as usize,
-            (ax.max(bx) + half + 2.0).ceil().min(w as f64 - 1.0) as usize,
-            (ay.max(by) + half + 2.0).ceil().min(h as f64 - 1.0) as usize,
-        )
-    };
-    for s in 0..poly.len() - 1 {
-        let (ax, ay) = (poly[s].0.round() as f64, poly[s].1.round() as f64);
-        let (bx, by) = (poly[s + 1].0.round() as f64, poly[s + 1].1.round() as f64);
-        let (lo_x, lo_y, hi_x, hi_y) = seg_bbx(s);
-        let dx = bx - ax;
-        let dy = by - ay;
-        let len = (dx * dx + dy * dy).sqrt();
-        let (ux, uy) = if len > 0.0 { (dx / len, dy / len) } else { (0.0, 0.0) };
-        for y in lo_y..=hi_y {
-            let py = y as f64 + 0.5;
-            // perpendicular distance is affine in y per row when |dx|>|dy|
-            // skip the generic case: compute per pixel below (f64 mul ~ns)
-            for x in lo_x..=hi_x {
-                let px = x as f64 + 0.5;
-                let proj = (px - ax) * ux + (py - ay) * uy;
-                if proj < -1.0 || proj > len + 1.0 {
-                    continue;
-                }
-                let perp = (-(px - ax) * uy + (py - ay) * ux).abs();
-                if perp > half {
-                    continue;
-                }
-                let a = alpha;
-                let i = y * w + x;
-                for c in 0..3 {
-                    canvas[i][c] = canvas[i][c] * (1.0 - a) + col[c] * a;
-                }
-                updated[i] = updated[i] * (1.0 - a) + a;
-            }
-        }
-    }
-    // end caps: radius-2 circles at the two polyline ends
-    for (ex, ey) in [(
-        poly[0].0.round() as f64,
-        poly[0].1.round() as f64,
-    ), (
-        poly[poly.len() - 1].0.round() as f64,
-        poly[poly.len() - 1].1.round() as f64,
-    )] {
-        let lo_x = (ex - 2.5).floor().max(0.0) as usize;
-        let hi_x = (ex + 2.5).ceil().min(w as f64 - 1.0) as usize;
-        let lo_y = (ey - 2.5).floor().max(0.0) as usize;
-        let hi_y = (ey + 2.5).ceil().min(h as f64 - 1.0) as usize;
-        for y in lo_y..=hi_y {
-            for x in lo_x..=hi_x {
-                let px = x as f64 + 0.5;
-                let py = y as f64 + 0.5;
-                if ((px - ex).powi(2) + (py - ey).powi(2)).sqrt() <= 2.0 {
-                    let i = y * w + x;
-                    for c in 0..3 {
-                        canvas[i][c] = canvas[i][c] * (1.0 - alpha) + col[c] * alpha;
-                    }
-                    updated[i] = updated[i] * (1.0 - alpha) + alpha;
-                }
-            }
-        }
-    }
-
 }
 
 // ---------------------------------------------------------------- relief
@@ -1192,11 +1434,12 @@ fn draw_polyline(
 pub fn canvas_relief(w: usize, h: usize, scale: i32, strength: f64, look: f64) -> (Vec<f32>, Vec<f32>) {
     let mut height = vec![0f32; w * h];
     let period = scale as f64 * look;
+    let pi = std::f64::consts::PI;
+    let hx: Vec<f64> = (0..w).map(|x| 0.5 * (x as f64 * pi / period).sin()).collect();
+    let sy: Vec<f64> = (0..h).map(|y| (y as f64 * pi / period).sin()).collect();
     for y in 0..h {
         for x in 0..w {
-            height[y * w + x] = (0.5 * (x as f64 * std::f64::consts::PI / period).sin()
-                * (y as f64 * std::f64::consts::PI / period).sin())
-                as f32;
+            height[y * w + x] = (hx[x] * sy[y]) as f32;
         }
     }
     // cv2 Sobel on height with strength → normal map → lambert
@@ -1220,18 +1463,48 @@ pub fn canvas_relief(w: usize, h: usize, scale: i32, strength: f64, look: f64) -
 
 // ---------------------------------------------------------------- pipeline
 
-pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, String) {
+/// Everything painted before impasto: BGRA frames (reference first, canvas
+/// relief applied, never impasto-shaded) and the strokes that made them.
+pub struct PaintStage {
+    pub w: usize,
+    pub h: usize,
+    pub frames: Vec<Vec<u8>>,
+    pub strokes: Vec<Stroke>,
+}
+
+/// The four input checks of the multi-channel entry point.
+pub fn validate_multi(ref_bgra: &[u8], chans: &[&[u8]], w: usize, h: usize) -> Result<(), String> {
+    if w == 0 || h == 0 {
+        return Err("empty image".into());
+    }
+    if chans.len() > 4 {
+        return Err(format!("at most 4 extra channels, got {}", chans.len()));
+    }
+    let n = w * h * 4;
+    for (i, c) in chans.iter().enumerate() {
+        if c.len() != n {
+            return Err(format!("channel {i} is {} bytes, expected {n}", c.len()));
+        }
+    }
+    if ref_bgra.len() != n {
+        return Err(format!("reference is {} bytes, expected {n}", ref_bgra.len()));
+    }
+    Ok(())
+}
+
+/// Flow + strokes from `ref_bgra`, strokes rasterized and the canvas shade
+/// computed once, then the SAME strokes stamped on the reference and every
+/// channel (each with its own Kuwahara base and colour sampling).
+pub fn paint_stage(ref_bgra: &[u8], chans: &[&[u8]], w: usize, h: usize, p: &Params) -> PaintStage {
     let look = p.look();
-    // BGRA -> BGR
-    let bgr = bgra_to_bgr(bgra, w, h);
-    // resize handled by JS (canvas); here we assume already-resized
-    let base = kuwahara(&bgr, w, h, p.base_radius);
-    let gray = gray_from_bgr(&bgr, w, h);
+    let ref_bgr = bgra_to_bgr(ref_bgra, w, h);
+    let base = kuwahara(&ref_bgr, w, h, p.base_radius);
+    let gray = gray_from_bgr(&ref_bgr, w, h);
     let flow0 = flow_field(&gray, w, h, 2.5 * look);
     let flow = smooth_flow(flow0, p.flow_smooth);
     let n_strokes = (((w * h) as f64 / (140.0 * look * look)) as i32).max(1);
     let mut strokes = generate_strokes(
-        &bgr,
+        &ref_bgr,
         w,
         h,
         &flow,
@@ -1246,12 +1519,64 @@ pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, Stri
     if p.boil_frame > 0 && p.boil > 0.0 {
         boil_strokes(&mut strokes, w, h, &flow, n_strokes, p.brush_len, p.brush_w, 0.6, p.seed, p.boil_frame, p.boil, look);
     }
-    let mut out = paint_from_strokes(&bgr, &base, w, h, &strokes, p.relief, look);
-    if p.impasto > 0.0 {
-        let hgt = impasto_height(w, h, &strokes, p.impasto_knife, look);
-        shade_impasto(&mut out, w, h, &hgt, p.impasto, impasto_ref_half(p.brush_w), look);
+    let cov = rasterize_strokes(w, h, &strokes, look);
+    let shade = (p.relief > 0.0).then(|| canvas_relief(w, h, 12, p.relief, look).0);
+    let mut frames = Vec::with_capacity(chans.len() + 1);
+    frames.push(compose(&ref_bgr, &base, w, h, &strokes, &cov, shade.as_deref()));
+    for c in chans {
+        let cgr = bgra_to_bgr(c, w, h);
+        let cbase = kuwahara(&cgr, w, h, p.base_radius);
+        frames.push(compose(&cgr, &cbase, w, h, &strokes, &cov, shade.as_deref()));
     }
-    (out, String::new())
+    PaintStage { w, h, frames, strokes }
+}
+
+/// Frame 0 of the stage, impasto-shaded when `hgt` is given.
+pub fn finish_single<'a>(stage: &'a PaintStage, hgt: Option<&[f32]>, p: &Params) -> Cow<'a, [u8]> {
+    match hgt {
+        None => Cow::Borrowed(&stage.frames[0][..]),
+        Some(hg) => {
+            let field = impasto_shade_field(stage.w, stage.h, hg, p.impasto, impasto_ref_half(p.brush_w), p.look());
+            let mut o = stage.frames[0].clone();
+            apply_shade(&mut o, &field);
+            Cow::Owned(o)
+        }
+    }
+}
+
+/// All stage frames; with `hgt`, frames of kind "color" are impasto-shaded and
+/// a height frame then a display-only relief preview are appended.
+pub fn finish_multi<'a>(
+    stage: &'a PaintStage,
+    hgt: Option<&[f32]>,
+    p: &Params,
+    kinds: Option<&[Option<String>]>,
+) -> Vec<Cow<'a, [u8]>> {
+    let (w, h) = (stage.w, stage.h);
+    let mut out: Vec<Cow<'a, [u8]>> = Vec::with_capacity(stage.frames.len() + 2);
+    let field = hgt.map(|hg| impasto_shade_field(w, h, hg, p.impasto, impasto_ref_half(p.brush_w), p.look()));
+    for (i, f) in stage.frames.iter().enumerate() {
+        match &field {
+            Some(field) if kind_at(kinds, i) == Some("color") => {
+                let mut o = f.clone();
+                apply_shade(&mut o, field);
+                out.push(Cow::Owned(o));
+            }
+            _ => out.push(Cow::Borrowed(&f[..])),
+        }
+    }
+    if let (Some(hg), Some(field)) = (hgt, &field) {
+        out.push(Cow::Owned(height_frame(hg, w, h, impasto_norm_px(p.brush_w))));
+        out.push(Cow::Owned(preview_frame(w, h, field)));
+    }
+    out
+}
+
+pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, String) {
+    // resize handled by JS (canvas); here we assume already-resized
+    let stage = paint_stage(bgra, &[], w, h, p);
+    let hgt = (p.impasto > 0.0).then(|| impasto_height(w, h, &stage.strokes, p.impasto_knife, p.look()));
+    (finish_single(&stage, hgt.as_deref(), p).into_owned(), String::new())
 }
 
 /// bgra_to_bgr helper shared by the single and multi paths.
@@ -1284,66 +1609,8 @@ pub fn paint_bgra_multi(
     p: &Params,
     kinds: Option<&[Option<String>]>,
 ) -> Result<Vec<Vec<u8>>, String> {
-    if w == 0 || h == 0 {
-        return Err("empty image".into());
-    }
-    if chans.len() > 4 {
-        return Err(format!("at most 4 extra channels, got {}", chans.len()));
-    }
-    let n = w * h * 4;
-    for (i, c) in chans.iter().enumerate() {
-        if c.len() != n {
-            return Err(format!("channel {i} is {} bytes, expected {n}", c.len()));
-        }
-    }
-    if ref_bgra.len() != n {
-        return Err(format!(
-            "reference is {} bytes, expected {n}",
-            ref_bgra.len()
-        ));
-    }
-
-    let look = p.look();
-    let ref_bgr = bgra_to_bgr(ref_bgra, w, h);
-    let base = kuwahara(&ref_bgr, w, h, p.base_radius);
-    let gray = gray_from_bgr(&ref_bgr, w, h);
-    let flow0 = flow_field(&gray, w, h, 2.5 * look);
-    let flow = smooth_flow(flow0, p.flow_smooth);
-    let n_strokes = (((w * h) as f64 / (140.0 * look * look)) as i32).max(1);
-    let mut strokes = generate_strokes(
-        &ref_bgr,
-        w,
-        h,
-        &flow,
-        n_strokes,
-        p.brush_len,
-        p.brush_w,
-        p.layers,
-        0.6,
-        p.seed,
-        look,
-    );
-    if p.boil_frame > 0 && p.boil > 0.0 {
-        boil_strokes(&mut strokes, w, h, &flow, n_strokes, p.brush_len, p.brush_w, 0.6, p.seed, p.boil_frame, p.boil, look);
-    }
-    let hgt = if p.impasto > 0.0 { Some(impasto_height(w, h, &strokes, p.impasto_knife, look)) } else { None };
-    let mut out = Vec::with_capacity(chans.len() + 3);
-    // painted reference (BGRA) is frame 0
-    out.push(paint_from_strokes(&ref_bgr, &base, w, h, &strokes, p.relief, look));
-    for c in chans {
-        let cgr = bgra_to_bgr(c, w, h);
-        let cbase = kuwahara(&cgr, w, h, p.base_radius);
-        out.push(paint_from_strokes(&cgr, &cbase, w, h, &strokes, p.relief, look));
-    }
-    if let Some(hgt) = hgt {
-        let ref_half = impasto_ref_half(p.brush_w);
-        for (i, frame) in out.iter_mut().enumerate() {
-            if kind_at(kinds, i) == Some("color") {
-                shade_impasto(frame, w, h, &hgt, p.impasto, ref_half, look);
-            }
-        }
-        out.push(height_frame(&hgt, w, h, impasto_norm_px(p.brush_w)));
-        out.push(preview_frame(w, h, &hgt, p.impasto, ref_half, look));
-    }
-    Ok(out)
+    validate_multi(ref_bgra, chans, w, h)?;
+    let stage = paint_stage(ref_bgra, chans, w, h, p);
+    let hgt = (p.impasto > 0.0).then(|| impasto_height(w, h, &stage.strokes, p.impasto_knife, p.look()));
+    Ok(finish_multi(&stage, hgt.as_deref(), p, kinds).into_iter().map(Cow::into_owned).collect())
 }

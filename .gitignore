@@ -7,5 +7,6 @@ __pycache__/
 rust/target/
 rust/CACHEDIR.TAG
 rust/tests/*.npy
-rust/tests/node/
+rust/tests/node/*
 !rust/tests/node/wasm_smoke.mjs
+!rust/tests/node/wasm_bench.mjs
