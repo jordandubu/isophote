@@ -116,8 +116,10 @@ class PN_OT_apply_animated_from_isophote(bpy.types.Operator):
     def _apply_multi(self, context, s, base, kinds, anim):
         """Coherent animated multi: anim[i] = [b64 per kind] (kinds order).
         Writes <base>_<kind>_anim/ sequences and wires every kind."""
+        hs = _bridge_state.get("result_height_scale")
         _bridge_state["result_anim"] = None
         _bridge_state["result_anim_kinds"] = None
+        _bridge_state["result_height_scale"] = None
         tmp = bpy.app.tempdir
         _clear_anim_dirs(tmp, base, kinds)
         obj = context.active_object
@@ -156,7 +158,8 @@ class PN_OT_apply_animated_from_isophote(bpy.types.Operator):
                 _, _, colorspace = _paint_targets_for(kind)
                 img.colorspace_settings.name = colorspace
                 _apply_animated_map(mat, img, start_frame=1,
-                                    duration=len(anim), kind=kind)
+                                    duration=len(anim), kind=kind,
+                                    height_scale=hs)
                 applied.append(KIND_LABELS[kind])
         except Exception as e:
             self.report({'ERROR'}, f"Frame write failed: {e}")
@@ -214,7 +217,7 @@ def _clear_anim_dirs(tmp, base, kinds):
                 pass
 
 
-def _apply_animated_map(mat, img, start_frame=1, duration=10, kind='normal'):
+def _apply_animated_map(mat, img, start_frame=1, duration=10, kind='normal', height_scale=None):
     """Wire `img` (a SEQUENCE image) into the material for `kind`.
     normal: tex -> object-space NormalMap -> Normal. Others: tex -> socket.
     orm: tex -> Separate Color -> Roughness/Metallic (packed MR sequence)."""
@@ -247,7 +250,7 @@ def _apply_animated_map(mat, img, start_frame=1, duration=10, kind='normal'):
         return
 
     if kind == 'height':
-        tex = _apply_height(mat, img, bpy.context.active_object)
+        tex = _apply_height(mat, img, bpy.context.active_object, height_scale)
         tex.image_user.frame_duration = duration
         tex.image_user.frame_start = start_frame
         tex.image_user.frame_offset = 0
@@ -443,8 +446,10 @@ class PN_OT_apply_from_isophote(bpy.types.Operator):
             if len(pngs) != len(kinds):
                 self.report({'ERROR'}, "Corrupted multi result (kinds/pngs mismatch).")
                 return {'CANCELLED'}
+            hs = _bridge_state.get("result_height_scale")
             _bridge_state["result_kinds"] = None
             _bridge_state["result_pngs"] = None
+            _bridge_state["result_height_scale"] = None
             obj = context.active_object
             mat = obj.active_material if obj else None
             if mat is None or not mat.use_nodes:
@@ -485,7 +490,7 @@ class PN_OT_apply_from_isophote(bpy.types.Operator):
                         img = bpy.data.images.load(final, check_existing=False)
                         img.name = dname
                         img.colorspace_settings.name = 'Non-Color'
-                        _apply_height(mat, img, obj)
+                        _apply_height(mat, img, obj, hs)
                     elif kind == 'other':
                         _apply_other(mat, final)
                     else:
@@ -856,9 +861,9 @@ def _apply_normal(mat, path):
     nt.links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])
 
 
-# pairs with the core's height-frame scale (20 / long edge): ridge height
-# ≈ 0.5 × stroke half-width at impasto 1
-IMPASTO_UV_DIVISOR = 40.0
+# world ridge height = (UV thickness of a white height pixel, sent by the page
+# as height_scale) x this x world units per UV unit
+IMPASTO_DEPTH = 0.5
 
 
 def _uv_world_scale(obj):
@@ -886,7 +891,7 @@ def _uv_world_scale(obj):
     return (area3d / uva) ** 0.5
 
 
-def _apply_height(mat, img, obj):
+def _apply_height(mat, img, obj, height_scale=None):
     """Insert the impasto Bump between whatever feeds the Principled Normal
     and the BSDF. Returns the height tex node."""
     nt = mat.node_tree
@@ -905,7 +910,8 @@ def _apply_height(mat, img, obj):
         bump.name = "PainterlyImpastoBump"
     bump.location = (bsdf.location.x - 200, bsdf.location.y - 420)
     bump.inputs['Strength'].default_value = 1.0
-    bump.inputs['Distance'].default_value = _uv_world_scale(obj) / IMPASTO_UV_DIVISOR
+    hs = float(height_scale) if height_scale else 0.05   # 0.05 = pre-scale page strength
+    bump.inputs['Distance'].default_value = _uv_world_scale(obj) * hs * IMPASTO_DEPTH
     feed = bsdf.inputs['Normal'].links
     if feed and feed[0].from_node is not bump:
         nt.links.new(feed[0].from_socket, bump.inputs['Normal'])
@@ -1327,7 +1333,8 @@ _bridge_state = {"pending_png": None, "pending_ack": False,
                  "result_kinds": None,     # multi single-frame result: [kinds]
                  "result_pngs": None,      # multi single-frame result: [b64]
                  "result_anim": None,      # legacy anim: [b64]
-                 "result_anim_kinds": None}  # multi anim: kinds for anim
+                 "result_anim_kinds": None,  # multi anim: kinds for anim
+                 "result_height_scale": None}  # UV thickness of a white height px (multi results)
 _bridge_server = None
 
 
@@ -1407,6 +1414,7 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
                 _bridge_state["result_png"] = None
                 _bridge_state["result_kinds"] = None
                 _bridge_state["result_pngs"] = None
+                _bridge_state["result_height_scale"] = req.get("height_scale")
             elif isinstance(anim, list):
                 # legacy animated (single channel: list of b64)
                 _bridge_state["result_anim_kinds"] = None
@@ -1414,6 +1422,7 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
                 _bridge_state["result_png"] = None
                 _bridge_state["result_kinds"] = None
                 _bridge_state["result_pngs"] = None
+                _bridge_state["result_height_scale"] = None
             elif "kinds" in req and "pngs" in req:
                 # multi single-frame result
                 _bridge_state["result_kinds"] = req.get("kinds")
@@ -1421,6 +1430,7 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
                 _bridge_state["result_png"] = None
                 _bridge_state["result_anim"] = None
                 _bridge_state["result_anim_kinds"] = None
+                _bridge_state["result_height_scale"] = req.get("height_scale")
             else:
                 # legacy single: {png, kind?}
                 _bridge_state["result_png"] = req.get("png")
@@ -1429,6 +1439,7 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
                 _bridge_state["result_pngs"] = None
                 _bridge_state["result_anim"] = None
                 _bridge_state["result_anim_kinds"] = None
+                _bridge_state["result_height_scale"] = None
             return self._reply({"ok": True})
 
         if self.path == "/result":           # addon pulls the app's painting

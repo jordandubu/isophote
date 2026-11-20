@@ -68,8 +68,10 @@ function slabToUrl(bytes, w, h) {
 
 // Multi-channel coherent paint (stroke replay): bgras[0] is the reference
 // (drives flow + strokes), the rest are painted with the SAME strokes.
-// Returns { urls: [png data URLs (reference first, plus a trailing gray
-// impasto height map when params.impasto > 0)], ms }. No resize in the
+// Returns { urls: [png data URLs (reference first, plus a gray impasto
+// height map and a display-only relief preview when params.impasto > 0)],
+// ms, heightScale (UV thickness of a white height pixel; 0 = no height) }.
+// No resize in the
 // core for this path: all frames must be the same w*h already.
 async function wasmPaintMulti(bgras, w, h, params) {
   await wasmReady;
@@ -83,7 +85,7 @@ async function wasmPaintMulti(bgras, w, h, params) {
 
   const inPtr = alloc(blob.length);
   const pPtr = alloc(pb.length);
-  const outLen = frame * (k + 1);  // room for the trailing impasto height frame
+  const outLen = frame * (k + 2);  // room for the trailing impasto height + preview frames
   const outPtr = alloc(outLen);
   try {
     new Uint8Array(wasm.exports.memory.buffer, inPtr, blob.length).set(blob);
@@ -102,7 +104,8 @@ async function wasmPaintMulti(bgras, w, h, params) {
     const urls = [];
     for (let i = 0; i < nOut; i++)
       urls.push(slabToUrl(out.subarray(i * frame, (i + 1) * frame), w, h));
-    return { urls, ms: Math.round(performance.now() - t0) };
+    return { urls, ms: Math.round(performance.now() - t0),
+             heightScale: wasm.exports.wasm_paint_multi_height_scale() };
   } finally {
     wasm.exports.wasm_free(inPtr, blob.length);
     wasm.exports.wasm_free(pPtr, pb.length);

@@ -192,6 +192,11 @@ input[type=file] { display: none; }
         <input type="number" id="animCountInput" min="1" max="24" value="5"
           style="width:52px; background:transparent; border:1px solid var(--border); border-radius:6px; color:var(--txt); padding:4px 6px; font-size:12px;">
       </div>
+      <div style="display:flex; align-items:center; gap:8px; padding:4px 10px 6px;">
+        <span style="font-size:12px; color:var(--txt2);" title="Share of strokes repainted on each frame. 100% = a new seed per frame">Boil</span>
+        <input type="range" id="animBoil" min="0" max="100" step="5" value="30" style="flex:1; min-width:0;">
+        <span id="animBoilV" style="font-size:12px; color:var(--txt2); width:34px; text-align:right;">30%</span>
+      </div>
     </div>
   </div>
   <button class="btn" id="menuBtn" title="Effects"><svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
@@ -270,7 +275,7 @@ input[type=file] { display: none; }
     <div class="slider"><div class="row"><label>Stroke length<span class="dot" id="d_len" style="visibility:hidden"></span></label><span class="v" id="v_len">40</span></div>
       <input type="range" id="len" min="10" max="90" value="40"></div>
     <div class="slider"><div class="row"><label>Stroke width<span class="dot" id="d_width" style="visibility:hidden"></span></label><span class="v" id="v_width">9</span></div>
-      <input type="range" id="width" min="2" max="14" value="9"></div>
+      <input type="range" id="width" min="2" max="30" value="9"></div>
     <div class="slider"><div class="row"><label>Layers<span class="dot" id="d_layers" style="visibility:hidden"></span></label><span class="v" id="v_layers">2</span></div>
       <input type="range" id="layers" min="1" max="6" value="2"></div>
     <div class="slider"><div class="row"><label>Flow coherence<span class="dot" id="d_flow_smooth" style="visibility:hidden"></span></label><span class="v" id="v_flow_smooth">8</span></div>
@@ -280,7 +285,8 @@ input[type=file] { display: none; }
     <div class="slider"><div class="row"><label>Canvas relief<span class="dot" id="d_relief" style="visibility:hidden"></span></label><span class="v" id="v_relief">0.10</span></div>
       <input type="range" id="relief" min="0" max="0.6" step="0.05" value="0.10"></div>
     <div class="slider"><div class="row"><label>Impasto (paint ridges)<span class="dot" id="d_impasto" style="visibility:hidden"></span></label><span class="v" id="v_impasto">0.00</span></div>
-      <input type="range" id="impasto" min="0" max="2" step="0.1" value="0"></div>
+      <input type="range" id="impasto" min="0" max="2" step="0.1" value="0">
+      <label style="display:block; margin-top:6px; font-size:12px; color:var(--txt2);"><input type="checkbox" id="impastoKnife" style="vertical-align:-2px; accent-color:var(--accent);"> Palette knife (flat slabs)</label></div>
     <div class="slider"><div class="row"><label>Seed<span class="dot" id="d_seed" style="visibility:hidden"></span></label><span class="v" id="v_seed">42</span></div>
       <input type="range" id="seed" min="1" max="200" value="42"></div>
     <div class="slider"><div class="row"><label><input type="checkbox" id="imgscaleOn" checked style="vertical-align:-2px; accent-color:var(--accent);"> Image Scale</label><span style="display:flex; align-items:center; gap:8px;"><span class="v" id="v_imgscale">1024px</span><span class="dot" id="d_imgscale" style="visibility:hidden"></span></span></div>
@@ -300,7 +306,7 @@ input[type=file] { display: none; }
 const PRESETS = {
   art:    {len:40, width:9, layers:2, flow_smooth:8, base_radius:6, relief:0.10, impasto:0},
   medium: {len:30, width:4, layers:3, flow_smooth:8, base_radius:6, relief:0.15, impasto:0},
-  bold:   {len:60, width:5, layers:2, flow_smooth:8, base_radius:8, relief:0.10, impasto:1},
+  bold:   {len:44, width:26, layers:2, flow_smooth:8, base_radius:8, relief:0.10, impasto:1},
   pastel: {len:30, width:5, layers:3, flow_smooth:8, base_radius:9, relief:0.00, impasto:0},
 };
 const DEFAULTS = {len:40, width:9, layers:2, flow_smooth:8, base_radius:6, relief:0.10, impasto:0, seed:42, sscale:1, imgscale:2};
@@ -464,11 +470,17 @@ function syncOverlay() {
         $(input.id).value = input.value;
         $(input.id).dispatchEvent(new Event("input", {bubbles: false}));
       });
+      const cb = clone.querySelector("input[type=checkbox]");
+      if (cb && cb !== input) cb.addEventListener("change", () => {
+        $(cb.id).checked = cb.checked;
+        $(cb.id).dispatchEvent(new Event("change"));
+      });
       overlayBody.appendChild(clone);
     });
     overlayBody.dataset.built = "1";
   }
   overlayBody.querySelectorAll("input[type=range]").forEach(r => r.value = $(r.id).value);
+  overlayBody.querySelectorAll("input[type=checkbox]").forEach(c => c.checked = $(c.id).checked);
   overlayBody.querySelectorAll(".v").forEach(v => v.textContent = $("v_" + v.id.slice(2)).textContent);
   overlayBody.querySelectorAll(".chip").forEach(c => c.classList.toggle("on", c.dataset.p === presetOn));
   overlayBody.querySelectorAll(".dot").forEach(d => d.style.visibility = $("d_" + d.id.slice(2)).style.visibility);
@@ -553,12 +565,13 @@ function buildChannelTabs() {
     return;
   }
   sel.innerHTML = "";
-  for (const k of bridgeKinds.concat(paintedByKind.height ? ["height"] : [])) {
+  for (const k of bridgeKinds.concat(["height", "preview"].filter(x => paintedByKind[x]))) {
     const o = document.createElement("option");
     o.value = k;
     o.textContent = KIND_LABEL[k] || k;
     sel.appendChild(o);
   }
+  if (sel.options.length < 2) { wrap.style.display = "none"; return; }
   sel.value = activeKind;
   wrap.style.display = "";
 }
@@ -602,7 +615,7 @@ $("clear").onclick = () => {
   imgZoom = 1; imgWrap.classList.remove("zoomed"); imgWrap.style.removeProperty("--zoom");
   srcBgrBytes = origURL = paintedURL = null;
   bridgeKinds = null; bridgeImgs = null;
-  paintedByKind = null; activeKind = null;
+  paintedByKind = null; activeKind = null; previewAuto = false;
   $("chSelectWrap").style.display = "none"; $("chSelect").innerHTML = "";
   clearTimeout(liveTimer); liveQueue = false;
   $("imgWrap").style.display = "none";
@@ -669,10 +682,13 @@ function paintTargetLong(refW) {
   return Math.max(target, Math.min(L, 1400));
 }
 $("imgscaleOn").onchange = () => scheduleLive();
+$("impastoKnife").onchange = () => scheduleLive();
 // painted results per channel when a multi queue is loaded:
 // { url, srcBytes, w, h } per kind; activeKind is the one shown in view
 let paintedByKind = null;   // null = single-image mode (plain paintedURL)
 let activeKind = null;
+let paintedHeightScale = 0; // UV thickness of a white height pixel of the last multi paint
+let previewAuto = false;    // the relief preview was auto-selected once
 async function livePaint() {
   if (liveBusy) { liveQueue = true; return; }
   liveBusy = true;
@@ -707,6 +723,7 @@ async function livePaint() {
       max_size: t_,
       // impasto shades color maps; multi adds a trailing height map
       impasto: params.impasto || 0,
+      impasto_knife: $("impastoKnife").checked,
     };
     let url, ms, outW_, outH_;
     if (bridgeKinds && bridgeImgs) {
@@ -741,6 +758,11 @@ async function livePaint() {
       ms = r.ms;
       paintedByKind = {};
       resultKinds(r.urls.length).forEach((kind, i) => { paintedByKind[kind] = { url: r.urls[i] }; });
+      paintedHeightScale = r.heightScale;
+      // first time impasto goes above 0 with no colour map loaded, jump to the
+      // clay relief preview once (the user can switch back and it stays)
+      if (!paintedByKind.preview) previewAuto = false;
+      else if (!previewAuto && !bridgeKinds.includes("color")) { activeKind = "preview"; previewAuto = true; }
       if (!activeKind || !paintedByKind[activeKind]) {
         activeKind = bridgeKinds[0];
       }
@@ -825,11 +847,17 @@ let bridgeKinds = null;           // ["color","normal",...] when a multi queue i
 let bridgeImgs = null;            // {kind: {b64, blob}} source (unpainted) channels
 const KIND_LABEL = { color: "base color", normal: "normal map", rough: "roughness",
                      metal: "metallic", emission: "emission", orm: "ORM", other: "custom",
-                     height: "impasto height" };
+                     height: "impasto height", preview: "relief preview" };
 const kindList = (kinds) => kinds.map(k => KIND_LABEL[k] || k).join(" + ");
 // kinds of a wasmPaintMulti result: bridgeKinds plus the trailing impasto
-// height frame when the core emitted one
-const resultKinds = (n) => n > bridgeKinds.length ? bridgeKinds.concat(["height"]) : bridgeKinds;
+// height + display-only preview frames when the core emitted them
+const resultKinds = (n) => n > bridgeKinds.length ? bridgeKinds.concat(["height", "preview"]) : bridgeKinds;
+// kinds + urls of a multi result without the display-only preview frame
+function sendable(urls) {
+  const ks = resultKinds(urls.length), kinds = [], out = [];
+  ks.forEach((k, i) => { if (k !== "preview") { kinds.push(k); out.push(urls[i]); } });
+  return { kinds, urls: out };
+}
 function bridgeURL(path) { return `http://127.0.0.1:${BRIDGE_PORT}${path}`; }
 async function bridgePoll() {
   // ask the local bridge whether Blender pushed a new image
@@ -837,7 +865,11 @@ async function bridgePoll() {
   bridge.inFlight = true;
   try {
     const r = await fetch(bridgeURL("/poll"), { method: "POST", body: "{}" });
-    const d = await r.json();
+    let d = await r.json();
+    // a single Blender image is a one-kind queue: same path, so impasto
+    // relief (height map + preview) works for normal-only sends too
+    if (d.kind === "image" && d.bgr_png)
+      d = { kind: "multi", kinds: [d.map_kind || "normal"], pngs: [d.bgr_png], status: d.status };
     if (d.status) $("bridgeState").__show(d.status);
     // new multi-channel queue from the addon: {kind:"multi", kinds, pngs[0]=references}
     if (d.kind === "multi" && Array.isArray(d.kinds) && Array.isArray(d.pngs) && d.pngs.length === d.kinds.length && !bridgeImagePending) {
@@ -849,6 +881,7 @@ async function bridgePoll() {
       bridgeImagePending = true;
       try {
         bridgeKinds = d.kinds;
+        previewAuto = false;
         bridgeImgs = {};
         paintedByKind = null;
         multiRef = null;
@@ -874,32 +907,11 @@ async function bridgePoll() {
       }
       return;
     }
-    if (d.kind === "image" && d.bgr_png && !bridgeImagePending) {
-      // sticky poll: same image repeats every 1.5s until acked; skip if this
-      // tab already painted it (avoid re-paint loop while waiting for ack)
-      let h = 0;
-      for (let i = 0; i < d.bgr_png.length; i += 4096)
-        h = (h + (d.bgr_png.charCodeAt(i) + i)) | 0;
-      if (h === bridgeLastPainted) return;
-      bridgeLastPainted = h;          // claim immediately: blocks sample load
-      bridgeImagePending = true;
-      try {
-        $("bridgeState").__show("received image — painting…");
-        const blob = b64ToBlob(d.bgr_png, "image/png");
-        await load(blob);                 // reuse the normal load path
-        await livePaint();                // paint now, don't wait for debounce
-        bridgeLastPainted = h;
-        // painted; ack so the bridge clears it (sticky /poll can't be stolen)
-        fetch(bridgeURL("/ack"), { method: "POST", body: "{}" }).catch(() => {});
-        $("bridgeState").__show("painted — click Send to Blender when done");
-      } finally {
-        bridgeImagePending = false;
-      }
-    }
   } catch (e) {
     $("bridgeState").__show("bridge offline — restart Blender (runs the relay on 127.0.0.1:8778)");
+  } finally {
+    bridge.inFlight = false;   // also on the early returns above
   }
-  bridge.inFlight = false;
 }
 async function sendToBlender() {
   if (!paintedURL) { $("bridgeState").__show("nothing painted yet"); return; }
@@ -939,20 +951,22 @@ async function sendToBlender() {
       // livePaint() already painted with the current params (same seed,
       // same strokes) — reuse its per-kind results; fall back to a fresh
       // replay when it hasn't run for this state yet
-      let urls, sendKinds;
+      let urls, sendKinds, hs;
       if (paintedByKind && bridgeKinds.every(k => paintedByKind[k])) {
         sendKinds = bridgeKinds.concat(paintedByKind.height ? ["height"] : []);
         urls = sendKinds.map(k => paintedByKind[k].url);
+        hs = paintedHeightScale;
       } else {
-        ({ urls } = await wasmPaintMulti(bgras, mw, mh, { ...params, kinds: bridgeKinds }));
-        sendKinds = resultKinds(urls.length);
+        const r = await wasmPaintMulti(bgras, mw, mh, { ...params, kinds: bridgeKinds });
+        ({ kinds: sendKinds, urls } = sendable(r.urls));
+        hs = r.heightScale;
       }
       const pngs = [];
       for (const url of urls) pngs.push(await blobToB64(await (await fetch(url)).blob()));
       await fetch(bridgeURL("/send_to_blender"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ kinds: sendKinds, pngs }),
+        body: JSON.stringify({ kinds: sendKinds, pngs, height_scale: hs }),
       });
       $("bridgeState").__show(
         `sent ${sendKinds.length} maps (${kindList(sendKinds)}) — now click 'Apply from Isophote' inside Blender`);
@@ -990,6 +1004,7 @@ function coreParamsForSize() {
     seed: Math.round(params.seed),
     max_size: ms_,
     impasto: params.impasto || 0,
+    impasto_knife: $("impastoKnife").checked,
   };
 }
 
@@ -1039,8 +1054,9 @@ async function decodeToBgra(blob) {
   }
   return out;
 }
-/* send animated: paint N extra seeds silently and post them all; Blender
-   wires them into an image sequence so the paint flickers as strokes */
+/* send animated: paint N frames silently and post them all; Blender wires
+   them into an image sequence. Boil sets how many strokes repaint per frame
+   (the rest stay put); 100% reseeds every frame */
 async function sendAnimatedToBlender(count = 5) {
   if (!srcBgrBytes) { $("bridgeState").__show("nothing to send"); return; }
   try {
@@ -1052,16 +1068,12 @@ async function sendAnimatedToBlender(count = 5) {
 }
 async function _sendAnimatedToBlender(count = 10) {
   const baseSeed = Math.round(parseFloat($("seed").value));
-  const core0 = coreParamsForSize();
-  const core = {
-    brush_len: core0.brush_len,
-    brush_w: core0.brush_w,
-    layers: core0.layers,
-    relief: core0.relief,
-    base_radius: core0.base_radius,
-    flow_smooth: core0.flow_smooth,
-    max_size: core0.max_size,
-  };
+  const { seed: _seed, ...core } = coreParamsForSize();   // incl. impasto + knife look
+  // Boil: share of strokes repainted per frame; the rest hold still.
+  // 100% = a fresh seed every frame (all strokes reshuffle).
+  const boil = +$("animBoil").value / 100;
+  const frameParams = (i) => boil >= 1 ? { seed: baseSeed + i }
+                                       : { seed: baseSeed, boil, boil_frame: i };
   $("animProgress").style.display = "flex";
   $("animBar").style.width = "0%";
   const multi = !!(bridgeKinds && bridgeImgs);
@@ -1100,12 +1112,13 @@ async function _sendAnimatedToBlender(count = 10) {
     const ups = await Promise.all(jobs);
     const bgras = ups.map(u => u.bytes);
     const aw = refW, ah = refH;
-    let sendKinds = bridgeKinds;
+    let sendKinds = bridgeKinds, hs = 0;
     for (let i = 0; i < count; i++) {
-      const { urls } = await wasmPaintMulti(bgras, aw, ah, { ...core, seed: baseSeed + i, kinds: bridgeKinds });
-      sendKinds = resultKinds(urls.length);
+      const r = await wasmPaintMulti(bgras, aw, ah, { ...core, ...frameParams(i), kinds: bridgeKinds });
+      const sb = sendable(r.urls);
+      sendKinds = sb.kinds; hs = r.heightScale;
       const one = [];
-      for (const url of urls) one.push(await blobToB64(await (await fetch(url)).blob()));
+      for (const url of sb.urls) one.push(await blobToB64(await (await fetch(url)).blob()));
       frames.push(one);
       $("animBar").style.width = Math.round((i + 1) / total * 100) + "%";
       $("animCount").textContent = `${i + 1} / ${total} × ${k} channels`;
@@ -1114,7 +1127,7 @@ async function _sendAnimatedToBlender(count = 10) {
     await fetch(bridgeURL("/send_to_blender"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kinds: sendKinds, anim: frames }),
+      body: JSON.stringify({ kinds: sendKinds, anim: frames, height_scale: hs }),
     });
     $("animProgress").style.display = "none";
     $("bridgeState").__show(
@@ -1132,7 +1145,7 @@ async function _sendAnimatedToBlender(count = 10) {
     abytes = up.bytes; aW = up.w; aH = up.h;
   }
   for (let i = 1; i < count; i++) {
-    const { url } = await wasmPaint(abytes, aW, aH, { ...core, seed: baseSeed + i });
+    const { url } = await wasmPaint(abytes, aW, aH, { ...core, ...frameParams(i) });
     frames1.push(await blobToB64(await (await fetch(url)).blob()));
     const pct = Math.round((i + 1) / count * 100);
     $("animBar").style.width = pct + "%";
@@ -1163,6 +1176,7 @@ document.querySelectorAll("#sendMenu .sendm").forEach(b => b.onclick = async () 
   else await sendToBlender();
 });
 $("bridgeSend").onclick = () => { sendToBlender(); };
+$("animBoil").oninput = () => { $("animBoilV").textContent = $("animBoil").value + "%"; };
 let bridgeTimer = null;
 function startBridgePolling() {
   if (bridge.on) return;

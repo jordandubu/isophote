@@ -57,7 +57,7 @@ All knobs with defaults:
 3. **Coherent smoothing** — orientations averaged weighted by coherence, so flat regions inherit nearby directions instead of turning noisy
 4. **Strokes** — polylines walking the flow with direction inertia, color sampled from the original under the stroke midpoint, per-stroke luminance jitter, gradient-first ordering
 5. **Canvas relief** — procedural weave heightmap → normal map → Lambert shading
-6. **Impasto** (web slider, 0 = off) — each stroke becomes a raised, bristle-grooved paint bead in a height field; the base color is lit by it, and a gray height map is sent to Blender
+6. **Impasto** (web slider, 0 = off) — each stroke becomes a thick slab in a height field: steep shoulders, raised rims, bristle grooves, a blob where the brush lands and a ragged tail where it lifts; new strokes flatten what they cover. *Palette knife* swaps the bristle grooves for flat slabs. The base color is lit by it, a gray height map is sent to Blender, and a clay *relief preview* shows it on the page when no color map is loaded
 
 ## Use it inside Blender
 
@@ -65,8 +65,8 @@ The repo ships a Blender add-on (`addon/painterly_normals/`) that bridges the we
 
 - **Send to Isophote** — bakes the object's normal map and opens it in the isophote web app
 - **Apply from Isophote** — pulls the painted result back and wires it into the material as a normal map
-- **Impasto** — when the Impasto slider is above 0, an extra *impasto height* map comes back and is wired through a Bump node (`PainterlyImpastoBump`) after the normal map, so the strokes have real relief; bump distance scales with the mesh's UV density
-- **Apply animated (seeds)** — receives multiple seed-variations the app painted (Send dropdown → *Send animated (10 seeds)*) and wires them as a playing image sequence, giving a flickering hand-painted animation when you play the timeline
+- **Impasto** — when the Impasto slider is above 0, an extra *impasto height* map comes back (also for a normal-map-only send) and is wired through a Bump node (`PainterlyImpastoBump`) after the normal map, so the strokes have real relief; the page sends the height scale and bump distance follows the mesh's UV density. Reinstall the add-on to pick up the new scaling
+- **Apply animated** — receives the frames the app painted (Send dropdown → *Send animated*) and wires them as a playing image sequence. The **Boil** slider sets how many strokes repaint per frame (the rest hold still); 100% reseeds every frame
 
 Install: download [painterly_normals-0.4.0-isophote.zip](../../releases) (or zip the `addon/painterly_normals/` folder yourself), then Blender → *Preferences → Add-ons → Install from Disk*. The add-on is pure Python — no numpy/cv2 required; all painting happens in your browser.
 

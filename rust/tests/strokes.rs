@@ -77,7 +77,8 @@ fn multi_replay_same_strokes() {
     }
     let p = Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
                      base_radius: 3, flow_smooth: 4, seed: 7,
-                     max_size: None, impasto: 0.0 };
+                     max_size: None, impasto: 0.0, impasto_knife: false,
+                     boil: 0.0, boil_frame: 0 };
     let outs = paint_bgra_multi(&ref_img, &[&chan], w, h, &p, None).unwrap();
     assert_eq!(outs.len(), 2);
     // determinism: same inputs -> identical bytes
@@ -161,20 +162,25 @@ fn impasto_multi_frames() {
     let (w, h, ref_img, chan) = synth_pair();
     let params = |impasto: f64| Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
                                          base_radius: 3, flow_smooth: 4, seed: 7,
-                                         max_size: None, impasto };
+                                         max_size: None, impasto, impasto_knife: false,
+                                         boil: 0.0, boil_frame: 0 };
     let kinds = |a: &str, b: &str| vec![Some(a.to_string()), Some(b.to_string())];
     let cn = kinds("color", "normal");
     let off = paint_bgra_multi(&ref_img, &[&chan], w, h, &params(0.0), Some(&cn)).unwrap();
     assert_eq!(off.len(), 2, "impasto 0 must not add a height frame");
 
     let on = paint_bgra_multi(&ref_img, &[&chan], w, h, &params(1.0), Some(&cn)).unwrap();
-    assert_eq!(on.len(), 3, "impasto > 0 appends the height frame");
+    assert_eq!(on.len(), 4, "impasto > 0 appends the height + preview frames");
     assert_ne!(on[0], off[0], "color reference not shaded by impasto");
     assert_eq!(on[1], off[1], "normal channel must not be touched by impasto");
     let hf = &on[2];
     assert!(hf.chunks(4).all(|p| p[0] == p[1] && p[1] == p[2] && p[3] == 255), "height not gray");
     let (lo, hi) = hf.chunks(4).fold((255u8, 0u8), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
     assert!(hi > lo, "height frame is flat");
+    let pv = &on[3];
+    assert!(pv.chunks(4).all(|p| p[3] == 255));
+    let (plo, phi) = pv.chunks(4).fold((255u8, 0u8), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
+    assert!(phi > plo, "preview frame is flat");
 
     // frame-aligned kinds: [normal, color] shades frame 1, never the reference
     let nc = kinds("normal", "color");
@@ -187,4 +193,98 @@ fn impasto_multi_frames() {
     let (single_on, _) = paint_bgra(&ref_img, w, h, &params(1.0));
     assert_eq!(single_off, off[0], "single path diverged from multi reference at impasto 0");
     assert_ne!(single_on, single_off, "single path ignores impasto");
+}
+
+#[test]
+fn impasto_reference_only() {
+    let (w, h, ref_img, _) = synth_pair();
+    let params = |impasto: f64| Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
+                                         base_radius: 3, flow_smooth: 4, seed: 7,
+                                         max_size: None, impasto, impasto_knife: false,
+                                         boil: 0.0, boil_frame: 0 };
+    let kinds = vec![Some("normal".to_string())];
+    let off = paint_bgra_multi(&ref_img, &[], w, h, &params(0.0), Some(&kinds)).unwrap();
+    assert_eq!(off.len(), 1);
+    let on = paint_bgra_multi(&ref_img, &[], w, h, &params(1.0), Some(&kinds)).unwrap();
+    assert_eq!(on.len(), 3, "reference + height + preview");
+    assert_eq!(on[0], off[0], "normal-only reference must stay unshaded");
+    assert!(on[2].chunks(4).all(|p| p[3] == 255));
+    let (lo, hi) = on[2].chunks(4).fold((255u8, 0u8), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
+    assert!(hi > lo, "preview frame is flat");
+}
+
+#[test]
+fn impasto_styles_and_range() {
+    let (w, h) = (160usize, 120usize);
+    let mut ref_img = vec![255u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            ref_img[i] = (x * 255 / w) as u8;
+            ref_img[i + 1] = (y * 255 / h) as u8;
+            ref_img[i + 2] = ((x + y) * 3 % 256) as u8;
+        }
+    }
+    let params = |knife: bool| Params { brush_len: 30, brush_w: 8, layers: 2, relief: 0.1,
+                                        base_radius: 3, flow_smooth: 4, seed: 7,
+                                        max_size: None, impasto: 2.0, impasto_knife: knife,
+                                        boil: 0.0, boil_frame: 0 };
+    let kinds = vec![Some("normal".to_string())];
+    let bristle = paint_bgra_multi(&ref_img, &[], w, h, &params(false), Some(&kinds)).unwrap();
+    let knife = paint_bgra_multi(&ref_img, &[], w, h, &params(true), Some(&kinds)).unwrap();
+    assert_ne!(bristle[1], knife[1], "knife and bristle heights are identical");
+    for hf in [&bristle[1], &knife[1]] {
+        let white = hf.chunks(4).filter(|p| p[0] == 255).count();
+        assert!(white * 100 < w * h, "height frame clips: {white} white px of {}", w * h);
+        assert!(hf.chunks(4).any(|p| p[0] > 100), "height frame is barely used");
+    }
+}
+
+#[test]
+fn boil_keeps_most_strokes() {
+    let (w, h) = (128usize, 96usize);
+    let mut bgr = vec![0u8; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            bgr[i] = (x * 2) as u8;
+            bgr[i + 1] = (y * 2) as u8;
+            bgr[i + 2] = ((x * y) % 256) as u8;
+        }
+    }
+    let gray = gray_from_bgr(&bgr, w, h);
+    let flow = smooth_flow(flow_field(&gray, w, h, 2.5), 4);
+    let n_strokes = (w * h) as i32 / 140;
+    let base = generate_strokes(&bgr, w, h, &flow, n_strokes, 20, 3, 2, 0.6, 7);
+    assert!(base.len() > 20);
+    let boiled = |boil: f64, frame: u32| {
+        let mut s = generate_strokes(&bgr, w, h, &flow, n_strokes, 20, 3, 2, 0.6, 7);
+        boil_strokes(&mut s, w, h, &flow, n_strokes, 20, 3, 0.6, 7, frame, boil);
+        s
+    };
+    let changed = |s: &[Stroke]| s.iter().zip(&base).filter(|(a, b)| a.pts != b.pts || a.lum != b.lum).count();
+    assert_eq!(changed(&boiled(0.0, 1)), 0);
+    let c30 = changed(&boiled(0.3, 1));
+    assert!(c30 > 0 && c30 < base.len(), "boil 0.3 changed {c30} of {}", base.len());
+    let c100 = changed(&boiled(1.0, 1));
+    assert!(c100 * 10 >= base.len() * 8, "boil 1.0 changed only {c100} of {}", base.len());
+    let (a, b) = (boiled(0.3, 2), boiled(0.3, 2));
+    assert!(a.iter().zip(&b).all(|(x, y)| x.pts == y.pts && x.lum == y.lum && x.th == y.th));
+
+    // paint path: frame 0 ignores boil, frame 1 differs but is deterministic
+    let mut bgra = vec![255u8; w * h * 4];
+    for i in 0..w * h {
+        bgra[i * 4..i * 4 + 3].copy_from_slice(&bgr[i * 3..i * 3 + 3]);
+    }
+    let p = |boil: f64, boil_frame: u32| Params { brush_len: 20, brush_w: 3, layers: 2, relief: 0.1,
+                                                  base_radius: 3, flow_smooth: 4, seed: 7,
+                                                  max_size: None, impasto: 0.0, impasto_knife: false,
+                                                  boil, boil_frame };
+    let plain = paint_bgra(&bgra, w, h, &p(0.0, 0)).0;
+    assert_eq!(paint_bgra(&bgra, w, h, &p(0.3, 0)).0, plain, "frame 0 must ignore boil");
+    let f1 = paint_bgra(&bgra, w, h, &p(0.3, 1)).0;
+    assert_ne!(f1, plain);
+    assert_eq!(f1, paint_bgra(&bgra, w, h, &p(0.3, 1)).0);
+    let same = f1.chunks(4).zip(plain.chunks(4)).filter(|(a, b)| a == b).count();
+    assert!(same * 2 > w * h, "boil 0.3 repainted most of the frame ({same} same px)");
 }

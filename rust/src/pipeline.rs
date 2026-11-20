@@ -20,6 +20,15 @@ pub struct Params {
     /// the Blender Bump node.
     #[serde(default)]
     pub impasto: f64,
+    /// Impasto look: false = bristle strokes, true = palette knife (flat slabs).
+    #[serde(default)]
+    pub impasto_knife: bool,
+    /// Animation boil: share (0..1) of strokes repainted on frame `boil_frame`.
+    #[serde(default)]
+    pub boil: f64,
+    /// Animation frame index; 0 = base painting (boil has no effect).
+    #[serde(default)]
+    pub boil_frame: u32,
 }
 
 /// Companion struct: optional per-frame kind names, same params JSON.
@@ -544,6 +553,89 @@ pub struct Stroke {
     pub lum: f32,
 }
 
+/// Walk a stroke polyline from (x0, y0) along the flow field (f32 math like
+/// the python reference). Shared by generate_strokes and boil_strokes.
+fn trace_stroke(x0: f32, y0: f32, flow: &Flow, w: usize, h: usize, length: i32) -> Vec<(f32, f32)> {
+    let xi = (x0 as i64).clamp(0, w as i64 - 1) as usize;
+    let yi = (y0 as i64).clamp(0, h as i64 - 1) as usize;
+    let a = (flow.angle[yi * w + xi] as f32).to_radians();
+    let steps = (length as i64 / 2).max(2) as usize;
+    let mut poly: Vec<(f32, f32)> = vec![(x0, y0)];
+    let (mut cx, mut cy) = (x0, y0);
+    let (mut dx0, mut dy0) = (a.cos(), a.sin());
+    for _s in 0..steps {
+        let xj = (cx as i64).clamp(0, w as i64 - 1) as usize;
+        let yj = (cy as i64).clamp(0, h as i64 - 1) as usize;
+        let mut a2 = (flow.angle[yj * w + xj] as f32).to_radians();
+        let cur = dy0.atan2(dx0);
+        let mut d1 = (a2 - cur + std::f32::consts::PI)
+            % (2.0 * std::f32::consts::PI)
+            - std::f32::consts::PI;
+        if d1 < -std::f32::consts::PI {
+            d1 += 2.0 * std::f32::consts::PI;
+        }
+        if d1.abs() >= std::f32::consts::PI / 2.0 {
+            a2 += std::f32::consts::PI;
+        }
+        dx0 = 0.7 * dx0 + 0.3 * a2.cos();
+        dy0 = 0.7 * dy0 + 0.3 * a2.sin();
+        let nrm = (dx0 * dx0 + dy0 * dy0).sqrt() + 1e-8;
+        dx0 /= nrm;
+        dy0 /= nrm;
+        cx += 2.0 * dx0;
+        cy += 2.0 * dy0;
+        if !(cx >= 0.0 && cx < w as f32 && cy >= 0.0 && cy < h as f32) {
+            break;
+        }
+        poly.push((cx, cy));
+    }
+    poly
+}
+
+/// Animation boil: repaint a `boil` share of `strokes` for frame `frame` (new
+/// start offset re-traced through the flow, new lum and width). The other
+/// strokes stay identical to frame 0, and draw order never changes.
+pub fn boil_strokes(
+    strokes: &mut [Stroke],
+    w: usize,
+    h: usize,
+    flow: &Flow,
+    strokes_per_layer: i32,
+    length: i32,
+    width: i32,
+    jitter: f64,
+    seed: u64,
+    frame: u32,
+    boil: f64,
+) {
+    let mut rng = Pcg64::new(seed ^ (frame as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let step = (h as i32 / (strokes_per_layer as f64).sqrt() as i32).max(2);
+    let off = step as f64 * 0.5;
+    for s in strokes.iter_mut() {
+        if rng.uniform(0.0, 1.0) >= boil {
+            continue;
+        }
+        let dx = rng.uniform(-off, off);
+        let dy = rng.uniform(-off, off);
+        let lum = rng.uniform(0.94, 1.06) as f32;
+        let wj = ((width as f64 * rng.uniform(1.0 - jitter, 1.0 + jitter)) as i64).max(1) as i32;
+        let poly = trace_stroke(
+            (s.pts[0].0 as f64 + dx) as f32,
+            (s.pts[0].1 as f64 + dy) as f32,
+            flow,
+            w,
+            h,
+            length,
+        );
+        if poly.len() < 3 {
+            continue;
+        }
+        s.pts = poly;
+        s.lum = lum;
+        s.th = wj;
+    }
+}
+
 /// Stroke geometry + every RNG decision, none of the coloring. Same RNG
 /// consumption order as the pre-split render_strokes (jittered grid,
 /// gradient sort, then per stroke lum/length/width draws, and the <3-point
@@ -601,42 +693,7 @@ pub fn generate_strokes(
         });
 
         for (x0, y0) in &pts {
-            // python keeps all stroke geometry in float32 (np.radians of f32
-            // angle, np.cos/sin f32); replicate with f32 ops.
-            let (x0, y0) = (*x0, *y0);
-            let xi = (x0 as i64).clamp(0, w as i64 - 1) as usize;
-            let yi = (y0 as i64).clamp(0, h as i64 - 1) as usize;
-            let a = (flow.angle[yi * w + xi] as f32).to_radians();
-            let steps = (length as i64 / 2).max(2) as usize;
-            let mut poly: Vec<(f32, f32)> = vec![(x0, y0)];
-            let (mut cx, mut cy) = (x0, y0);
-            let (mut dx0, mut dy0) = (a.cos(), a.sin());
-            for _s in 0..steps {
-                let xj = (cx as i64).clamp(0, w as i64 - 1) as usize;
-                let yj = (cy as i64).clamp(0, h as i64 - 1) as usize;
-                let mut a2 = (flow.angle[yj * w + xj] as f32).to_radians();
-                let cur = dy0.atan2(dx0);
-                let mut d1 = (a2 - cur + std::f32::consts::PI)
-                    % (2.0 * std::f32::consts::PI)
-                    - std::f32::consts::PI;
-                if d1 < -std::f32::consts::PI {
-                    d1 += 2.0 * std::f32::consts::PI;
-                }
-                if d1.abs() >= std::f32::consts::PI / 2.0 {
-                    a2 += std::f32::consts::PI;
-                }
-                dx0 = 0.7 * dx0 + 0.3 * a2.cos();
-                dy0 = 0.7 * dy0 + 0.3 * a2.sin();
-                let nrm = (dx0 * dx0 + dy0 * dy0).sqrt() + 1e-8;
-                dx0 /= nrm;
-                dy0 /= nrm;
-                cx += 2.0 * dx0;
-                cy += 2.0 * dy0;
-                if !(cx >= 0.0 && cx < w as f32 && cy >= 0.0 && cy < h as f32) {
-                    break;
-                }
-                poly.push((cx, cy));
-            }
+            let poly = trace_stroke(*x0, *y0, flow, w, h, length);
             if poly.len() < 3 {
                 continue;
             }
@@ -720,22 +777,85 @@ pub fn paint_from_strokes(
     out
 }
 
-/// Paint-thickness height field in PIXEL units from the stroke list
-/// (deterministic: uses only stroke geometry + s.lum, consumes no RNG).
-/// Each stroke is a rounded bead (sqrt cross profile) with bristle grooves,
-/// thinning along the drag and piling up where the brush lifts; later
-/// strokes sit on top of earlier paint.
-pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke]) -> Vec<f32> {
-    use std::f32::consts::TAU;
+// ---------------------------------------------------------------- impasto
+
+/// Footprint half-width of a stroke of thickness `th` (matches draw_polyline for th >= 2).
+fn stroke_half(th: i32) -> f32 {
+    if th <= 1 { 1.5 } else { ((th + 1) / 2) as f32 + 0.5 }
+}
+
+/// Half-width of the widest stroke the width jitter (x1.6) can produce.
+fn impasto_ref_half(brush_w: i32) -> f32 {
+    stroke_half(((brush_w as f64 * 1.6) as i32).max(1))
+}
+
+/// Height (px) that maps to white in the height frame.
+fn impasto_norm_px(brush_w: i32) -> f32 {
+    2.4 * impasto_ref_half(brush_w)
+}
+
+/// Thickness of a white height pixel in UV units x impasto (0 when impasto is off).
+pub fn impasto_height_scale(w: usize, h: usize, p: &Params) -> f32 {
+    if p.impasto > 0.0 {
+        p.impasto as f32 * impasto_norm_px(p.brush_w) / w.max(h) as f32
+    } else {
+        0.0
+    }
+}
+
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn hash01(seed: u32, i: u32) -> f32 {
+    let mut x = seed ^ i.wrapping_mul(0x9E37_79B9);
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352D);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846C_A68B);
+    x ^= x >> 16;
+    x as f32 / 4_294_967_296.0
+}
+
+struct ImpastoStyle {
+    t_k: f32,
+    keep: f32,
+    rim: f32,
+    groove0: f32,
+    groove1: f32,
+    rag: f32,
+    blur: f32,
+    lip: f32,
+    deplete: f32,
+}
+
+const BRISTLE: ImpastoStyle = ImpastoStyle {
+    t_k: 0.7, keep: 0.35, rim: 0.5, groove0: 0.18, groove1: 0.55, rag: 1.0, blur: 0.8, lip: 0.3, deplete: 0.4,
+};
+const KNIFE: ImpastoStyle = ImpastoStyle {
+    t_k: 0.8, keep: 0.30, rim: 0.7, groove0: 0.04, groove1: 0.15, rag: 0.5, blur: 0.7, lip: 0.5, deplete: 0.25,
+};
+
+/// Paint-thickness field in PIXEL units from the stroke list. Each stroke is
+/// a slab with steep shoulders, raised side rims, hashed bristle grooves, a
+/// blob where the brush lands and a ragged tail where it lifts; a new stroke
+/// flattens what is beneath it to its mean and keeps `keep` of it.
+/// Deterministic (hashes of lum + index), consumes no RNG.
+pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool) -> Vec<f32> {
+    let st = if knife { &KNIFE } else { &BRISTLE };
     let mut height = vec![0f32; w * h];
-    let mut scratch: Vec<f32> = Vec::new();
+    let mut best: Vec<f32> = Vec::new();
+    let mut sdv: Vec<f32> = Vec::new();
+    let mut av: Vec<f32> = Vec::new();
+    let mut tv: Vec<f32> = Vec::new();
     let mut cum: Vec<f32> = Vec::new();
-    for s in strokes {
+    for (idx, s) in strokes.iter().enumerate() {
         let poly = &s.pts[..];
         if poly.len() < 2 {
             continue;
         }
-        let half: f32 = if s.th <= 1 { 1.5 } else { ((s.th + 1) / 2) as f32 + 0.5 };
+        let half = stroke_half(s.th);
         cum.clear();
         cum.push(0.0);
         for k in 1..poly.len() {
@@ -754,7 +874,7 @@ pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke]) -> Vec<f32> {
             maxx = maxx.max(x);
             maxy = maxy.max(y);
         }
-        let pad = half + 1.0;
+        let pad = half + 2.0;
         let bx0 = (minx - pad).floor().max(0.0) as usize;
         let by0 = (miny - pad).floor().max(0.0) as usize;
         let bx1 = ((maxx + pad).ceil().max(0.0) as usize).min(w - 1);
@@ -764,17 +884,27 @@ pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke]) -> Vec<f32> {
         }
         let bw = bx1 - bx0 + 1;
         let bh = by1 - by0 + 1;
-        scratch.clear();
-        scratch.resize(bw * bh, 0.0);
+        best.clear();
+        best.resize(bw * bh, f32::MAX);
+        sdv.clear();
+        sdv.resize(bw * bh, 0.0);
+        av.clear();
+        av.resize(bw * bh, 0.0);
+        tv.clear();
+        tv.resize(bw * bh, 0.0);
 
-        let period = (0.4 * half).max(3.0);
-        let phase = (s.lum * 61.7).fract() * TAU;
+        // nearest segment per pixel: signed perpendicular offset + arclength
         for seg in 0..poly.len() - 1 {
             let (ax, ay) = poly[seg];
             let (bx, by) = poly[seg + 1];
             let (dx, dy) = (bx - ax, by - ay);
             let len = (dx * dx + dy * dy).sqrt();
-            let (ux, uy) = if len > 0.0 { (dx / len, dy / len) } else { (0.0, 0.0) };
+            if len <= 1e-6 {
+                continue;
+            }
+            let (ux, uy) = (dx / len, dy / len);
+            let lo = if seg == 0 { -1.0 } else { 0.0 };
+            let hi = if seg == poly.len() - 2 { len + 1.0 } else { len };
             let sx0 = ((ax.min(bx) - pad).floor().max(bx0 as f32)) as usize;
             let sy0 = ((ay.min(by) - pad).floor().max(by0 as f32)) as usize;
             let sx1 = ((ax.max(bx) + pad).ceil().max(0.0) as usize).min(bx1);
@@ -783,46 +913,94 @@ pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke]) -> Vec<f32> {
                 let py = y as f32 + 0.5;
                 for x in sx0..=sx1 {
                     let px = x as f32 + 0.5;
-                    let t = ((px - ax) * ux + (py - ay) * uy).clamp(0.0, len);
-                    let (cx, cy) = (ax + ux * t, ay + uy * t);
-                    let dist = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
-                    if dist >= half {
-                        continue;
-                    }
-                    let r = dist / half;
-                    let body = (1.0 - r * r).sqrt();
-                    let sd = -(px - ax) * uy + (py - ay) * ux;
-                    let groove = 1.0 - 0.3 * (0.5 + 0.5 * (TAU * sd / period + phase).cos());
-                    let a = cum[seg] + t;
-                    let along = (1.0 - 0.35 * a / total)
-                        + 0.45 * (-((total - a) / half).powi(2)).exp();
-                    let bump = half * body * groove * along;
+                    let proj = (px - ax) * ux + (py - ay) * uy;
+                    let perp = -(px - ax) * uy + (py - ay) * ux;
+                    let t = proj.clamp(lo, hi);
+                    let dist = perp.hypot(proj - t);
                     let j = (y - by0) * bw + (x - bx0);
-                    if bump > scratch[j] {
-                        scratch[j] = bump;
+                    if dist < best[j] {
+                        best[j] = dist;
+                        sdv[j] = perp;
+                        av[j] = cum[seg] + t;
                     }
                 }
             }
         }
-        for yy in 0..bh {
-            for xx in 0..bw {
-                let bump = scratch[yy * bw + xx];
-                if bump > 0.0 {
-                    let i = (by0 + yy) * w + bx0 + xx;
-                    height[i] = height[i].max(0.5 * height[i] + bump);
-                }
+
+        // per-stroke randoms from hashes (no RNG consumed)
+        let seed = s.lum.to_bits() ^ (idx as u32).wrapping_mul(0x9E37_79B9);
+        let kn = (((2.0 * half / 2.2).round()) as usize).clamp(3, 24);
+        let mut gb = [0f32; 24];
+        let mut ge = [0f32; 24];
+        for i in 0..kn {
+            gb[i] = hash01(seed, i as u32);
+            ge[i] = hash01(seed, (kn + i) as u32);
+        }
+        let load = 0.6 + 0.8 * hash01(seed, (2 * kn) as u32);
+        let tmax = st.t_k * half * load;
+
+        let mut sum = 0f64;
+        let mut cnt = 0usize;
+        for j in 0..bw * bh {
+            if best[j] >= half {
+                continue;
+            }
+            let sd = sdv[j];
+            let a = av[j];
+            let u = (sd / half).clamp(-1.0, 1.0);
+            let fx = (u * 0.5 + 0.5) * (kn - 1) as f32;
+            let i0 = (fx.floor() as usize).min(kn - 2);
+            let mut fr = fx - i0 as f32;
+            fr = fr * fr * (3.0 - 2.0 * fr);
+            let nb = gb[i0] * (1.0 - fr) + gb[i0 + 1] * fr;
+            let ne = ge[i0] * (1.0 - fr) + ge[i0 + 1] * fr;
+            let au = u.abs();
+            let cross = (1.0 - au.powi(6)) * (1.0 + st.rim * (-((au - 0.78) / 0.13).powi(2)).exp());
+            let edge = smoothstep(0.0, 1.4, half - sd.abs());
+            let ac = a.clamp(0.0, total);
+            let q = ac / total;
+            let leff = total - st.rag * half * ne;
+            let tail = smoothstep(0.0, 0.8 * half, leff - a);
+            let head = smoothstep(-1.0, 0.5 * half, a);
+            let lip = if leff - a > 0.0 {
+                st.lip * (-((leff - a) / (0.45 * half)).powi(2)).exp()
+            } else {
+                0.0
+            };
+            let along = (1.0 - st.deplete * q) * (1.0 + 0.25 * (-(ac / (0.9 * half)).powi(2)).exp()) + lip;
+            let groove = 1.0 - (st.groove0 + (st.groove1 - st.groove0) * q) * nb;
+            let t = tmax * cross * edge * groove * along * tail * head;
+            tv[j] = t;
+            if t > 0.0 {
+                let i = (by0 + j / bw) * w + bx0 + j % bw;
+                sum += height[i] as f64;
+                cnt += 1;
+            }
+        }
+        if cnt == 0 {
+            continue;
+        }
+        let mean_under = (sum / cnt as f64) as f32;
+        for j in 0..bw * bh {
+            let t = tv[j];
+            if t > 0.0 {
+                let i = (by0 + j / bw) * w + bx0 + j % bw;
+                let c = smoothstep(0.0, 0.45 * tmax, t);
+                height[i] = height[i] * (1.0 - c) + st.keep * mean_under * c + t;
             }
         }
     }
-    gaussian_blur_plane(&height, w, h, 0.8)
+    gaussian_blur_plane(&height, w, h, st.blur as f64)
 }
 
 /// Shade a BGRA color frame in place by the impasto height (light from
-/// upper-left + wet specular). Flat height leaves pixels unchanged.
-fn shade_impasto(out: &mut [u8], w: usize, h: usize, height: &[f32], impasto: f64) {
+/// upper-left + wet specular + darkening in the cavities between strokes).
+/// Flat height leaves pixels unchanged.
+fn shade_impasto(out: &mut [u8], w: usize, h: usize, height: &[f32], impasto: f64, ref_half: f32) {
     let gx = sobel3(height, w, h, 1, 0);
     let gy = sobel3(height, w, h, 0, 1);
-    let g = 0.5 * impasto as f32 / 8.0; // sobel3 = 8x derivative
+    let low = gaussian_blur_plane(height, w, h, (0.28 * ref_half).clamp(1.0, 6.0) as f64);
+    let g = 0.6 * impasto as f32 / 8.0; // sobel3 = 8x derivative
     let norm3 = |v: [f32; 3]| {
         let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
         [v[0] / l, v[1] / l, v[2] / l]
@@ -836,25 +1014,37 @@ fn shade_impasto(out: &mut [u8], w: usize, h: usize, height: &[f32], impasto: f6
         let diff = (n[0] * l[0] + n[1] * l[1] + n[2] * l[2]).max(0.0) / l[2];
         let nh = (n[0] * hv[0] + n[1] * hv[1] + n[2] * hv[2]).max(0.0);
         let spec = (nh.powi(40) - spec0).max(0.0);
+        let cav = (low[i] - height[i]).max(0.0) / ref_half;
+        let dark = 1.0 - (0.7 * impasto as f32 * cav).min(0.6);
         for c in 0..3 {
-            let v = out[i * 4 + c] as f32 * (1.0 + 0.85 * (diff - 1.0)) + 255.0 * 0.22 * spec;
+            let v = (out[i * 4 + c] as f32 * (1.0 + 0.85 * (diff - 1.0)) + 255.0 * 0.22 * spec) * dark;
             out[i * 4 + c] = v.round().clamp(0.0, 255.0) as u8;
         }
     }
 }
 
-/// Height as gray BGRA for the Blender Bump node:
-/// v = clamp(height_px * impasto * 20 / max(w,h), 0, 1). The 20 pairs with
-/// the addon's IMPASTO_UV_DIVISOR (ridge ≈ 0.5 × half-width at impasto 1).
-fn height_frame(height: &[f32], w: usize, h: usize, impasto: f64) -> Vec<u8> {
-    let k = impasto as f32 * 20.0 / w.max(h) as f32;
+/// Height as gray BGRA for the Blender Bump node: v = clamp(height_px /
+/// norm_px, 0, 1). The impasto factor travels separately in
+/// [`impasto_height_scale`].
+fn height_frame(height: &[f32], w: usize, h: usize, norm_px: f32) -> Vec<u8> {
     let mut out = vec![255u8; w * h * 4];
     for i in 0..w * h {
-        let v = ((height[i] * k).clamp(0.0, 1.0) * 255.0).round() as u8;
+        let v = ((height[i] / norm_px).clamp(0.0, 1.0) * 255.0).round() as u8;
         out[i * 4] = v;
         out[i * 4 + 1] = v;
         out[i * 4 + 2] = v;
     }
+    out
+}
+
+/// Display-only clay render: mid-gray canvas lit by the impasto shading, so
+/// the relief is visible on the page when no color map is loaded.
+fn preview_frame(w: usize, h: usize, height: &[f32], impasto: f64, ref_half: f32) -> Vec<u8> {
+    let mut out = vec![170u8; w * h * 4];
+    for i in 0..w * h {
+        out[i * 4 + 3] = 255;
+    }
+    shade_impasto(&mut out, w, h, height, impasto, ref_half);
     out
 }
 
@@ -997,7 +1187,7 @@ pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, Stri
     let flow0 = flow_field(&gray, w, h, 2.5);
     let flow = smooth_flow(flow0, p.flow_smooth);
     let n_strokes = (w * h) as i32 / 140;
-    let strokes = generate_strokes(
+    let mut strokes = generate_strokes(
         &bgr,
         w,
         h,
@@ -1009,10 +1199,13 @@ pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, Stri
         0.6,
         p.seed,
     );
+    if p.boil_frame > 0 && p.boil > 0.0 {
+        boil_strokes(&mut strokes, w, h, &flow, n_strokes, p.brush_len, p.brush_w, 0.6, p.seed, p.boil_frame, p.boil);
+    }
     let mut out = paint_from_strokes(&bgr, &base, w, h, &strokes, p.relief);
     if p.impasto > 0.0 {
-        let hgt = impasto_height(w, h, &strokes);
-        shade_impasto(&mut out, w, h, &hgt, p.impasto);
+        let hgt = impasto_height(w, h, &strokes, p.impasto_knife);
+        shade_impasto(&mut out, w, h, &hgt, p.impasto, impasto_ref_half(p.brush_w));
     }
     (out, String::new())
 }
@@ -1031,10 +1224,11 @@ fn bgra_to_bgr(bgra: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// Multi-channel coherent paint: flow + strokes derived from `ref_bgra`
 /// only, then the SAME strokes are stamped on every channel in `chans`
 /// (stroke replay). The painted reference is element 0 of the returned Vec,
-/// so callers pass ONLY the other channels: returned.len() == chans.len() + 1,
-/// or chans.len() + 2 when impasto > 0 (trailing gray height frame for the
-/// Blender Bump node). `kinds` is frame-aligned (kinds[0] = reference); with
-/// impasto > 0 frames of kind "color" are shaded by the stroke height.
+/// so callers pass ONLY the other channels (0..=4; none = reference only):
+/// returned.len() == chans.len() + 1, or chans.len() + 3 when impasto > 0
+/// (a gray height frame for the Blender Bump node, then a display-only
+/// clay "relief preview"). `kinds` is frame-aligned (kinds[0] = reference);
+/// with impasto > 0 frames of kind "color" are shaded by the stroke height.
 /// Every channel gets identical stroke geometry and per-stroke lum; the
 /// per-channel color sampling makes each map its own painting. relief is
 /// applied to all.
@@ -1049,8 +1243,8 @@ pub fn paint_bgra_multi(
     if w == 0 || h == 0 {
         return Err("empty image".into());
     }
-    if chans.is_empty() || chans.len() > 4 {
-        return Err(format!("1-4 channels required, got {}", chans.len()));
+    if chans.len() > 4 {
+        return Err(format!("at most 4 extra channels, got {}", chans.len()));
     }
     let n = w * h * 4;
     for (i, c) in chans.iter().enumerate() {
@@ -1071,7 +1265,7 @@ pub fn paint_bgra_multi(
     let flow0 = flow_field(&gray, w, h, 2.5);
     let flow = smooth_flow(flow0, p.flow_smooth);
     let n_strokes = (w * h) as i32 / 140;
-    let strokes = generate_strokes(
+    let mut strokes = generate_strokes(
         &ref_bgr,
         w,
         h,
@@ -1083,8 +1277,11 @@ pub fn paint_bgra_multi(
         0.6,
         p.seed,
     );
-    let hgt = if p.impasto > 0.0 { Some(impasto_height(w, h, &strokes)) } else { None };
-    let mut out = Vec::with_capacity(chans.len() + 2);
+    if p.boil_frame > 0 && p.boil > 0.0 {
+        boil_strokes(&mut strokes, w, h, &flow, n_strokes, p.brush_len, p.brush_w, 0.6, p.seed, p.boil_frame, p.boil);
+    }
+    let hgt = if p.impasto > 0.0 { Some(impasto_height(w, h, &strokes, p.impasto_knife)) } else { None };
+    let mut out = Vec::with_capacity(chans.len() + 3);
     // painted reference (BGRA) is frame 0
     out.push(paint_from_strokes(&ref_bgr, &base, w, h, &strokes, p.relief));
     for c in chans {
@@ -1093,12 +1290,14 @@ pub fn paint_bgra_multi(
         out.push(paint_from_strokes(&cgr, &cbase, w, h, &strokes, p.relief));
     }
     if let Some(hgt) = hgt {
+        let ref_half = impasto_ref_half(p.brush_w);
         for (i, frame) in out.iter_mut().enumerate() {
             if kind_at(kinds, i) == Some("color") {
-                shade_impasto(frame, w, h, &hgt, p.impasto);
+                shade_impasto(frame, w, h, &hgt, p.impasto, ref_half);
             }
         }
-        out.push(height_frame(&hgt, w, h, p.impasto));
+        out.push(height_frame(&hgt, w, h, impasto_norm_px(p.brush_w)));
+        out.push(preview_frame(w, h, &hgt, p.impasto, ref_half));
     }
     Ok(out)
 }
