@@ -122,6 +122,8 @@ pub extern "C" fn wasm_paint(
             flow_smooth: 8,
             seed: 42,
             max_size: None,
+            impasto: 0.0,
+            impasto_kind: None,
         }
     } else {
         match serde_json::from_str(&json) {
@@ -211,6 +213,8 @@ pub extern "C" fn wasm_paint_multi(
             flow_smooth: 8,
             seed: 42,
             max_size: None,
+            impasto: 0.0,
+            impasto_kind: None,
         }
     } else {
         match serde_json::from_str(&json) {
@@ -219,7 +223,12 @@ pub extern "C" fn wasm_paint_multi(
         }
     };
     let frames: Vec<&[u8]> = (0..k).map(|i| &blob[i * frame..(i + 1) * frame]).collect();
-    match pipeline::paint_bgra_multi(frames[0], &frames[1..], w, h, &p) {
+    // channel kind names (["<ref>", ...]) from the same params JSON; used
+    // only to locate the normal channel for the impasto pass
+    let kinds: Option<Vec<Option<String>>> = serde_json::from_str::<pipeline::KindsHint>(&json)
+        .ok()
+        .map(|h| h.kinds);
+    match pipeline::paint_bgra_multi(frames[0], &frames[1..], w, h, &p, kinds.as_deref()) {
         Ok(painted) => {
             // no downscale in the multi path: same dims in/out
             let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, frame * k) };

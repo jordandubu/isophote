@@ -29,7 +29,7 @@ fn strokes_match_python_reference() {
     let flow = smooth_flow(flow0, 8);
     let n_strokes = (w * h) as i32 / 140;
     let strokes = generate_strokes(&bgr, w, h, &flow, n_strokes, 45, 3, 4, 0.6, 42);
-    let out_bgra = paint_from_strokes(&bgr, &base, w, h, &strokes, 0.0);
+    let out_bgra = paint_from_strokes(&bgr, &base, w, h, &strokes, 0.0, 0.0);
     struct OutWrap { bgra: Vec<u8> }
     let out = OutWrap { bgra: out_bgra };
     let (_, ref_painted) = read_npy("tests/painted_ref.npy");
@@ -77,11 +77,11 @@ fn multi_replay_same_strokes() {
     }
     let p = Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
                      base_radius: 3, flow_smooth: 4, seed: 7,
-                     max_size: None };
-    let outs = paint_bgra_multi(&ref_img, &[&chan], w, h, &p).unwrap();
+                     max_size: None, impasto: 0.0, impasto_kind: None };
+    let outs = paint_bgra_multi(&ref_img, &[&chan], w, h, &p, None).unwrap();
     assert_eq!(outs.len(), 2);
     // determinism: same inputs -> identical bytes
-    let outs2 = paint_bgra_multi(&ref_img, &[&chan], w, h, &p).unwrap();
+    let outs2 = paint_bgra_multi(&ref_img, &[&chan], w, h, &p, None).unwrap();
     assert_eq!(outs, outs2, "multi repaint is nondeterministic");
 
     // coherence: strokes stamped identically -> the painted channel's
@@ -127,10 +127,10 @@ fn multi_replay_same_strokes() {
                          p.brush_len, p.brush_w, p.layers, 0.6, p.seed)
     };
     assert!(!strokes.is_empty());
-    let painted_ref2 = paint_from_strokes(&ref_bgr, &ref_base, w, h, &strokes, p.relief);
+    let painted_ref2 = paint_from_strokes(&ref_bgr, &ref_base, w, h, &strokes, p.relief, 0.0);
     assert_eq!(painted_ref2, outs[0], "generate+paint path != paint_bgra_multi ref");
 
     // validation errors
-    assert!(paint_bgra_multi(&ref_img, &[&chan], 0, 32, &p).is_err());
-    assert!(paint_bgra_multi(&ref_img, &[&chan[..chan.len() - 4]], w, h, &p).is_err());
+    assert!(paint_bgra_multi(&ref_img, &[&chan], 0, 32, &p, None).is_err());
+    assert!(paint_bgra_multi(&ref_img, &[&chan[..chan.len() - 4]], w, h, &p, None).is_err());
 }

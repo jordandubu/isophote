@@ -15,6 +15,31 @@ pub struct Params {
     // input downscale cap (long edge). Omitted -> 1400 (old behavior).
     #[serde(default)]
     pub max_size: Option<i32>,
+    /// Impasto ridge strength (0 = off). Tilts the painted normal channel's
+    /// normals along the stroke height gradient ("too much paint").
+    #[serde(default)]
+    pub impasto: f64,
+    /// Which queued channel is the normal map (receives the impasto tilt).
+    /// None on color-only painting.
+    #[serde(default)]
+    pub impasto_kind: Option<String>,
+}
+
+/// Companion struct: optional per-channel kind names, same params JSON
+/// (index 0 = reference may be null).
+#[derive(serde::Deserialize, Default)]
+pub struct KindsHint {
+    #[serde(default)]
+    pub kinds: Vec<Option<String>>,
+}
+
+/// True when `kinds[chan_index]` names the normal channel.
+pub fn kinds_is_normal(kinds: Option<&[Option<String>]>, chan_index: usize) -> bool {
+    kinds
+        .and_then(|ks| ks.get(chan_index))
+        .and_then(|k| k.as_deref())
+        .map(|k| k == "normal")
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------- image ops
@@ -644,6 +669,7 @@ pub fn paint_from_strokes(
     h: usize,
     strokes: &[Stroke],
     relief: f64,
+    impasto: f64,
 ) -> Vec<u8> {
     // canvas starts as base (BGRA out)
     let mut canvas: Vec<[f32; 3]> = base
@@ -699,7 +725,80 @@ pub fn paint_from_strokes(
             }
         }
     }
+    if impasto > 0.0 {
+        apply_impasto(&mut out, w, h, strokes, impasto);
+    }
     out
+}
+
+/// Impasto: ridges where strokes were laid. Rasterize each stroke into a
+/// height buffer (soft bumps along the centerline, height ~ brush width),
+/// Sobel it, and tilt the painted normal map's XY by the gradient. Applied
+/// ONLY to the normal channel; the painted RGB is reprojected back to unit
+/// normals in 0..1 space (same math as the addon's `_renormalize_file`).
+fn apply_impasto(out: &mut [u8], w: usize, h: usize, strokes: &[Stroke], impasto: f64) {
+    let mut height = vec![0f32; w * h];
+    for s in strokes {
+        let poly = &s.pts[..];
+        let half = if s.th <= 1 {
+            0.5
+        } else {
+            ((s.th + 1) / 2) as f64 + 0.5
+        };
+        let peak = half as f32 * 2.0; // taller strokes for wider brushes
+        for seg in 0..poly.len().saturating_sub(1) {
+            let (ax, ay) = (poly[seg].0 as f64, poly[seg].1 as f64);
+            let (bx, by) = (poly[seg + 1].0 as f64, poly[seg + 1].1 as f64);
+            let dx = bx - ax;
+            let dy = by - ay;
+            let len = (dx * dx + dy * dy).sqrt();
+            let (ux, uy) = if len > 0.0 { (dx / len, dy / len) } else { (0.0, 0.0) };
+            let lo_x = ((ax.min(bx) - half - 2.0).floor().max(0.0)) as usize;
+            let lo_y = ((ay.min(by) - half - 2.0).floor().max(0.0)) as usize;
+            let hi_x = ((ax.max(bx) + half + 2.0).ceil().min(w as f64 - 1.0)) as usize;
+            let hi_y = ((ay.max(by) + half + 2.0).ceil().min(h as f64 - 1.0)) as usize;
+            for y in lo_y..=hi_y {
+                let py = y as f64 + 0.5;
+                for x in lo_x..=hi_x {
+                    let px = x as f64 + 0.5;
+                    let proj = (px - ax) * ux + (py - ay) * uy;
+                    if proj < -1.0 || proj > len + 1.0 { continue; }
+                    let perp = (-(px - ax) * uy + (py - ay) * ux).abs();
+                    if perp >= half { continue; }
+                    // ridge profile: cos falloff from the centerline
+                    let bump = ((1.0 - (perp / half) * (perp / half)) as f64)
+                        .max(0.0).sqrt() as f32
+                        * peak;
+                    let i = y * w + x;
+                    if bump > height[i] {
+                        height[i] = bump;
+                    }
+                }
+            }
+        }
+    }
+    // tilt the painted normals by the height gradient
+    let gx = sobel3(&height, w, h, 1, 0);
+    let gy = sobel3(&height, w, h, 0, 1);
+    let k = 0.35 * (impasto as f32);
+    for i in 0..w * h {
+        // BGRA out: B=nx, G=ny, R=nz
+        let nx = out[i * 4] as f32 / 255.0 * 2.0 - 1.0;
+        let ny = out[i * 4 + 1] as f32 / 255.0 * 2.0 - 1.0;
+        let nz = out[i * 4 + 2] as f32 / 255.0 * 2.0 - 1.0;
+        // normalize the painted vector first so the tilt adds evenly
+        let l = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-4);
+        let (nnx, nny, nnz) = (nx / l, ny / l, nz / l);
+        // ridge slopes up left-of-peak: subtract gradient from XY
+        let tx = (nnx - gx[i] * k).clamp(-0.99, 0.99);
+        let ty = (nny - gy[i] * k).clamp(-0.99, 0.99);
+        let tl = (tx * tx + ty * ty + nnz * nnz).sqrt() + 1e-6;
+        out[i * 4] = ((tx / tl * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+        out[i * 4 + 1] = ((ty / tl * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+        // keep the sign of nz positive (up-facing)
+        let zn = (nnz.abs() / tl * 0.5 + 0.5) * 255.0;
+        out[i * 4 + 2] = zn.round().clamp(0.0, 255.0) as u8;
+    }
 }
 
 /// cv2.LINE_AA-ish polyline with thickness (anti-aliased coverage).
@@ -853,7 +952,7 @@ pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, Stri
         0.6,
         p.seed,
     );
-    let out = paint_from_strokes(&bgr, &base, w, h, &strokes, p.relief);
+    let out = paint_from_strokes(&bgr, &base, w, h, &strokes, p.relief, 0.0);
     (out, String::new())
 }
 
@@ -882,6 +981,7 @@ pub fn paint_bgra_multi(
     w: usize,
     h: usize,
     p: &Params,
+    kinds: Option<&[Option<String>]>,
 ) -> Result<Vec<Vec<u8>>, String> {
     if w == 0 || h == 0 {
         return Err("empty image".into());
@@ -921,13 +1021,17 @@ pub fn paint_bgra_multi(
         p.seed,
     );
     let mut out = Vec::with_capacity(chans.len() + 1);
-    out.push(paint_from_strokes(&ref_bgr, &base, w, h, &strokes, p.relief));
+    out.push(paint_from_strokes(&ref_bgr, &base, w, h, &strokes, p.relief, 0.0));
     // painted ref is BGRA already (paint_from_strokes emits BGRA); the
     // result above is the painted reference.
-    for c in chans {
+    for (ci, c) in chans.iter().enumerate() {
+        let is_normal = p.impasto > 0.0 && kinds_is_normal(kinds, ci + 1);
         let cgr = bgra_to_bgr(c, w, h);
         let cbase = kuwahara(&cgr, w, h, p.base_radius);
-        let painted = paint_from_strokes(&cgr, &cbase, w, h, &strokes, p.relief);
+        let painted = paint_from_strokes(
+            &cgr, &cbase, w, h, &strokes, p.relief,
+            if is_normal { p.impasto } else { 0.0 },
+        );
         out.push(painted);
     }
     Ok(out)

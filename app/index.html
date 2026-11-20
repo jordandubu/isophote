@@ -279,6 +279,8 @@ input[type=file] { display: none; }
       <input type="range" id="base_radius" min="2" max="16" value="6"></div>
     <div class="slider"><div class="row"><label>Canvas relief<span class="dot" id="d_relief" style="visibility:hidden"></span></label><span class="v" id="v_relief">0.10</span></div>
       <input type="range" id="relief" min="0" max="0.6" step="0.05" value="0.10"></div>
+    <div class="slider"><div class="row"><label>Impasto (paint ridges)<span class="dot" id="d_impasto" style="visibility:hidden"></span></label><span class="v" id="v_impasto">0.00</span></div>
+      <input type="range" id="impasto" min="0" max="2" step="0.1" value="0"></div>
     <div class="slider"><div class="row"><label>Seed<span class="dot" id="d_seed" style="visibility:hidden"></span></label><span class="v" id="v_seed">42</span></div>
       <input type="range" id="seed" min="1" max="200" value="42"></div>
     <div class="slider"><div class="row"><label><input type="checkbox" id="imgscaleOn" checked style="vertical-align:-2px; accent-color:var(--accent);"> Image Scale</label><span style="display:flex; align-items:center; gap:8px;"><span class="v" id="v_imgscale">1024px</span><span class="dot" id="d_imgscale" style="visibility:hidden"></span></span></div>
@@ -301,8 +303,8 @@ const PRESETS = {
   bold:   {len:60, width:5, layers:2, flow_smooth:8, base_radius:8, relief:0.10},
   pastel: {len:30, width:5, layers:3, flow_smooth:8, base_radius:9, relief:0.00},
 };
-const DEFAULTS = {len:40, width:9, layers:2, flow_smooth:8, base_radius:6, relief:0.10, seed:42, sscale:1, imgscale:2};
-const KEYS = ["sscale","len","width","layers","flow_smooth","base_radius","relief","seed","imgscale"];
+const DEFAULTS = {len:40, width:9, layers:2, flow_smooth:8, base_radius:6, relief:0.10, impasto:0, seed:42, sscale:1, imgscale:2};
+const KEYS = ["sscale","len","width","layers","flow_smooth","base_radius","relief","impasto","seed","imgscale"];
 let srcBgrBytes = null, origURL = null, paintedURL = null, presetOn = "art", srcExt = "png";
 let srcW = 0, srcH = 0;
 const $ = id => document.getElementById(id);
@@ -628,7 +630,7 @@ function scheduleLive() {
 }
 function currentParams() {
   const p = {};
-  for (const k of ["sscale","len","width","layers","flow_smooth","base_radius","relief","seed"])
+  for (const k of ["sscale","len","width","layers","flow_smooth","base_radius","relief","impasto","seed"])
     p[k] = parseFloat($(k).value);
   return p;
 }
@@ -703,6 +705,8 @@ async function livePaint() {
       flow_smooth: Math.max(2, Math.round(params.flow_smooth * s)),
       seed: Math.round(params.seed),
       max_size: t_,
+      // impasto applies inside wasmPaintMulti when a normal channel exists
+      impasto: params.impasto || 0,
     };
     let url, ms, outW_, outH_;
     if (bridgeKinds && bridgeImgs) {
@@ -731,7 +735,9 @@ async function livePaint() {
       const ups = await Promise.all(jobs);
       const bgras = ups.map(u => u.bytes);
       const mw = inW, mh = inH;
-      const r = await wasmPaintMulti(bgras, mw, mh, core);
+      // kinds in blob order (reference first) — the core locates the normal
+      // channel for the impasto pass
+      const r = await wasmPaintMulti(bgras, mw, mh, { ...core, kinds: [null].concat(bridgeKinds) });
       ms = r.ms;
       paintedByKind = {};
       for (let i = 0; i < bridgeKinds.length; i++) {
@@ -936,7 +942,7 @@ async function sendToBlender() {
       if (paintedByKind && bridgeKinds.every(k => paintedByKind[k])) {
         urls = bridgeKinds.map(k => paintedByKind[k].url);
       } else {
-        ({ urls } = await wasmPaintMulti(bgras, mw, mh, params));
+        ({ urls } = await wasmPaintMulti(bgras, mw, mh, { ...params, kinds: [null].concat(bridgeKinds) }));
       }
       const pngs = [];
       for (const url of urls) pngs.push(await blobToB64(await (await fetch(url)).blob()));
@@ -980,6 +986,7 @@ function coreParamsForSize() {
     flow_smooth: Math.max(2, Math.round(params.flow_smooth * s)),
     seed: Math.round(params.seed),
     max_size: ms_,
+    impasto: params.impasto || 0,
   };
 }
 
@@ -1091,7 +1098,7 @@ async function _sendAnimatedToBlender(count = 10) {
     const bgras = ups.map(u => u.bytes);
     const aw = refW, ah = refH;
     for (let i = 0; i < count; i++) {
-      const { urls } = await wasmPaintMulti(bgras, aw, ah, { ...core, seed: baseSeed + i });
+      const { urls } = await wasmPaintMulti(bgras, aw, ah, { ...core, seed: baseSeed + i, kinds: [null].concat(bridgeKinds) });
       const one = [];
       for (const url of urls) one.push(await blobToB64(await (await fetch(url)).blob()));
       frames.push(one);
