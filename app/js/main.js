@@ -7,7 +7,7 @@ import { buildPanel } from "./controls.js";
 import { PaintClient, CANCELLED, makeSource, paint, draftUseful, bitmapToPngBlob } from "./engine.js";
 import { createViewer } from "./viewer.js";
 import { createAnim } from "./anim.js";
-import { createBlender, KIND_LABEL } from "./blender.js";
+import { createBlender } from "./blender.js";
 
 const store = createStore(DEFAULTS);
 const viewer = createViewer();
@@ -173,20 +173,10 @@ function clearSource() {
   syncUi();
 }
 
-/* channel dropdown: every channel of the current result (base color, normal map,
-   impasto height, relief preview...); all share stroke geometry */
+/* the channel dropdown lives in the Blender section (blender.refresh) */
 function syncUi() {
   blender.refresh();
-  const sel = $("chSelect"), kinds = result && source && source.multi ? result.kinds : [];
-  sel.hidden = kinds.length < 2;
-  sel.replaceChildren(...kinds.map((k) => {
-    const o = document.createElement("option");
-    o.value = k; o.textContent = KIND_LABEL[k] || k;
-    return o;
-  }));
-  sel.value = activeKind;
 }
-$("chSelect").onchange = (e) => setKind(e.target.value);
 
 function setKind(k) {
   activeKind = k;

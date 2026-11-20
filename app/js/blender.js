@@ -20,16 +20,18 @@ export function createBlender(app) {
   const B = { enabled: false, connected: null, timer: null, inFlight: false, pending: false, lastHash: 0, msg: "" };
 
   const dot = h("span", { class: "conn", title: "" });
-  const msg = h("div", { class: "bmsg" });
+  // channel shown on the canvas (base color, normal map, impasto height, relief preview...)
+  const sel = h("select", { class: "chsel", hidden: true, title: "Channel shown on the canvas", "aria-label": "Channel",
+    onchange: (e) => app.setKind(e.target.value) });
   const section = h("details", { class: "sec", id: "sec-blender", open: true },
     h("summary", {}, "Blender", dot),
-    h("div", { class: "secbody" }, msg));
+    h("div", { class: "secbody" }, sel));
   section.hidden = true;
   $("blenderSlot").append(section);
 
   function say(text, ms) {
     if (text === B.msg) return;      // the relay repeats its status on every poll
-    B.msg = text; msg.textContent = text; app.toast(text, ms);
+    B.msg = text; app.toast(text, ms);
   }
   const SENT_MS = 3000;              // "sent" confirmations are brief
 
@@ -44,6 +46,11 @@ export function createBlender(app) {
   function refresh() {
         const ready = !!app.result();
     $("sendBtn").disabled = !ready;
+    const res = app.result(), src = app.source();
+    const kinds = res && src && src.multi ? res.kinds : [];
+    sel.hidden = kinds.length < 2;
+    sel.replaceChildren(...kinds.map((k) => h("option", { value: k }, KIND_LABEL[k] || k)));
+    sel.value = app.activeKind();
   }
 
   async function send(animated) {
@@ -131,14 +138,14 @@ export function createBlender(app) {
           say(`received ${kindList(d.kinds)} — painting…`);
           await app.loadQueue(d.kinds, blobs);
           fetch(url("/ack"), { method: "POST", body: "{}" }).catch(() => {});
-          say(`received ${kindList(d.kinds)} — adjust sliders freely; ALL channels repaint on Send`);
+          say(`received ${kindList(d.kinds)} — adjust sliders freely; ALL channels repaint on Send`, 4000);
         } finally {
           B.pending = false;
         }
       }
     } catch (e) {
       setConnected(false);
-      if (B.enabled) { B.msg = "bridge offline — restart Blender (runs the relay on 127.0.0.1:8778)"; msg.textContent = B.msg; }
+      if (B.enabled) say("bridge offline — restart Blender (runs the relay on 127.0.0.1:8778)");
     } finally {
       B.inFlight = false;
     }
