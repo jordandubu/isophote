@@ -108,7 +108,8 @@ class PN_OT_apply_animated_from_isophote(bpy.types.Operator):
         img.colorspace_settings.name = 'Non-Color'
         # sequence expects frame files named with the END number; the loaded
         # first frame sets the pattern
-        _apply_animated_map(mat, img, start_frame=1, duration=len(paths), kind='normal')
+        _apply_animated_map(mat, img, start_frame=1, duration=len(paths), kind='normal',
+                            normal_space=_result_normal_space())
         s.status = f"Applied animated ({len(paths)} frames)"
         self.report({'INFO'}, f"Animated painterly normal: {len(paths)} frames from frame 1")
         return {'FINISHED'}
@@ -159,7 +160,7 @@ class PN_OT_apply_animated_from_isophote(bpy.types.Operator):
                 img.colorspace_settings.name = colorspace
                 _apply_animated_map(mat, img, start_frame=1,
                                     duration=len(anim), kind=kind,
-                                    height_scale=hs)
+                                    height_scale=hs, normal_space=_result_normal_space())
                 applied.append(KIND_LABELS[kind])
         except Exception as e:
             self.report({'ERROR'}, f"Frame write failed: {e}")
@@ -217,9 +218,10 @@ def _clear_anim_dirs(tmp, base, kinds):
                 pass
 
 
-def _apply_animated_map(mat, img, start_frame=1, duration=10, kind='normal', height_scale=None):
+def _apply_animated_map(mat, img, start_frame=1, duration=10, kind='normal', height_scale=None,
+                        normal_space='OBJECT'):
     """Wire `img` (a SEQUENCE image) into the material for `kind`.
-    normal: tex -> object-space NormalMap -> Normal. Others: tex -> socket.
+    normal: tex -> NormalMap (`normal_space`) -> Normal. Others: tex -> socket.
     orm: tex -> Separate Color -> Roughness/Metallic (packed MR sequence)."""
     if not mat or not mat.use_nodes:
         return
@@ -230,13 +232,10 @@ def _apply_animated_map(mat, img, start_frame=1, duration=10, kind='normal', hei
 
     if kind == 'normal':
         tex = next((n for n in nt.nodes if n.type == 'TEX_IMAGE' and n.name == "PainterlyNormalsTex"), None)
-        nmap = next((n for n in nt.nodes if n.type == 'NORMAL_MAP' and n.space == 'OBJECT'), None)
         if tex is None:
             tex = nt.nodes.new('ShaderNodeTexImage')
             tex.name = "PainterlyNormalsTex"
-        if nmap is None:
-            nmap = nt.nodes.new('ShaderNodeNormalMap')
-            nmap.space = 'OBJECT'
+        nmap = _painterly_normal_map(nt, tex, normal_space)
         tex.image = img
         tex.image_user.frame_duration = duration
         tex.image_user.frame_start = start_frame
@@ -247,6 +246,8 @@ def _apply_animated_map(mat, img, start_frame=1, duration=10, kind='normal', hei
         nmap.location = (bsdf.location.x - 200, bsdf.location.y + 200)
         nt.links.new(tex.outputs['Color'], nmap.inputs['Color'])
         nt.links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])
+        if normal_space == 'TANGENT':
+            _drop_impasto_bump(nt)
         return
 
     if kind == 'height':
@@ -366,7 +367,7 @@ class PN_OT_send_to_isophote(bpy.types.Operator):
                         baked['orm'] = base64.b64encode(f.read()).decode()
                     continue
                 path = os.path.join(bpy.app.tempdir, base + KIND_SUFFIX.get(kind, f'_{kind}.png'))
-                err = _bake_map(obj, size, kind, path)
+                err = _bake_map(obj, size, kind, path, normal_space=s.normal_space)
                 if err:
                     self.report({'ERROR'}, f"Bake failed ({kind}): {err}")
                     s.status = f"Bake failed ({kind})"
@@ -407,6 +408,7 @@ class PN_OT_send_to_isophote(bpy.types.Operator):
                 "pngs": [baked[k] for k in wired],
             }
         _bridge_state["pending_ack"] = False
+        _bridge_state["pending_normal_space"] = s.normal_space.lower()
         import urllib.request
         try:
             urllib.request.urlopen(
@@ -462,7 +464,7 @@ class PN_OT_apply_from_isophote(bpy.types.Operator):
                 with open(final, "wb") as f:
                     f.write(base64.b64decode(png_b64))
                 if kind == 'normal':
-                    final = self._normal_chain(context, s, base, final)
+                    final = self._normal_chain(context, s, base, final, _result_normal_space())
                     if final is None:
                         return {'CANCELLED'}
                 kind_final[kind] = final
@@ -548,13 +550,13 @@ class PN_OT_apply_from_isophote(bpy.types.Operator):
             final = res["path"]
 
         obj = context.active_object
-        _apply_normal(obj.active_material, final)
+        _apply_normal(obj.active_material, final, _result_normal_space())
         s.status = "Applied"
         self.report({'INFO'}, f"Painterly normal applied: {final}")
         return {'FINISHED'}
 
     @staticmethod
-    def _normal_chain(context, s, base, result_path):
+    def _normal_chain(context, s, base, result_path, space):
         """Renormalize + wire the normal chain; returns final path or None."""
         final = result_path
         if s.renormalize:
@@ -564,7 +566,7 @@ class PN_OT_apply_from_isophote(bpy.types.Operator):
                 return None
             final = res["path"]
         obj = context.active_object
-        _apply_normal(obj.active_material, final)
+        _apply_normal(obj.active_material, final, space)
         return final
 
 
@@ -589,10 +591,10 @@ _BAKE_TYPES = {
 }
 
 
-def _bake_map(obj, size: int, kind: str, out_path: str):
+def _bake_map(obj, size: int, kind: str, out_path: str, normal_space: str = 'OBJECT'):
     """Bake one map via Blender's bake system.
-    'normal': object-space bake with swizzle +X +Y +Z (geometric; a stripped
-              temp material is fine).
+    'normal': geometric bake in `normal_space` ('OBJECT' or 'TANGENT') with
+              swizzle +X +Y +Z (a stripped temp material is fine).
     'color'/'emission'/'rough': bake the REAL material with an added bake
               image node (Cycles evaluates the full graph).
     'metal': no METALLIC bake type exists — copy the material graph, reroute
@@ -676,7 +678,7 @@ def _bake_map(obj, size: int, kind: str, out_path: str):
         b.margin = 8
         b.use_selected_to_active = False
         if is_normal:
-            b.normal_space = 'OBJECT'
+            b.normal_space = normal_space
             b.normal_r = 'POS_X'
             b.normal_g = 'POS_Y'
             b.normal_b = 'POS_Z'
@@ -822,7 +824,37 @@ def _renormalize_file(path, result, base_name="painterly"):
     result["path"] = final_path
 
 
-def _apply_normal(mat, path):
+def _result_normal_space():
+    """Blender enum value for the space the page painted the normal map in
+    (it echoes what the add-on baked; old pages send nothing = object)."""
+    return 'TANGENT' if _bridge_state.get("result_normal_space") == "tangent" else 'OBJECT'
+
+
+def _painterly_normal_map(nt, tex, space):
+    """The Normal Map node fed by `tex` (created if missing), set to `space`.
+    Tangent maps read the active UV map, which is the one they were baked on."""
+    nmap = next((l.to_node for l in tex.outputs['Color'].links
+                 if l.to_node.type == 'NORMAL_MAP'), None)
+    if nmap is None:
+        nmap = nt.nodes.new('ShaderNodeNormalMap')
+        nmap.name = "PainterlyNormalMap"
+    nmap.space = space
+    obj = bpy.context.active_object
+    if space == 'TANGENT' and obj is not None and obj.type == 'MESH' and obj.data.uv_layers.active:
+        nmap.uv_map = obj.data.uv_layers.active.name
+    return nmap
+
+
+def _drop_impasto_bump(nt):
+    """Tangent-space normals already carry the impasto relief: remove a Bump
+    left over from an object-space apply (it would apply the relief twice)."""
+    for name in ("PainterlyImpastoBump", "PainterlyHeightTex"):
+        node = nt.nodes.get(name)
+        if node is not None:
+            nt.nodes.remove(node)
+
+
+def _apply_normal(mat, path, space='OBJECT'):
     """Wire (or update) the Painterly normal chain. Always replaces the image
     in the existing PainterlyNormalsTex node once baking is done."""
     if not mat or not mat.use_nodes:
@@ -843,13 +875,10 @@ def _apply_normal(mat, path):
 
     # existing painterly nodes or create fresh
     tex = next((n for n in nt.nodes if n.type == 'TEX_IMAGE' and n.name == "PainterlyNormalsTex"), None)
-    nmap = next((n for n in nt.nodes if n.type == 'NORMAL_MAP' and n.space == 'OBJECT'), None)
     if tex is None:
         tex = nt.nodes.new('ShaderNodeTexImage')
         tex.name = "PainterlyNormalsTex"
-    if nmap is None:
-        nmap = nt.nodes.new('ShaderNodeNormalMap')
-        nmap.space = 'OBJECT'
+    nmap = _painterly_normal_map(nt, tex, space)
 
     # ALWAYS replace the image
     tex.image = img
@@ -859,6 +888,8 @@ def _apply_normal(mat, path):
     # ensure wiring exists (idempotent)
     nt.links.new(tex.outputs['Color'], nmap.inputs['Color'])
     nt.links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])
+    if space == 'TANGENT':
+        _drop_impasto_bump(nt)
 
 
 # world ridge height = (UV thickness of a white height pixel, sent by the page
@@ -1195,6 +1226,19 @@ class PN_scene_settings(bpy.types.PropertyGroup):
         name="Renormalize Painted Output", default=True,
         description="Re-project AI pixels to valid normal vectors",
     )
+    normal_space: EnumProperty(
+        name="Normal Space",
+        description="Space of the baked/painted normal map. Object: world-fixed "
+                    "maps for static meshes, relief via the impasto height "
+                    "(Bump node). Tangent: works on deforming/instanced "
+                    "meshes, and Isophote paints the impasto relief into the "
+                    "normal map itself (no height map needed)",
+        items=[
+            ('OBJECT', "Object", "Object-space normal map (impasto relief via the height map)"),
+            ('TANGENT', "Tangent", "Tangent-space normal map (impasto relief painted into it)"),
+        ],
+        default='OBJECT',
+    )
     channels: CollectionProperty(type=PN_channel)
     channels_index: IntProperty(default=0)
     apply_animated: BoolProperty(
@@ -1272,6 +1316,7 @@ class PN_PT_to_isophote(bpy.types.Panel):
         layout.prop(s, "strokes_coherent")
         layout.prop(s, "tex_name", text="Name")
         layout.prop(s, "tex_size")
+        layout.prop(s, "normal_space")
 
 
 class PN_PT_from_isophote(bpy.types.Panel):
@@ -1334,7 +1379,9 @@ _bridge_state = {"pending_png": None, "pending_ack": False,
                  "result_pngs": None,      # multi single-frame result: [b64]
                  "result_anim": None,      # legacy anim: [b64]
                  "result_anim_kinds": None,  # multi anim: kinds for anim
-                 "result_height_scale": None}  # UV thickness of a white height px (multi results)
+                 "result_height_scale": None,  # UV thickness of a white height px (multi results)
+                 "pending_normal_space": "object",  # space of the queued normal map
+                 "result_normal_space": "object"}   # space the page painted the normal in
 _bridge_server = None
 
 
@@ -1374,6 +1421,7 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
             return self._reply({"ok": True})
 
         if self.path == "/queue":            # Blender -> app
+            _bridge_state["pending_normal_space"] = "object"
             _bridge_state["pending_png"] = req.get("png")
             _bridge_state["pending_kind"] = req.get("kind", "normal")
             _bridge_state["pending_multi"] = None
@@ -1390,12 +1438,14 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
                 return self._reply({"kind": "multi",
                                     "kinds": multi["kinds"],
                                     "pngs": multi["pngs"],
+                                    "normal_space": _bridge_state["pending_normal_space"],
                                     "ack": True})
             png = _bridge_state["pending_png"]
             if png is None:
                 return self._reply({"kind": "none"})
             return self._reply({"kind": "image", "bgr_png": png,
                                 "map_kind": _bridge_state["pending_kind"] or "normal",
+                                "normal_space": _bridge_state["pending_normal_space"],
                                 "ack": True})
 
         if self.path == "/ack":              # page says: painted it, clear
@@ -1406,6 +1456,7 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
             return self._reply({"ok": True})
 
         if self.path == "/send_to_blender":  # app result -> Blender
+            _bridge_state["result_normal_space"] = req.get("normal_space") or "object"
             anim = req.get("anim")
             if isinstance(anim, list) and anim and isinstance(anim[0], list):
                 # multi animated: outer = frames, inner = one b64 per kind

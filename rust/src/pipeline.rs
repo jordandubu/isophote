@@ -38,6 +38,12 @@ pub struct Params {
     /// it. 0/omitted or >= painted long edge = no resize.
     #[serde(default)]
     pub out_size: i32,
+    /// Frames of kind "normal" are tangent-space (Blender/OpenGL: +X = u, +Y =
+    /// v, +Z out): with impasto > 0 the stroke-height slope is blended into
+    /// them. False = object-space maps, left untouched (relief goes through
+    /// the height frame / Bump node instead).
+    #[serde(default)]
+    pub normal_tangent: bool,
 }
 
 impl Params {
@@ -1362,17 +1368,29 @@ pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool, look:
     gaussian_blur_plane(&height, w, h, st.blur as f64 * look)
 }
 
+/// Height gradient (x, y; image coords, y down) as 8x-scaled sobel3 planes.
+type Grad = (Vec<f32>, Vec<f32>);
+
+fn height_gradient(height: &[f32], w: usize, h: usize) -> Grad {
+    (sobel3(height, w, h, 1, 0), sobel3(height, w, h, 0, 1))
+}
+
+/// Surface slope per sobel3 unit (sobel3 = 8x derivative); shared by the colour
+/// shading and the tangent-space normal relief so both show the same ridges.
+fn impasto_slope(impasto: f64) -> f32 {
+    0.6 * impasto as f32 / 8.0
+}
+
 /// Per-pixel impasto shading from the height field (light from upper-left +
 /// wet specular + darkening in the cavities between strokes): `[m, s, dark]`
 /// so a colour byte `v` becomes `(v * m + s) * dark`. Flat height gives
 /// m = 1, s = 0, dark = 1 (pixels unchanged). Computed once and applied to
 /// every colour frame and the preview.
-fn impasto_shade_field(w: usize, h: usize, height: &[f32], impasto: f64, ref_half: f32, look: f64) -> Vec<[f32; 3]> {
+fn impasto_shade_field(w: usize, h: usize, height: &[f32], grad: &Grad, impasto: f64, ref_half: f32, look: f64) -> Vec<[f32; 3]> {
     let lk = look as f32;
-    let gx = sobel3(height, w, h, 1, 0);
-    let gy = sobel3(height, w, h, 0, 1);
+    let (gx, gy) = grad;
     let low = gaussian_blur_plane(height, w, h, (0.28 * ref_half).clamp(1.0 * lk, 6.0 * lk) as f64);
-    let g = 0.6 * impasto as f32 / 8.0; // sobel3 = 8x derivative
+    let g = impasto_slope(impasto);
     let norm3 = |v: [f32; 3]| {
         let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
         [v[0] / l, v[1] / l, v[2] / l]
@@ -1401,6 +1419,32 @@ fn apply_shade(frame: &mut [u8], field: &[[f32; 3]]) {
             let v = (px[c] as f32 * f[0] + f[1]) * f[2];
             px[c] = v.round().clamp(0.0, 255.0) as u8;
         }
+    }
+}
+
+/// Blend the impasto slope into the tangent-space normals of a BGRA frame in
+/// place (whiteout blend). Image y points down but tangent +Y is v (up), so
+/// the relief normal is (-g*gx, +g*gy, 1). Pixels are renormalised first, so a
+/// canvas-modulated or flat (0.5, 0.5, 1) normal behaves the same.
+fn tilt_normal_frame(frame: &mut [u8], grad: &Grad, impasto: f64) {
+    let g = impasto_slope(impasto);
+    let dec = |b: u8| b as f32 / 127.5 - 1.0;
+    let enc = |v: f32| ((v * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+    for ((px, &gx), &gy) in frame.chunks_exact_mut(4).zip(&grad.0).zip(&grad.1) {
+        let (mut x, mut y, mut z) = (dec(px[2]), dec(px[1]), dec(px[0]));
+        let l = (x * x + y * y + z * z).sqrt();
+        if l < 1e-3 {
+            (x, y, z) = (0.0, 0.0, 1.0);
+        } else {
+            (x, y, z) = (x / l, y / l, z / l);
+        }
+        let (rx, ry) = (-g * gx, g * gy);
+        let rl = (rx * rx + ry * ry + 1.0).sqrt();
+        let (ox, oy, oz) = (x + rx / rl, y + ry / rl, z / rl);
+        let ol = (ox * ox + oy * oy + oz * oz).sqrt();
+        px[2] = enc(ox / ol);
+        px[1] = enc(oy / ol);
+        px[0] = enc(oz / ol);
     }
 }
 
@@ -1536,7 +1580,8 @@ pub fn finish_single<'a>(stage: &'a PaintStage, hgt: Option<&[f32]>, p: &Params)
     match hgt {
         None => Cow::Borrowed(&stage.frames[0][..]),
         Some(hg) => {
-            let field = impasto_shade_field(stage.w, stage.h, hg, p.impasto, impasto_ref_half(p.brush_w), p.look());
+            let grad = height_gradient(hg, stage.w, stage.h);
+            let field = impasto_shade_field(stage.w, stage.h, hg, &grad, p.impasto, impasto_ref_half(p.brush_w), p.look());
             let mut o = stage.frames[0].clone();
             apply_shade(&mut o, &field);
             Cow::Owned(o)
@@ -1544,8 +1589,9 @@ pub fn finish_single<'a>(stage: &'a PaintStage, hgt: Option<&[f32]>, p: &Params)
     }
 }
 
-/// All stage frames; with `hgt`, frames of kind "color" are impasto-shaded and
-/// a height frame then a display-only relief preview are appended.
+/// All stage frames; with `hgt`, frames of kind "color" are impasto-shaded, frames
+/// of kind "normal" get the relief blended in when `p.normal_tangent`, and a height
+/// frame then a display-only relief preview are appended.
 pub fn finish_multi<'a>(
     stage: &'a PaintStage,
     hgt: Option<&[f32]>,
@@ -1554,12 +1600,19 @@ pub fn finish_multi<'a>(
 ) -> Vec<Cow<'a, [u8]>> {
     let (w, h) = (stage.w, stage.h);
     let mut out: Vec<Cow<'a, [u8]>> = Vec::with_capacity(stage.frames.len() + 2);
-    let field = hgt.map(|hg| impasto_shade_field(w, h, hg, p.impasto, impasto_ref_half(p.brush_w), p.look()));
+    let grad = hgt.map(|hg| height_gradient(hg, w, h));
+    let field = hgt.zip(grad.as_ref()).map(|(hg, gr)| impasto_shade_field(w, h, hg, gr, p.impasto, impasto_ref_half(p.brush_w), p.look()));
     for (i, f) in stage.frames.iter().enumerate() {
-        match &field {
-            Some(field) if kind_at(kinds, i) == Some("color") => {
+        let kind = kind_at(kinds, i);
+        match (&field, &grad) {
+            (Some(field), _) if kind == Some("color") => {
                 let mut o = f.clone();
                 apply_shade(&mut o, field);
+                out.push(Cow::Owned(o));
+            }
+            (_, Some(grad)) if kind == Some("normal") && p.normal_tangent => {
+                let mut o = f.clone();
+                tilt_normal_frame(&mut o, grad, p.impasto);
                 out.push(Cow::Owned(o));
             }
             _ => out.push(Cow::Borrowed(&f[..])),

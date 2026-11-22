@@ -221,6 +221,7 @@ pub extern "C" fn wasm_paint(
             boil_frame: 0,
             look_scale: 0.0,
             out_size: 0,
+            normal_tangent: false,
         }
     } else {
         match serde_json::from_str(&json) {
@@ -330,6 +331,7 @@ pub extern "C" fn wasm_paint_multi(
             boil_frame: 0,
             look_scale: 0.0,
             out_size: 0,
+            normal_tangent: false,
         }
     } else {
         match serde_json::from_str(&json) {

@@ -78,7 +78,7 @@ fn multi_replay_same_strokes() {
     let p = Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
                      base_radius: 3, flow_smooth: 4, seed: 7,
                      max_size: None, impasto: 0.0, impasto_knife: false,
-                     boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0 };
+                     boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0, normal_tangent: false };
     let outs = paint_bgra_multi(&ref_img, &[&chan], w, h, &p, None).unwrap();
     assert_eq!(outs.len(), 2);
     // determinism: same inputs -> identical bytes
@@ -163,7 +163,7 @@ fn impasto_multi_frames() {
     let params = |impasto: f64| Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
                                          base_radius: 3, flow_smooth: 4, seed: 7,
                                          max_size: None, impasto, impasto_knife: false,
-                                         boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0 };
+                                         boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0, normal_tangent: false };
     let kinds = |a: &str, b: &str| vec![Some(a.to_string()), Some(b.to_string())];
     let cn = kinds("color", "normal");
     let off = paint_bgra_multi(&ref_img, &[&chan], w, h, &params(0.0), Some(&cn)).unwrap();
@@ -201,7 +201,7 @@ fn impasto_reference_only() {
     let params = |impasto: f64| Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
                                          base_radius: 3, flow_smooth: 4, seed: 7,
                                          max_size: None, impasto, impasto_knife: false,
-                                         boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0 };
+                                         boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0, normal_tangent: false };
     let kinds = vec![Some("normal".to_string())];
     let off = paint_bgra_multi(&ref_img, &[], w, h, &params(0.0), Some(&kinds)).unwrap();
     assert_eq!(off.len(), 1);
@@ -211,6 +211,49 @@ fn impasto_reference_only() {
     assert!(on[2].chunks(4).all(|p| p[3] == 255));
     let (lo, hi) = on[2].chunks(4).fold((255u8, 0u8), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
     assert!(hi > lo, "preview frame is flat");
+}
+
+#[test]
+fn impasto_tangent_normal_relief() {
+    let (w, h, ref_img, _) = synth_pair();
+    // flat tangent-space normal (0.5, 0.5, 1) as the normal channel (BGRA)
+    let flat: Vec<u8> = (0..w * h).flat_map(|_| [255u8, 128, 128, 255]).collect();
+    let params = |impasto: f64, tangent: bool| Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
+                                                        base_radius: 3, flow_smooth: 4, seed: 7,
+                                                        max_size: None, impasto, impasto_knife: false,
+                                                        boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0,
+                                                        normal_tangent: tangent };
+    let kinds = vec![Some("color".to_string()), Some("normal".to_string())];
+    let run = |impasto: f64, tangent: bool| {
+        paint_bgra_multi(&ref_img, &[&flat], w, h, &params(impasto, tangent), Some(&kinds)).unwrap()
+    };
+    let off = run(0.0, true);
+    assert_eq!(off.len(), 2, "impasto 0 must not add frames, tangent or not");
+    assert_eq!(off, run(0.0, false), "impasto 0 must ignore normal_tangent");
+    let obj = run(1.0, false);
+    let tan = run(1.0, true);
+    assert_eq!(obj[1], off[1], "object-space normal must stay untouched");
+    assert_eq!(tan[0], obj[0], "colour frame must not depend on normal_tangent");
+    assert_eq!(tan[2], obj[2], "height frame must not depend on normal_tangent");
+    assert_ne!(tan[1], off[1], "tangent normal carries no relief");
+    for px in tan[1].chunks(4) {
+        let d = |b: u8| b as f32 / 127.5 - 1.0;
+        let (x, y, z) = (d(px[2]), d(px[1]), d(px[0]));
+        assert!(((x * x + y * y + z * z).sqrt() - 1.0).abs() < 0.03, "not unit length");
+        assert!(z > 0.0, "normal points into the surface");
+    }
+    // slope direction: n.x = -g*dh/dx, n.y = +g*dh/dy (tangent +Y is image up)
+    let hf: Vec<f32> = tan[2].chunks(4).map(|p| p[0] as f32).collect();
+    let (gx, gy) = (sobel3(&hf, w, h, 1, 0), sobel3(&hf, w, h, 0, 1));
+    let (mut cx, mut cy) = (0.0f64, 0.0f64);
+    for i in 0..w * h {
+        let dr = tan[1][i * 4 + 2] as f32 - off[1][i * 4 + 2] as f32;
+        let dg = tan[1][i * 4 + 1] as f32 - off[1][i * 4 + 1] as f32;
+        cx += (dr * gx[i]) as f64;
+        cy += (dg * gy[i]) as f64;
+    }
+    assert!(cx < 0.0, "red must fall with +x height slope (got {cx})");
+    assert!(cy > 0.0, "green must rise with +y(image) height slope (got {cy})");
 }
 
 #[test]
@@ -228,7 +271,7 @@ fn impasto_styles_and_range() {
     let params = |knife: bool| Params { brush_len: 30, brush_w: 8, layers: 2, relief: 0.1,
                                         base_radius: 3, flow_smooth: 4, seed: 7,
                                         max_size: None, impasto: 2.0, impasto_knife: knife,
-                                        boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0 };
+                                        boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0, normal_tangent: false };
     let kinds = vec![Some("normal".to_string())];
     let bristle = paint_bgra_multi(&ref_img, &[], w, h, &params(false), Some(&kinds)).unwrap();
     let knife = paint_bgra_multi(&ref_img, &[], w, h, &params(true), Some(&kinds)).unwrap();
@@ -279,7 +322,7 @@ fn boil_keeps_most_strokes() {
     let p = |boil: f64, boil_frame: u32| Params { brush_len: 20, brush_w: 3, layers: 2, relief: 0.1,
                                                   base_radius: 3, flow_smooth: 4, seed: 7,
                                                   max_size: None, impasto: 0.0, impasto_knife: false,
-                                                  boil, boil_frame, look_scale: 0.0, out_size: 0 };
+                                                  boil, boil_frame, look_scale: 0.0, out_size: 0, normal_tangent: false };
     let plain = paint_bgra(&bgra, w, h, &p(0.0, 0)).0;
     assert_eq!(paint_bgra(&bgra, w, h, &p(0.3, 0)).0, plain, "frame 0 must ignore boil");
     let f1 = paint_bgra(&bgra, w, h, &p(0.3, 1)).0;
@@ -341,6 +384,6 @@ fn look_scale_keeps_stroke_pattern() {
     let p = |look_scale: f64| Params { brush_len: 20, brush_w: 3, layers: 2, relief: 0.2,
                                        base_radius: 3, flow_smooth: 4, seed: 7,
                                        max_size: None, impasto: 1.0, impasto_knife: false,
-                                       boil: 0.0, boil_frame: 0, look_scale, out_size: 0 };
+                                       boil: 0.0, boil_frame: 0, look_scale, out_size: 0, normal_tangent: false };
     assert_eq!(paint_bgra(&bgra, bw, bh, &p(0.0)).0, paint_bgra(&bgra, bw, bh, &p(1.0)).0);
 }

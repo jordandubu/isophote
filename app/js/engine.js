@@ -68,7 +68,8 @@ let nextSourceId = 1;
 
 // blobs: {kind: Blob}; kinds: order (kinds[0] is the reference that drives
 // flow + strokes). multi = a Blender channel queue; otherwise one photo.
-export async function makeSource(blobs, kinds, multi) {
+// normalSpace: "object" | "tangent", how the Blender normal map is encoded.
+export async function makeSource(blobs, kinds, multi, normalSpace = "object") {
   const bitmaps = {};
   try {
     for (const k of kinds) bitmaps[k] = await createImageBitmap(blobs[k]);
@@ -82,7 +83,7 @@ export async function makeSource(blobs, kinds, multi) {
     if (Math.max(bitmaps[k].width, bitmaps[k].height) > Math.max(bitmaps[best].width, bitmaps[best].height)) best = k;
   }
   return {
-    id: nextSourceId++, multi, kinds, bitmaps, shown: false,
+    id: nextSourceId++, multi, kinds, bitmaps, normalSpace, shown: false,
     ref: { w: bitmaps[best].width, h: bitmaps[best].height },
     origURL: URL.createObjectURL(blobs[kinds[0]]),
     close() {
@@ -235,7 +236,7 @@ export class PaintClient {
 export async function paint(client, source, v, { draft = false, frame = null } = {}) {
   const g = paintGeom(v, source.ref, draft);
   const params = { ...coreParams(v, g), ...(frame == null ? {} : frameParams(v, frame)) };
-  if (source.multi) params.kinds = source.kinds;
+  if (source.multi) { params.kinds = source.kinds; params.normal_tangent = source.normalSpace === "tangent"; }
   const inp = inputsFor(source, g, draft);
   const r = await client.run({ op: source.multi ? "multi" : "paint", key: inp.key, build: inp.build, params },
                              { final: !draft });

@@ -32,7 +32,7 @@ function toast(text, ms = 5000) {
 $("toast").onclick = () => { $("toast").hidden = true; };
 
 /* ---------- persisted settings (Blender bridge on/off) ---------- */
-const settings = { addonBlender: false, sendAnimated: false, sendHeight: false };
+const settings = { addonBlender: false, sendAnimated: false, sendHeight: true };
 try { Object.assign(settings, JSON.parse(localStorage.getItem("isophote_settings") || "{}")); } catch { /* corrupt: defaults */ }
 const saveSettings = () => { try { localStorage.setItem("isophote_settings", JSON.stringify(settings)); } catch { /* private mode */ } };
 // the add-on opens the site with ?bridge=1 -> force the bridge on
@@ -154,8 +154,8 @@ async function loadFile(file) {
   } catch (e) { toast(e.message || String(e)); }
 }
 
-async function loadQueue(kinds, blobs) {
-  installSource(await makeSource(blobs, kinds, true));
+async function loadQueue(kinds, blobs, normalSpace) {
+  installSource(await makeSource(blobs, kinds, true, normalSpace));
   await ensureFinal();
 }
 

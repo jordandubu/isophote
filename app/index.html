@@ -50,7 +50,7 @@
     <div id="sendMenu" class="pop right" hidden>
       <button type="button" id="sendBtn">Send to Blender</button>
       <label class="check" title="Sends Frames painted with Boil (Animation section) as an animation"><input type="checkbox" id="sendAnimated"> Animated</label>
-      <label class="check" title="Also send the impasto height map (wired as a Bump node; needs the latest add-on). The normal map already carries the relief."><input type="checkbox" id="sendHeight"> Include impasto height</label>
+      <label class="check" title="Send the impasto height map (wired as a Bump node after the normal map; needs the latest add-on). Used with object-space normals only: tangent-space normals (add-on Normal Space) carry the relief in the normal map and skip this. Untick and an object-space relief is only painted into the base color."><input type="checkbox" id="sendHeight"> Include impasto height</label>
     </div>
   </div>
   <button class="btn icon" id="adjustBtn" title="Adjust" aria-label="Adjust settings">

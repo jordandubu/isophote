@@ -58,9 +58,10 @@ export function createBlender(app) {
     catch (e) { if (e !== CANCELLED) say("send failed: " + (e.message || e)); }
   }
 
-  // the relief preview is display-only; impasto height is opt-in (Send menu)
+  // the relief preview is display-only; impasto height is sent unless unticked (Send menu)
+  // and never for tangent-space normals (the relief is already in the normal map)
   const sendable = (res) => res.kinds.map((k, i) => [k, i])
-    .filter(([k]) => k !== "preview" && (k !== "height" || app.sendHeight()));
+    .filter(([k]) => k !== "preview" && (k !== "height" || (app.sendHeight() && app.source().normalSpace !== "tangent")));
 
   async function sendCurrent() {
     const res = await app.ensureFinal();
@@ -70,7 +71,7 @@ export function createBlender(app) {
       const pngs = [];
       for (const [, i] of items) pngs.push(await bitmapToB64(res.bitmaps[i]));
       const kinds = items.map(([k]) => k);
-      await post({ kinds, pngs, height_scale: res.heightScale });
+      await post({ kinds, pngs, height_scale: res.heightScale, normal_space: app.source().normalSpace });
       say(`sent ${kinds.length} maps (${kindList(kinds)}) — now click 'Apply from Isophote' inside Blender`, SENT_MS);
     } else {
       await post({ png: await bitmapToB64(res.bitmaps[0]), kind: "normal" });
@@ -96,7 +97,7 @@ export function createBlender(app) {
         const kinds = items.map(([k]) => k);
         const anim = [];
         for (const f of frames) anim.push(await Promise.all(items.map(([, i]) => bitmapToB64(f.bitmaps[i]))));
-        await post({ kinds, anim, height_scale: frames[0].heightScale });
+        await post({ kinds, anim, height_scale: frames[0].heightScale, normal_space: app.source().normalSpace });
         say(`sent ${frames.length} frames × ${kinds.length} maps (${kindList(kinds)}) — now click 'Apply from Isophote' (Animated checked) inside Blender`, SENT_MS);
       } else {
         const anim = [];
@@ -124,7 +125,7 @@ export function createBlender(app) {
       setConnected(true);
       // a single Blender image is a one-kind queue: same path, so impasto
       // relief (height map + preview) works for normal-only sends too
-      if (d.kind === "image" && d.bgr_png) d = { kind: "multi", kinds: [d.map_kind || "normal"], pngs: [d.bgr_png], status: d.status };
+      if (d.kind === "image" && d.bgr_png) d = { kind: "multi", kinds: [d.map_kind || "normal"], pngs: [d.bgr_png], normal_space: d.normal_space, status: d.status };
       if (d.status) say(d.status);
       if (d.kind === "multi" && Array.isArray(d.kinds) && Array.isArray(d.pngs) && d.pngs.length === d.kinds.length && !B.pending) {
         let hash = 0;
@@ -136,7 +137,7 @@ export function createBlender(app) {
           const blobs = {};
           d.kinds.forEach((k, i) => { blobs[k] = b64ToBlob(d.pngs[i], "image/png"); });
           say(`received ${kindList(d.kinds)} — painting…`);
-          await app.loadQueue(d.kinds, blobs);
+          await app.loadQueue(d.kinds, blobs, d.normal_space);
           fetch(url("/ack"), { method: "POST", body: "{}" }).catch(() => {});
           say(`received ${kindList(d.kinds)} — adjust sliders freely; ALL channels repaint on Send`, 4000);
         } finally {
