@@ -42,7 +42,7 @@ fn params(len: i32, bw: i32, layers: i32, relief: f64, radius: i32, smooth: i32,
     Params {
         brush_len: len, brush_w: bw, layers, relief, base_radius: radius, flow_smooth: smooth, seed,
         max_size: None, impasto: 0.0, impasto_knife: false, boil: 0.0, boil_frame: 0,
-        look_scale: 0.0, out_size: 0, normal_tangent: false,
+        look_scale: 0.0, out_size: 0, normal_tangent: false, uv_aware: false,
     }
 }
 

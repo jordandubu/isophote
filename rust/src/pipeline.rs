@@ -44,6 +44,10 @@ pub struct Params {
     /// the height frame / Bump node instead).
     #[serde(default)]
     pub normal_tangent: bool,
+    /// Paint on the mesh surface (strokes cross UV seams) when the caller
+    /// supplies a mesh; false or no mesh = classic flat-texture strokes.
+    #[serde(default)]
+    pub uv_aware: bool,
 }
 
 impl Params {
@@ -978,27 +982,66 @@ pub fn compose(
     cov: &Coverage,
     shade: Option<&[f32]>,
 ) -> Vec<u8> {
-    let mut cols = vec![[0f32; 3]; strokes.len()];
-    for (si, s) in strokes.iter().enumerate() {
+    let samples: Vec<StrokeSample> = strokes
+        .iter()
+        .map(|s| {
+            let mi = s.pts.len() / 2;
+            StrokeSample {
+                x: (s.pts[mi].0 as i64).clamp(0, w as i64 - 1),
+                y: (s.pts[mi].1 as i64).clamp(0, h as i64 - 1),
+                r: s.pr as i64,
+                lum: s.lum,
+            }
+        })
+        .collect();
+    compose_samples(bgr, base, w, h, &samples, cov, shade, None)
+}
+
+/// Where a stroke samples its colour: patch centre (px), patch radius, brightness jitter.
+pub(crate) struct StrokeSample {
+    pub x: i64,
+    pub y: i64,
+    pub r: i64,
+    pub lum: f32,
+}
+
+/// [`compose`] on precomputed colour samples. `valid` (the surface twin map)
+/// drops texels equal to `u32::MAX` from the patch mean.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compose_samples(
+    bgr: &[u8],
+    base: &[u8],
+    w: usize,
+    h: usize,
+    samples: &[StrokeSample],
+    cov: &Coverage,
+    shade: Option<&[f32]>,
+    valid: Option<&[u32]>,
+) -> Vec<u8> {
+    let mut cols = vec![[0f32; 3]; samples.len()];
+    for (si, s) in samples.iter().enumerate() {
         if !cov.used[si] {
             continue;
         }
-        let poly = &s.pts[..];
         // python: f32 patch mean (f64 accumulation in rust, cast to f32),
         // then *lum f32
-        let mi = poly.len() / 2;
-        let mx = ((poly[mi].0 as i64).clamp(0, w as i64 - 1)) as i64;
-        let my = ((poly[mi].1 as i64).clamp(0, h as i64 - 1)) as i64;
-        let r = s.pr as i64;
+        let (mx, my, r) = (s.x, s.y, s.r);
         let (mut sb, mut sg, mut sr, mut cnt) = (0f64, 0f64, 0f64, 0i64);
         for yy in (my - r).max(0)..=(my + r).min(h as i64 - 1) {
             for xx in (mx - r).max(0)..=(mx + r).min(w as i64 - 1) {
-                let p = (yy as usize * w + xx as usize) * 3;
+                let t = yy as usize * w + xx as usize;
+                if valid.is_some_and(|v| v[t] == u32::MAX) {
+                    continue;
+                }
+                let p = t * 3;
                 sb += bgr[p] as f64;
                 sg += bgr[p + 1] as f64;
                 sr += bgr[p + 2] as f64;
                 cnt += 1;
             }
+        }
+        if cnt == 0 {
+            continue;
         }
         cols[si] = [
             ((sb / cnt as f64) as f32 * s.lum).clamp(0.0, 255.0),
@@ -1050,12 +1093,12 @@ pub fn paint_from_strokes(
 // ---------------------------------------------------------------- impasto
 
 /// Footprint half-width of a stroke of thickness `th` (matches stamp_stroke for th >= 2).
-fn stroke_half(th: i32) -> f32 {
+pub(crate) fn stroke_half(th: i32) -> f32 {
     if th <= 1 { 1.5 } else { ((th + 1) / 2) as f32 + 0.5 }
 }
 
 /// Half-width of the widest stroke the width jitter (x1.6) can produce.
-fn impasto_ref_half(brush_w: i32) -> f32 {
+pub(crate) fn impasto_ref_half(brush_w: i32) -> f32 {
     stroke_half(((brush_w as f64 * 1.6) as i32).max(1))
 }
 
@@ -1078,7 +1121,7 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-fn hash01(seed: u32, i: u32) -> f32 {
+pub(crate) fn hash01(seed: u32, i: u32) -> f32 {
     let mut x = seed ^ i.wrapping_mul(0x9E37_79B9);
     x ^= x >> 16;
     x = x.wrapping_mul(0x7FEB_352D);
@@ -1088,16 +1131,16 @@ fn hash01(seed: u32, i: u32) -> f32 {
     x as f32 / 4_294_967_296.0
 }
 
-struct ImpastoStyle {
-    t_k: f32,
-    keep: f32,
-    rim: f32,
-    groove0: f32,
-    groove1: f32,
-    rag: f32,
-    blur: f32,
-    lip: f32,
-    deplete: f32,
+pub(crate) struct ImpastoStyle {
+    pub t_k: f32,
+    pub keep: f32,
+    pub rim: f32,
+    pub groove0: f32,
+    pub groove1: f32,
+    pub rag: f32,
+    pub blur: f32,
+    pub lip: f32,
+    pub deplete: f32,
 }
 
 const BRISTLE: ImpastoStyle = ImpastoStyle {
@@ -1106,6 +1149,11 @@ const BRISTLE: ImpastoStyle = ImpastoStyle {
 const KNIFE: ImpastoStyle = ImpastoStyle {
     t_k: 0.8, keep: 0.30, rim: 0.7, groove0: 0.04, groove1: 0.15, rag: 0.5, blur: 0.7, lip: 0.5, deplete: 0.25,
 };
+
+/// Bristle strokes or palette-knife slabs.
+pub(crate) fn impasto_style(knife: bool) -> &'static ImpastoStyle {
+    if knife { &KNIFE } else { &BRISTLE }
+}
 
 /// exp(-z^2) by table (1024 intervals over |z| < 4.25, linear interpolation,
 /// max error ~4e-6; beyond that the true value is < 1.5e-8 and returns 0).
@@ -1129,9 +1177,97 @@ fn gauss(tab: &[f32], z: f32) -> f32 {
 
 /// smoothstep on an already-normalized coordinate.
 #[inline]
-fn smooth01(t: f32) -> f32 {
+pub(crate) fn smooth01(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Thickness profile of one impasto stroke, in px: steep shoulders, raised
+/// side rims, hashed bristle grooves, a blob at the start and a ragged tail.
+/// Per-stroke randoms come from hashes of `seed` (no RNG consumed).
+pub(crate) struct StrokeProfile {
+    st: &'static ImpastoStyle,
+    tab: &'static [f32],
+    kn: usize,
+    gb: [f32; 24],
+    ge: [f32; 24],
+    half: f32,
+    total: f32,
+    /// thickness scale of this stroke
+    pub tmax: f32,
+    inv_half: f32,
+    inv_total: f32,
+    inv_edge: f32,
+    inv_tail: f32,
+    inv_head: f32,
+    inv_lip: f32,
+    inv_blob: f32,
+    inv_rim: f32,
+}
+
+impl StrokeProfile {
+    /// `half` = footprint half-width, `total` = polyline length, `lk` = look scale.
+    pub(crate) fn new(st: &'static ImpastoStyle, seed: u32, half: f32, total: f32, lk: f32) -> Self {
+        let kn = (((2.0 * half / (2.2 * lk)).round()) as usize).clamp(3, 24);
+        let mut gb = [0f32; 24];
+        let mut ge = [0f32; 24];
+        for i in 0..kn {
+            gb[i] = hash01(seed, i as u32);
+            ge[i] = hash01(seed, (kn + i) as u32);
+        }
+        let load = 0.6 + 0.8 * hash01(seed, (2 * kn) as u32);
+        StrokeProfile {
+            st,
+            tab: gauss_table(),
+            kn,
+            gb,
+            ge,
+            half,
+            total,
+            tmax: st.t_k * half * load,
+            inv_half: 1.0 / half,
+            inv_total: 1.0 / total,
+            inv_edge: 1.0 / (1.4 * lk),
+            inv_tail: 1.0 / (0.8 * half),
+            inv_head: 1.0 / (0.5 * half + 1.0),
+            inv_lip: 1.0 / (0.45 * half),
+            inv_blob: 1.0 / (0.9 * half),
+            inv_rim: 1.0 / 0.13,
+        }
+    }
+
+    /// Paint thickness at signed cross offset `sd` and arclength `a`
+    /// (0.0 or less = no paint).
+    #[inline]
+    pub(crate) fn eval(&self, sd: f32, a: f32) -> f32 {
+        let (st, tab, kn, half, total) = (self.st, self.tab, self.kn, self.half, self.total);
+        let u = (sd * self.inv_half).clamp(-1.0, 1.0);
+        let fx = (u * 0.5 + 0.5) * (kn - 1) as f32;
+        let i0 = (fx.floor() as usize).min(kn - 2);
+        let mut fr = fx - i0 as f32;
+        fr = fr * fr * (3.0 - 2.0 * fr);
+        let nb = self.gb[i0] * (1.0 - fr) + self.gb[i0 + 1] * fr;
+        let ne = self.ge[i0] * (1.0 - fr) + self.ge[i0 + 1] * fr;
+        let ac = a.clamp(0.0, total);
+        let leff = total - st.rag * half * ne;
+        let rem = leff - a;
+        if rem <= 0.0 {
+            return 0.0; // past the ragged tail: tail == 0
+        }
+        let head = smooth01((a + 1.0) * self.inv_head);
+        let tail = smooth01(rem * self.inv_tail);
+        if head <= 0.0 || tail <= 0.0 {
+            return 0.0;
+        }
+        let au = u.abs();
+        let cross = (1.0 - au.powi(6)) * (1.0 + st.rim * gauss(tab, (au - 0.78) * self.inv_rim));
+        let edge = smooth01((half - sd.abs()) * self.inv_edge);
+        let q = ac * self.inv_total;
+        let lip = st.lip * gauss(tab, rem * self.inv_lip);
+        let along = (1.0 - st.deplete * q) * (1.0 + 0.25 * gauss(tab, ac * self.inv_blob)) + lip;
+        let groove = 1.0 - (st.groove0 + (st.groove1 - st.groove0) * q) * nb;
+        self.tmax * cross * edge * groove * along * tail * head
+    }
 }
 
 /// Paint-thickness field in PIXEL units from the stroke list. Each stroke is
@@ -1147,7 +1283,6 @@ fn smooth01(t: f32) -> f32 {
 pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool, look: f64) -> Vec<f32> {
     let lk = look as f32;
     let st = if knife { &KNIFE } else { &BRISTLE };
-    let tab = gauss_table();
     let mut height = vec![0f32; w * h];
     // Scratch over the stroke bbox. Invariant: every `best2` entry is f32::MAX
     // between strokes (reset through `touched`).
@@ -1296,23 +1431,8 @@ pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool, look:
 
         // per-stroke randoms from hashes (no RNG consumed)
         let seed = s.lum.to_bits() ^ (idx as u32).wrapping_mul(0x9E37_79B9);
-        let kn = (((2.0 * half / (2.2 * lk)).round()) as usize).clamp(3, 24);
-        let mut gb = [0f32; 24];
-        let mut ge = [0f32; 24];
-        for i in 0..kn {
-            gb[i] = hash01(seed, i as u32);
-            ge[i] = hash01(seed, (kn + i) as u32);
-        }
-        let load = 0.6 + 0.8 * hash01(seed, (2 * kn) as u32);
-        let tmax = st.t_k * half * load;
-        let inv_half = 1.0 / half;
-        let inv_total = 1.0 / total;
-        let inv_edge = 1.0 / (1.4 * lk);
-        let inv_tail = 1.0 / (0.8 * half);
-        let inv_head = 1.0 / (0.5 * half + 1.0);
-        let inv_lip = 1.0 / (0.45 * half);
-        let inv_blob = 1.0 / (0.9 * half);
-        let inv_rim = 1.0 / 0.13;
+        let prof = StrokeProfile::new(st, seed, half, total, lk);
+        let tmax = prof.tmax;
 
         // profile on the touched pixels only
         let mut sum = 0f64;
@@ -1320,34 +1440,7 @@ pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool, look:
         for &jj in &touched {
             let j = jj as usize;
             best2[j] = f32::MAX;
-            let sd = sdv[j];
-            let a = av[j];
-            let u = (sd * inv_half).clamp(-1.0, 1.0);
-            let fx = (u * 0.5 + 0.5) * (kn - 1) as f32;
-            let i0 = (fx.floor() as usize).min(kn - 2);
-            let mut fr = fx - i0 as f32;
-            fr = fr * fr * (3.0 - 2.0 * fr);
-            let nb = gb[i0] * (1.0 - fr) + gb[i0 + 1] * fr;
-            let ne = ge[i0] * (1.0 - fr) + ge[i0 + 1] * fr;
-            let ac = a.clamp(0.0, total);
-            let leff = total - st.rag * half * ne;
-            let rem = leff - a;
-            if rem <= 0.0 {
-                continue; // past the ragged tail: tail == 0
-            }
-            let head = smooth01((a + 1.0) * inv_head);
-            let tail = smooth01(rem * inv_tail);
-            if head <= 0.0 || tail <= 0.0 {
-                continue;
-            }
-            let au = u.abs();
-            let cross = (1.0 - au.powi(6)) * (1.0 + st.rim * gauss(tab, (au - 0.78) * inv_rim));
-            let edge = smooth01((half - sd.abs()) * inv_edge);
-            let q = ac * inv_total;
-            let lip = st.lip * gauss(tab, rem * inv_lip);
-            let along = (1.0 - st.deplete * q) * (1.0 + 0.25 * gauss(tab, ac * inv_blob)) + lip;
-            let groove = 1.0 - (st.groove0 + (st.groove1 - st.groove0) * q) * nb;
-            let t = tmax * cross * edge * groove * along * tail * head;
+            let t = prof.eval(sdv[j], av[j]);
             if t > 0.0 {
                 let i = (by0 + j / bw) * w + bx0 + j % bw;
                 sum += height[i] as f64;
@@ -1369,15 +1462,15 @@ pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool, look:
 }
 
 /// Height gradient (x, y; image coords, y down) as 8x-scaled sobel3 planes.
-type Grad = (Vec<f32>, Vec<f32>);
+pub(crate) type Grad = (Vec<f32>, Vec<f32>);
 
-fn height_gradient(height: &[f32], w: usize, h: usize) -> Grad {
+pub(crate) fn height_gradient(height: &[f32], w: usize, h: usize) -> Grad {
     (sobel3(height, w, h, 1, 0), sobel3(height, w, h, 0, 1))
 }
 
 /// Surface slope per sobel3 unit (sobel3 = 8x derivative); shared by the colour
 /// shading and the tangent-space normal relief so both show the same ridges.
-fn impasto_slope(impasto: f64) -> f32 {
+pub(crate) fn impasto_slope(impasto: f64) -> f32 {
     0.6 * impasto as f32 / 8.0
 }
 
@@ -1513,7 +1606,15 @@ pub struct PaintStage {
     pub w: usize,
     pub h: usize,
     pub frames: Vec<Vec<u8>>,
+    /// flat-texture strokes (empty when `surf` is set)
     pub strokes: Vec<Stroke>,
+    /// surface painting: texel map + world-space strokes
+    pub surf: Option<SurfStage>,
+}
+
+pub struct SurfStage {
+    pub map: crate::surface::SurfMap,
+    pub strokes: Vec<crate::surface::SurfStroke>,
 }
 
 /// The four input checks of the multi-channel entry point.
@@ -1539,8 +1640,24 @@ pub fn validate_multi(ref_bgra: &[u8], chans: &[&[u8]], w: usize, h: usize) -> R
 /// Flow + strokes from `ref_bgra`, strokes rasterized and the canvas shade
 /// computed once, then the SAME strokes stamped on the reference and every
 /// channel (each with its own Kuwahara base and colour sampling).
-pub fn paint_stage(ref_bgra: &[u8], chans: &[&[u8]], w: usize, h: usize, p: &Params) -> PaintStage {
+/// With `p.uv_aware` and a `mesh`, the strokes are walked and rasterized on
+/// the mesh surface instead (see `surface.rs`).
+pub fn paint_stage(
+    ref_bgra: &[u8],
+    chans: &[&[u8]],
+    w: usize,
+    h: usize,
+    p: &Params,
+    mesh: Option<&crate::surface::Mesh>,
+) -> PaintStage {
     let look = p.look();
+    if let Some(mesh) = mesh.filter(|_| p.uv_aware) {
+        let margin = ((16.0 * look).ceil() as usize).max(8);
+        let map = crate::surface::build_map(mesh, w, h, margin);
+        if map.islands > 0 {
+            return paint_stage_surface(ref_bgra, chans, w, h, p, map);
+        }
+    }
     let ref_bgr = bgra_to_bgr(ref_bgra, w, h);
     let base = kuwahara(&ref_bgr, w, h, p.base_radius);
     let gray = gray_from_bgr(&ref_bgr, w, h);
@@ -1572,7 +1689,62 @@ pub fn paint_stage(ref_bgra: &[u8], chans: &[&[u8]], w: usize, h: usize, p: &Par
         let cbase = kuwahara(&cgr, w, h, p.base_radius);
         frames.push(compose(&cgr, &cbase, w, h, &strokes, &cov, shade.as_deref()));
     }
-    PaintStage { w, h, frames, strokes }
+    PaintStage { w, h, frames, strokes, surf: None }
+}
+
+/// [`paint_stage`] on the mesh surface: gutter texels mirror their twin
+/// before every 2D filter and after every composed frame.
+fn paint_stage_surface(
+    ref_bgra: &[u8],
+    chans: &[&[u8]],
+    w: usize,
+    h: usize,
+    p: &Params,
+    map: crate::surface::SurfMap,
+) -> PaintStage {
+    use crate::surface;
+    let look = p.look();
+    let mut ref_bgr = bgra_to_bgr(ref_bgra, w, h);
+    surface::fill_gutter(&map, &mut ref_bgr, 3);
+    let base = kuwahara(&ref_bgr, w, h, p.base_radius);
+    let gray = gray_from_bgr(&ref_bgr, w, h);
+    let flow = smooth_flow(flow_field(&gray, w, h, 2.5 * look), p.flow_smooth);
+    let n_strokes = (((w * h) as f64 / (140.0 * look * look)) as i32).max(1);
+    let mut strokes =
+        surface::generate_strokes(&ref_bgr, &flow, &map, n_strokes, p.brush_len, p.brush_w, p.layers, 0.6, p.seed, look);
+    if p.boil_frame > 0 && p.boil > 0.0 {
+        surface::boil_strokes(&mut strokes, &flow, &map, n_strokes, p.brush_len, p.brush_w, 0.6, p.seed, p.boil_frame, p.boil, look);
+    }
+    let cov = surface::rasterize(&map, &strokes, look);
+    let shade = (p.relief > 0.0).then(|| canvas_relief(w, h, 12, p.relief, look).0);
+    let samples: Vec<StrokeSample> = strokes
+        .iter()
+        .map(|s| {
+            let t = s.tex[s.tex.len() / 2] as usize;
+            StrokeSample { x: (t % w) as i64, y: (t / w) as i64, r: s.pr as i64, lum: s.lum }
+        })
+        .collect();
+    let mut frames = Vec::with_capacity(chans.len() + 1);
+    let mut f = compose_samples(&ref_bgr, &base, w, h, &samples, &cov, shade.as_deref(), Some(&map.twin));
+    surface::fill_gutter(&map, &mut f, 4);
+    frames.push(f);
+    for c in chans {
+        let mut cgr = bgra_to_bgr(c, w, h);
+        surface::fill_gutter(&map, &mut cgr, 3);
+        let cbase = kuwahara(&cgr, w, h, p.base_radius);
+        let mut f = compose_samples(&cgr, &cbase, w, h, &samples, &cov, shade.as_deref(), Some(&map.twin));
+        surface::fill_gutter(&map, &mut f, 4);
+        frames.push(f);
+    }
+    PaintStage { w, h, frames, strokes: Vec::new(), surf: Some(SurfStage { map, strokes }) }
+}
+
+/// Impasto height (px) of a stage, whichever way its strokes were laid.
+pub fn stage_height(stage: &PaintStage, knife: bool, look: f64) -> Vec<f32> {
+    match &stage.surf {
+        Some(s) => crate::surface::impasto_height(&s.map, &s.strokes, knife, look),
+        None => impasto_height(stage.w, stage.h, &stage.strokes, knife, look),
+    }
 }
 
 /// Frame 0 of the stage, impasto-shaded when `hgt` is given.
@@ -1599,36 +1771,53 @@ pub fn finish_multi<'a>(
     kinds: Option<&[Option<String>]>,
 ) -> Vec<Cow<'a, [u8]>> {
     let (w, h) = (stage.w, stage.h);
+    let map = stage.surf.as_ref().map(|s| &s.map);
     let mut out: Vec<Cow<'a, [u8]>> = Vec::with_capacity(stage.frames.len() + 2);
     let grad = hgt.map(|hg| height_gradient(hg, w, h));
-    let field = hgt.zip(grad.as_ref()).map(|(hg, gr)| impasto_shade_field(w, h, hg, gr, p.impasto, impasto_ref_half(p.brush_w), p.look()));
+    let ref_half = impasto_ref_half(p.brush_w);
+    let field = hgt.zip(grad.as_ref()).map(|(hg, gr)| match map {
+        Some(m) => crate::surface::shade_field(m, hg, gr, p.impasto, ref_half, p.look()),
+        None => impasto_shade_field(w, h, hg, gr, p.impasto, ref_half, p.look()),
+    });
+    // tangent-space tilt: texel-density-corrected slopes on a surface
+    let tilt = match (map, grad.as_ref()) {
+        (Some(m), Some(gr)) if p.normal_tangent => Some(crate::surface::scale_grad(m, gr)),
+        _ => None,
+    };
+    // gutter texels mirror their twin again after per-texel shading
+    let pad = |mut o: Vec<u8>| {
+        if let Some(m) = map {
+            crate::surface::fill_gutter(m, &mut o, 4);
+        }
+        o
+    };
     for (i, f) in stage.frames.iter().enumerate() {
         let kind = kind_at(kinds, i);
         match (&field, &grad) {
             (Some(field), _) if kind == Some("color") => {
                 let mut o = f.clone();
                 apply_shade(&mut o, field);
-                out.push(Cow::Owned(o));
+                out.push(Cow::Owned(pad(o)));
             }
             (_, Some(grad)) if kind == Some("normal") && p.normal_tangent => {
                 let mut o = f.clone();
-                tilt_normal_frame(&mut o, grad, p.impasto);
-                out.push(Cow::Owned(o));
+                tilt_normal_frame(&mut o, tilt.as_ref().unwrap_or(grad), p.impasto);
+                out.push(Cow::Owned(pad(o)));
             }
             _ => out.push(Cow::Borrowed(&f[..])),
         }
     }
     if let (Some(hg), Some(field)) = (hgt, &field) {
-        out.push(Cow::Owned(height_frame(hg, w, h, impasto_norm_px(p.brush_w))));
-        out.push(Cow::Owned(preview_frame(w, h, field)));
+        out.push(Cow::Owned(pad(height_frame(hg, w, h, impasto_norm_px(p.brush_w)))));
+        out.push(Cow::Owned(pad(preview_frame(w, h, field))));
     }
     out
 }
 
 pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, String) {
     // resize handled by JS (canvas); here we assume already-resized
-    let stage = paint_stage(bgra, &[], w, h, p);
-    let hgt = (p.impasto > 0.0).then(|| impasto_height(w, h, &stage.strokes, p.impasto_knife, p.look()));
+    let stage = paint_stage(bgra, &[], w, h, p, None);
+    let hgt = (p.impasto > 0.0).then(|| stage_height(&stage, p.impasto_knife, p.look()));
     (finish_single(&stage, hgt.as_deref(), p).into_owned(), String::new())
 }
 
@@ -1663,7 +1852,7 @@ pub fn paint_bgra_multi(
     kinds: Option<&[Option<String>]>,
 ) -> Result<Vec<Vec<u8>>, String> {
     validate_multi(ref_bgra, chans, w, h)?;
-    let stage = paint_stage(ref_bgra, chans, w, h, p);
-    let hgt = (p.impasto > 0.0).then(|| impasto_height(w, h, &stage.strokes, p.impasto_knife, p.look()));
+    let stage = paint_stage(ref_bgra, chans, w, h, p, None);
+    let hgt = (p.impasto > 0.0).then(|| stage_height(&stage, p.impasto_knife, p.look()));
     Ok(finish_multi(&stage, hgt.as_deref(), p, kinds).into_iter().map(Cow::into_owned).collect())
 }

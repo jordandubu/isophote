@@ -4,6 +4,8 @@
 
 let wasm = null;
 const inputs = new Map();
+let mesh = null;            // { key, buf }: newest mesh sent by the page
+let wasmMeshKey = null;     // key of the mesh the core currently holds
 
 // the page sends the wasm URL in an {op:"init"} message (a worker's own
 // location is not reliable when the host wraps it in a blob: URL)
@@ -52,6 +54,23 @@ function paintSingle(inp, params) {
   }
 }
 
+// uv_aware paints read the mesh from the core: hand it over once per mesh
+function setWasmMesh() {
+  if (!mesh) throw new Error("mesh missing");
+  if (wasmMeshKey === mesh.key) return;
+  const bytes = new Uint8Array(mesh.buf);
+  const ptr = x().wasm_alloc(bytes.length);
+  let ret;
+  try {
+    new Uint8Array(x().memory.buffer, ptr, bytes.length).set(bytes);
+    ret = x().wasm_set_mesh(ptr, bytes.length);
+  } finally {
+    x().wasm_free(ptr, bytes.length);
+  }
+  if (ret !== 0) throw new Error("bad mesh");
+  wasmMeshKey = mesh.key;
+}
+
 // Coherent multi-channel paint (stroke replay): data[0] is the reference
 // (drives flow + strokes), the rest are painted with the SAME strokes. The
 // core appends an impasto height frame + a display-only relief preview.
@@ -63,6 +82,7 @@ function paintMulti(inp, params) {
     if (b.length !== frame) throw new Error("channel " + i + " size mismatch");
     blob.set(b, i * frame);
   });
+  if (params.uv_aware) setWasmMesh();
   const pb = new TextEncoder().encode(JSON.stringify(params));
   const outLen = frame * (k + 2);
   const inPtr = x().wasm_alloc(blob.length);
@@ -94,6 +114,7 @@ self.onmessage = async (e) => {
   const m = e.data;
   if (m.op === "init") { onUrl(m.wasm); return; }
   if (m.op === "clear") { inputs.clear(); return; }
+  if (m.mesh) mesh = m.mesh;
   try {
     await ready;
     if (m.input) inputs.set(m.key, m.input);

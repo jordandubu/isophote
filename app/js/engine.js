@@ -66,10 +66,31 @@ export function frameParams(v, i) {
 
 let nextSourceId = 1;
 
+// The add-on's mesh blob (little-endian): "ISOM", u32 version = 1, u32 ntri,
+// u32 nvert, 9 f32 object matrix (row-major), nvert*3 f32 world positions,
+// ntri*3 u32 vertex indices, ntri*6 f32 corner UVs (v up), ntri*9 f32 corner
+// world normals. Returns typed-array views on `buf`; throws on a bad blob.
+export function parseMesh(buf) {
+  const bad = () => new Error("bad mesh");
+  if (buf.byteLength < 52) throw bad();
+  const dv = new DataView(buf);
+  if (dv.getUint32(0, true) !== 0x4d4f5349 || dv.getUint32(4, true) !== 1) throw bad();   // "ISOM", version
+  const ntri = dv.getUint32(8, true), nvert = dv.getUint32(12, true);
+  if (!ntri || buf.byteLength !== 52 + nvert * 12 + ntri * 72) throw bad();
+  let o = 52;
+  const vpos = new Float32Array(buf, o, nvert * 3); o += nvert * 12;
+  const triVert = new Uint32Array(buf, o, ntri * 3); o += ntri * 12;
+  const triUv = new Float32Array(buf, o, ntri * 6); o += ntri * 24;
+  const triNrm = new Float32Array(buf, o, ntri * 9);
+  return { buf, ntri, nvert, matrix: new Float32Array(buf, 16, 9), vpos, triVert, triUv, triNrm };
+}
+
 // blobs: {kind: Blob}; kinds: order (kinds[0] is the reference that drives
 // flow + strokes). multi = a Blender channel queue; otherwise one photo.
 // normalSpace: "object" | "tangent", how the Blender normal map is encoded.
-export async function makeSource(blobs, kinds, multi, normalSpace = "object") {
+// mesh: parseMesh() result for a Blender queue (null = none): strokes are
+// painted on its surface while uvAware is on, and the 3D view shows it.
+export async function makeSource(blobs, kinds, multi, normalSpace = "object", mesh = null) {
   const bitmaps = {};
   try {
     for (const k of kinds) bitmaps[k] = await createImageBitmap(blobs[k]);
@@ -83,7 +104,7 @@ export async function makeSource(blobs, kinds, multi, normalSpace = "object") {
     if (Math.max(bitmaps[k].width, bitmaps[k].height) > Math.max(bitmaps[best].width, bitmaps[best].height)) best = k;
   }
   return {
-    id: nextSourceId++, multi, kinds, bitmaps, normalSpace, shown: false,
+    id: nextSourceId++, multi, kinds, bitmaps, normalSpace, mesh, uvAware: true, shown: false,
     ref: { w: bitmaps[best].width, h: bitmaps[best].height },
     origURL: URL.createObjectURL(blobs[kinds[0]]),
     close() {
@@ -150,6 +171,7 @@ export class PaintClient {
     w.postMessage({ op: "init", wasm: new URL("../isophote_core.wasm", import.meta.url).href });
     this.worker = w;
     this.sent = new Set();     // input keys the live worker already holds
+    this.meshKey = null;       // mesh the live worker already holds
     this.cur = null;
     this.pending = null;
     w.onmessage = (e) => this.onMessage(w, e.data);
@@ -211,6 +233,9 @@ export class PaintClient {
       const msg = { id: job.id, op: job.req.op, key, params: job.req.params };
       const transfer = [];
       if (input) { msg.input = input; for (const d of input.data) transfer.push(d.buffer); }
+      // the mesh rides along once per worker (cloned, not transferred: a respawned worker needs it again)
+      const mesh = job.req.mesh;
+      if (mesh && this.meshKey !== mesh.key) { msg.mesh = mesh; this.meshKey = mesh.key; }
       this.worker.postMessage(msg, transfer);
     } catch (e) {
       if (this.cur === job) { this.cur = null; this.pump(); }
@@ -237,9 +262,14 @@ export async function paint(client, source, v, { draft = false, frame = null } =
   const g = paintGeom(v, source.ref, draft);
   const params = { ...coreParams(v, g), ...(frame == null ? {} : frameParams(v, frame)) };
   if (source.multi) { params.kinds = source.kinds; params.normal_tangent = source.normalSpace === "tangent"; }
+  const req = { op: source.multi ? "multi" : "paint", params };
+  if (source.multi && source.mesh && source.uvAware) {
+    params.uv_aware = true;
+    req.mesh = { key: "mesh:" + source.id, buf: source.mesh.buf };
+  }
   const inp = inputsFor(source, g, draft);
-  const r = await client.run({ op: source.multi ? "multi" : "paint", key: inp.key, build: inp.build, params },
-                             { final: !draft });
+  req.key = inp.key; req.build = inp.build;
+  const r = await client.run(req, { final: !draft });
   // multi results carry a trailing impasto height + display-only preview when impasto > 0
   const kinds = !source.multi ? ["image"]
     : r.bitmaps.length > source.kinds.length ? [...source.kinds, "height", "preview"] : source.kinds;

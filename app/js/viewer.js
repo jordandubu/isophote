@@ -1,13 +1,20 @@
 // viewer.js — the canvas: original underneath, painted result on top, with
-// Original / Split / Result comparison, wheel + pinch zoom, drag pan.
+// Original / Split / Result comparison, wheel + pinch zoom, drag pan; plus
+// the 3D view of a Blender mesh (view3d.js) when the source carries one.
 import { $ } from "./dom.js";
+import { createView3d } from "./view3d.js";
 
 export function createViewer() {
   const viewport = $("viewport"), content = $("content"), orig = $("orig"), canvas = $("res");
   const ctx = canvas.getContext("2d");
   const divider = $("divider"), grip = divider.querySelector(".grip");
   const segBtns = document.querySelectorAll("#viewSeg button");
-  const MODES = ["orig", "split", "result"];
+  const btn3d = document.querySelector('#viewSeg button[data-mode="3d"]');
+  const gl = $("gl"), view3d = createView3d(gl);
+  const MODES = ["orig", "split", "result", "3d"];
+
+  let src = null;            // current source (its mesh feeds the 3D view)
+  const has3d = () => !!(src && src.mesh && view3d.supported);
 
   let ref = null;            // {w,h}: layout aspect
   let res = null, kind = null;
@@ -43,7 +50,10 @@ export function createViewer() {
   }
   const local = (e) => { const r = viewport.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
 
-  function fit() { fitMode = true; layout(); }
+  function fit() {
+    if (mode === "3d") { view3d.resetView(); return; }
+    fitMode = true; layout();
+  }
   function actualSize(cx, cy) {
     if (!res) return;
     if (cx == null) { cx = viewport.clientWidth / 2; cy = viewport.clientHeight / 2; }
@@ -112,9 +122,17 @@ export function createViewer() {
     divider.hidden = eff !== "split" || !res;
     divider.style.left = split * 100 + "%";
     segBtns.forEach((b) => b.classList.toggle("on", b.dataset.mode === mode));
+    btn3d.hidden = !has3d();
+    const on3d = eff === "3d";
+    gl.hidden = !on3d;
+    // the mesh wears what would be sent: bump from the height map only when it is sent
+    if (on3d && res) view3d.show(res, { tangent: src.normalSpace === "tangent", useHeight: $("sendHeight").checked });
   }
   segBtns.forEach((b) => b.addEventListener("click", () => setMode(b.dataset.mode)));
-  function setMode(m) { if (MODES.includes(m)) { mode = m; applyMode(); } }
+  function setMode(m) {
+    if (!MODES.includes(m) || (m === "3d" && !has3d())) return;
+    mode = m; applyMode();
+  }
 
   /* ---- content ---- */
   function draw() {
@@ -127,8 +145,11 @@ export function createViewer() {
 
   return {
     setSource(source) {
+      src = source;
       ref = source.ref;
       res = null;
+      view3d.setMesh(source.mesh || null);
+      if (mode === "3d" && !has3d()) mode = "result";
       orig.src = source.origURL;
       $("stageEmpty").hidden = true;
       viewport.hidden = false;
@@ -137,7 +158,9 @@ export function createViewer() {
       applyMode();
     },
     clear() {
-      ref = null; res = null;
+      src = null; ref = null; res = null;
+      view3d.setMesh(null);
+      if (mode === "3d") mode = "result";
       orig.removeAttribute("src");
       viewport.hidden = true;
       $("stageEmpty").hidden = false;
@@ -149,7 +172,7 @@ export function createViewer() {
     currentBitmap() { return res ? res.bitmap(kind) : null; },
     setMode, get mode() { return mode; },
     hold(on) { held = on; applyMode(); },
-    fit, actualSize,
+    fit, actualSize, refresh: applyMode,
     setBusy(text) { const b = $("busy"); b.hidden = !text; b.textContent = text || ""; },
     setInfo(text) { $("outRes").textContent = text; },
   };

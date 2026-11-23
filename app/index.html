@@ -26,7 +26,7 @@
         <div class="kt">Shortcuts</div>
         <div><kbd>Space</kbd> play / pause boil</div>
         <div><kbd>\</kbd> hold to see the original</div>
-        <div><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> original · split · result</div>
+        <div><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd> original · split · result · 3D</div>
         <div><kbd>F</kbd> fit · double-click zoom</div>
         <div><kbd>R</kbd> new random seed</div>
         <div><kbd>Ctrl</kbd>+<kbd>Z</kbd> undo · <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> redo</div>
@@ -67,6 +67,7 @@
           <div id="divider" hidden><div class="grip" title="Drag to compare"></div></div>
         </div>
       </div>
+      <canvas id="gl" hidden></canvas>
       <div id="stageEmpty">
         <div class="big">Drop a photo</div>
         <div class="small">or click to browse, or paste &middot; everything runs in your browser</div>
@@ -75,6 +76,7 @@
         <button type="button" data-mode="orig" title="Original (1) — hold \ to peek">Original</button>
         <button type="button" data-mode="split" title="Compare (2)">Split</button>
         <button type="button" data-mode="result" class="on" title="Painted (3)">Result</button>
+        <button type="button" data-mode="3d" hidden title="3D preview on the Blender mesh (4)">3D</button>
       </div>
       <div id="busy" hidden></div>
       <div id="zoombar" class="only-image">

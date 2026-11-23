@@ -78,7 +78,7 @@ fn multi_replay_same_strokes() {
     let p = Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
                      base_radius: 3, flow_smooth: 4, seed: 7,
                      max_size: None, impasto: 0.0, impasto_knife: false,
-                     boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0, normal_tangent: false };
+                     boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0, normal_tangent: false, uv_aware: false };
     let outs = paint_bgra_multi(&ref_img, &[&chan], w, h, &p, None).unwrap();
     assert_eq!(outs.len(), 2);
     // determinism: same inputs -> identical bytes
@@ -163,7 +163,7 @@ fn impasto_multi_frames() {
     let params = |impasto: f64| Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
                                          base_radius: 3, flow_smooth: 4, seed: 7,
                                          max_size: None, impasto, impasto_knife: false,
-                                         boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0, normal_tangent: false };
+                                         boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0, normal_tangent: false, uv_aware: false };
     let kinds = |a: &str, b: &str| vec![Some(a.to_string()), Some(b.to_string())];
     let cn = kinds("color", "normal");
     let off = paint_bgra_multi(&ref_img, &[&chan], w, h, &params(0.0), Some(&cn)).unwrap();
@@ -201,7 +201,7 @@ fn impasto_reference_only() {
     let params = |impasto: f64| Params { brush_len: 12, brush_w: 3, layers: 2, relief: 0.1,
                                          base_radius: 3, flow_smooth: 4, seed: 7,
                                          max_size: None, impasto, impasto_knife: false,
-                                         boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0, normal_tangent: false };
+                                         boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0, normal_tangent: false, uv_aware: false };
     let kinds = vec![Some("normal".to_string())];
     let off = paint_bgra_multi(&ref_img, &[], w, h, &params(0.0), Some(&kinds)).unwrap();
     assert_eq!(off.len(), 1);
@@ -222,7 +222,7 @@ fn impasto_tangent_normal_relief() {
                                                         base_radius: 3, flow_smooth: 4, seed: 7,
                                                         max_size: None, impasto, impasto_knife: false,
                                                         boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0,
-                                                        normal_tangent: tangent };
+                                                        normal_tangent: tangent, uv_aware: false };
     let kinds = vec![Some("color".to_string()), Some("normal".to_string())];
     let run = |impasto: f64, tangent: bool| {
         paint_bgra_multi(&ref_img, &[&flat], w, h, &params(impasto, tangent), Some(&kinds)).unwrap()
@@ -271,7 +271,7 @@ fn impasto_styles_and_range() {
     let params = |knife: bool| Params { brush_len: 30, brush_w: 8, layers: 2, relief: 0.1,
                                         base_radius: 3, flow_smooth: 4, seed: 7,
                                         max_size: None, impasto: 2.0, impasto_knife: knife,
-                                        boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0, normal_tangent: false };
+                                        boil: 0.0, boil_frame: 0, look_scale: 0.0, out_size: 0, normal_tangent: false, uv_aware: false };
     let kinds = vec![Some("normal".to_string())];
     let bristle = paint_bgra_multi(&ref_img, &[], w, h, &params(false), Some(&kinds)).unwrap();
     let knife = paint_bgra_multi(&ref_img, &[], w, h, &params(true), Some(&kinds)).unwrap();
@@ -322,7 +322,7 @@ fn boil_keeps_most_strokes() {
     let p = |boil: f64, boil_frame: u32| Params { brush_len: 20, brush_w: 3, layers: 2, relief: 0.1,
                                                   base_radius: 3, flow_smooth: 4, seed: 7,
                                                   max_size: None, impasto: 0.0, impasto_knife: false,
-                                                  boil, boil_frame, look_scale: 0.0, out_size: 0, normal_tangent: false };
+                                                  boil, boil_frame, look_scale: 0.0, out_size: 0, normal_tangent: false, uv_aware: false };
     let plain = paint_bgra(&bgra, w, h, &p(0.0, 0)).0;
     assert_eq!(paint_bgra(&bgra, w, h, &p(0.3, 0)).0, plain, "frame 0 must ignore boil");
     let f1 = paint_bgra(&bgra, w, h, &p(0.3, 1)).0;
@@ -384,6 +384,6 @@ fn look_scale_keeps_stroke_pattern() {
     let p = |look_scale: f64| Params { brush_len: 20, brush_w: 3, layers: 2, relief: 0.2,
                                        base_radius: 3, flow_smooth: 4, seed: 7,
                                        max_size: None, impasto: 1.0, impasto_knife: false,
-                                       boil: 0.0, boil_frame: 0, look_scale, out_size: 0, normal_tangent: false };
+                                       boil: 0.0, boil_frame: 0, look_scale, out_size: 0, normal_tangent: false, uv_aware: false };
     assert_eq!(paint_bgra(&bgra, bw, bh, &p(0.0)).0, paint_bgra(&bgra, bw, bh, &p(1.0)).0);
 }

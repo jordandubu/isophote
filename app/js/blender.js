@@ -2,7 +2,7 @@
 // queues pushed from the add-on, sends painted maps / animated frames back.
 // Wire protocol is unchanged from before the UI rewrite.
 import { $, h } from "./dom.js";
-import { b64ToBlob, bitmapToB64, CANCELLED } from "./engine.js";
+import { b64ToBlob, bitmapToB64, parseMesh, CANCELLED } from "./engine.js";
 
 const BRIDGE_PORT = 8778;
 const url = (path) => `http://127.0.0.1:${BRIDGE_PORT}${path}`;
@@ -23,9 +23,14 @@ export function createBlender(app) {
   // channel shown on the canvas (base color, normal map, impasto height, relief preview...)
   const sel = h("select", { class: "chsel", hidden: true, title: "Channel shown on the canvas", "aria-label": "Channel",
     onchange: (e) => app.setKind(e.target.value) });
+  // strokes painted on the mesh surface (continuous across UV seams); only with a mesh from the add-on
+  const uvBox = h("input", { type: "checkbox", onchange: (e) => app.setUvAware(e.target.checked) });
+  const uvLabel = h("label", { class: "check", hidden: true,
+    title: "Strokes, impasto and lighting continue across UV seams (uses the mesh sent by the add-on). Untick for the classic flat-texture strokes." },
+    uvBox, " Seamless strokes across UV seams");
   const section = h("details", { class: "sec", id: "sec-blender", open: true },
     h("summary", {}, "Blender", dot),
-    h("div", { class: "secbody" }, sel));
+    h("div", { class: "secbody" }, sel, uvLabel));
   section.hidden = true;
   $("blenderSlot").append(section);
 
@@ -51,6 +56,8 @@ export function createBlender(app) {
     sel.hidden = kinds.length < 2;
     sel.replaceChildren(...kinds.map((k) => h("option", { value: k }, KIND_LABEL[k] || k)));
     sel.value = app.activeKind();
+    uvLabel.hidden = !(src && src.mesh);
+    uvBox.checked = app.uvAware();
   }
 
   async function send(animated) {
@@ -125,7 +132,7 @@ export function createBlender(app) {
       setConnected(true);
       // a single Blender image is a one-kind queue: same path, so impasto
       // relief (height map + preview) works for normal-only sends too
-      if (d.kind === "image" && d.bgr_png) d = { kind: "multi", kinds: [d.map_kind || "normal"], pngs: [d.bgr_png], normal_space: d.normal_space, status: d.status };
+      if (d.kind === "image" && d.bgr_png) d = { kind: "multi", kinds: [d.map_kind || "normal"], pngs: [d.bgr_png], normal_space: d.normal_space, mesh: d.mesh, status: d.status };
       if (d.status) say(d.status);
       if (d.kind === "multi" && Array.isArray(d.kinds) && Array.isArray(d.pngs) && d.pngs.length === d.kinds.length && !B.pending) {
         let hash = 0;
@@ -137,7 +144,15 @@ export function createBlender(app) {
           const blobs = {};
           d.kinds.forEach((k, i) => { blobs[k] = b64ToBlob(d.pngs[i], "image/png"); });
           say(`received ${kindList(d.kinds)} — painting…`);
-          await app.loadQueue(d.kinds, blobs, d.normal_space);
+          let mesh = null;
+          if (d.mesh) {
+            try {
+              const mr = await fetch(url("/mesh"), { method: "POST", body: "{}" });
+              if (mr.ok) mesh = parseMesh(await mr.arrayBuffer());
+            } catch (e) { /* classic strokes */ }
+            if (!mesh) say("mesh unavailable — classic strokes, no 3D preview");
+          }
+          await app.loadQueue(d.kinds, blobs, d.normal_space, mesh);
           fetch(url("/ack"), { method: "POST", body: "{}" }).catch(() => {});
           say(`received ${kindList(d.kinds)} — adjust sliders freely; ALL channels repaint on Send`, 4000);
         } finally {

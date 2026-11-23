@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 6, 6),
+    "version": (0, 7, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -32,6 +32,71 @@ def _open_url(url):
         webbrowser.open(url)
     except Exception:
         pass
+
+
+# largest mesh sent to the page (seamless strokes + 3D preview)
+MESH_MAX_TRIS = 2_000_000
+
+
+def _mesh_blob(obj):
+    """Evaluated mesh of `obj` as the binary blob the isophote page reads
+    (seamless strokes across UV seams + 3D preview). World space, active UV
+    map. Little-endian layout:
+      b"ISOM", u32 version = 1, u32 ntri, u32 nvert,
+      9 f32  object->world 3x3 (row-major; decodes object-space normal maps),
+      nvert*3 f32  vertex positions,
+      ntri*3  u32  vertex indices,
+      ntri*6  f32  corner UVs (u, v; v up),
+      ntri*9  f32  corner normals.
+    Raises ValueError when the mesh cannot be sent."""
+    import struct
+    import numpy as np
+    ev = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    me = ev.to_mesh()
+    try:
+        if me.uv_layers.active is None:
+            raise ValueError("mesh has no UV map")
+        me.calc_loop_triangles()
+        nt, nv, nl = len(me.loop_triangles), len(me.vertices), len(me.loops)
+        if nt == 0:
+            raise ValueError("mesh has no faces")
+        if nt > MESH_MAX_TRIS:
+            raise ValueError(f"mesh has {nt} triangles (limit {MESH_MAX_TRIS})")
+        tri_vert = np.empty(nt * 3, dtype=np.int32)
+        tri_loop = np.empty(nt * 3, dtype=np.int32)
+        me.loop_triangles.foreach_get("vertices", tri_vert)
+        me.loop_triangles.foreach_get("loops", tri_loop)
+        co = np.empty(nv * 3, dtype=np.float32)
+        me.vertices.foreach_get("co", co)
+        uv = np.empty(nl * 2, dtype=np.float32)
+        me.uv_layers.active.data.foreach_get("uv", uv)
+        cn = np.empty(nl * 3, dtype=np.float32)
+        if hasattr(me, "corner_normals") and len(me.corner_normals) == nl:
+            me.corner_normals.foreach_get("vector", cn)
+        else:   # Blender 4.0
+            if hasattr(me, "calc_normals_split"):
+                me.calc_normals_split()
+            me.loops.foreach_get("normal", cn)
+        world = np.array(obj.matrix_world, dtype=np.float64)
+        lin, loc = world[:3, :3], world[:3, 3]
+        wpos = co.reshape(-1, 3).astype(np.float64) @ lin.T + loc
+        try:
+            nmat = np.linalg.inv(lin).T
+        except np.linalg.LinAlgError:
+            nmat = lin
+        wn = cn.reshape(-1, 3).astype(np.float64) @ nmat.T
+        length = np.linalg.norm(wn, axis=1, keepdims=True)
+        wn = wn / np.where(length > 0.0, length, 1.0)
+        return b"".join((
+            struct.pack("<4sIII", b"ISOM", 1, nt, nv),
+            lin.astype("<f4").tobytes(),
+            wpos.astype("<f4").tobytes(),
+            tri_vert.astype("<u4").tobytes(),
+            uv.reshape(-1, 2)[tri_loop].astype("<f4").tobytes(),
+            wn[tri_loop].astype("<f4").tobytes(),
+        ))
+    finally:
+        ev.to_mesh_clear()
 
 
 # ------------------------------------------------------------- operator
@@ -384,6 +449,13 @@ class PN_OT_send_to_isophote(bpy.types.Operator):
             self.report({'ERROR'}, "No active channels — set at least one row to Bake or Image")
             return {'CANCELLED'}
 
+        # mesh for the page: seamless strokes across UV seams + 3D preview
+        try:
+            mesh = _mesh_blob(obj)
+        except Exception as e:
+            mesh = None
+            self.report({'WARNING'}, f"Mesh not sent ({e}) — seamless strokes and 3D preview are off")
+
         # replay reference: color before normal, else wire order
         wired = [k for k in KIND_ORDER if k in baked]
         wired += [k for k in baked if k not in wired]
@@ -409,6 +481,7 @@ class PN_OT_send_to_isophote(bpy.types.Operator):
             }
         _bridge_state["pending_ack"] = False
         _bridge_state["pending_normal_space"] = s.normal_space.lower()
+        _bridge_state["pending_mesh"] = mesh
         import urllib.request
         try:
             urllib.request.urlopen(
@@ -1381,6 +1454,7 @@ _bridge_state = {"pending_png": None, "pending_ack": False,
                  "result_anim_kinds": None,  # multi anim: kinds for anim
                  "result_height_scale": None,  # UV thickness of a white height px (multi results)
                  "pending_normal_space": "object",  # space of the queued normal map
+                 "pending_mesh": None,     # _mesh_blob() bytes of the queued object (None = not sent)
                  "result_normal_space": "object"}   # space the page painted the normal in
 _bridge_server = None
 
@@ -1405,6 +1479,14 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _reply_bytes(self, data):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_OPTIONS(self):
         self.send_response(204)
         self._cors()
@@ -1425,6 +1507,7 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
             _bridge_state["pending_png"] = req.get("png")
             _bridge_state["pending_kind"] = req.get("kind", "normal")
             _bridge_state["pending_multi"] = None
+            _bridge_state["pending_mesh"] = None
             _bridge_state["pending_ack"] = False
             _bridge_state["result_png"] = None
             _bridge_state["result_kinds"] = None
@@ -1439,6 +1522,7 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
                                     "kinds": multi["kinds"],
                                     "pngs": multi["pngs"],
                                     "normal_space": _bridge_state["pending_normal_space"],
+                                    "mesh": _bridge_state["pending_mesh"] is not None,
                                     "ack": True})
             png = _bridge_state["pending_png"]
             if png is None:
@@ -1446,12 +1530,20 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
             return self._reply({"kind": "image", "bgr_png": png,
                                 "map_kind": _bridge_state["pending_kind"] or "normal",
                                 "normal_space": _bridge_state["pending_normal_space"],
+                                "mesh": _bridge_state["pending_mesh"] is not None,
                                 "ack": True})
+
+        if self.path == "/mesh":             # app pulls the queued object's mesh
+            data = _bridge_state["pending_mesh"]
+            if data is None:
+                return self._reply({"error": "no mesh"}, 404)
+            return self._reply_bytes(data)
 
         if self.path == "/ack":              # page says: painted it, clear
             _bridge_state["pending_png"] = None
             _bridge_state["pending_kind"] = None
             _bridge_state["pending_multi"] = None
+            _bridge_state["pending_mesh"] = None
             _bridge_state["pending_ack"] = False
             return self._reply({"ok": True})
 

@@ -1,5 +1,6 @@
 pub mod pcg64;
 pub mod pipeline;
+pub mod surface;
 
 pub use pcg64::Pcg64;
 pub use pipeline::paint_bgra;
@@ -84,6 +85,10 @@ struct StageCache {
 
 static CACHE: std::sync::Mutex<Option<StageCache>> = std::sync::Mutex::new(None);
 
+/// Mesh for surface painting (`uv_aware`), set by `wasm_set_mesh`: hash of
+/// its bytes (part of the stage cache key) + the parsed mesh.
+static MESH: std::sync::Mutex<Option<(u64, std::sync::Arc<surface::Mesh>)>> = std::sync::Mutex::new(None);
+
 /// 64-bit multiply-xorshift hash over 8-byte little-endian words (std's
 /// SipHash is ~10x slower on wasm32 and inputs reach hundreds of MB).
 fn hash_words(mut h: u64, bytes: &[u8]) -> u64 {
@@ -140,7 +145,7 @@ fn with_stage<R>(
     }
     let c = guard.as_mut().unwrap();
     if p.impasto > 0.0 && c.height.as_ref().map_or(true, |(knife, _)| *knife != p.impasto_knife) {
-        let hf = pipeline::impasto_height(c.stage.w, c.stage.h, &c.stage.strokes, p.impasto_knife, p.look());
+        let hf = pipeline::stage_height(&c.stage, p.impasto_knife, p.look());
         c.height = Some((p.impasto_knife, hf));
     }
     let hgt = if p.impasto > 0.0 { c.height.as_ref().map(|(_, v)| &v[..]) } else { None };
@@ -148,7 +153,10 @@ fn with_stage<R>(
     let px = c.stage.w * c.stage.h;
     let bytes = (c.stage.frames.len() + 1) * px * 4
         + c.height.as_ref().map_or(0, |_| px * 4)
-        + c.stage.strokes.iter().map(|s| s.pts.len() * 8 + 32).sum::<usize>();
+        + c.stage.strokes.iter().map(|s| s.pts.len() * 8 + 32).sum::<usize>()
+        + c.stage.surf.as_ref().map_or(0, |s| {
+            px * 12 + s.map.tris.len() * 108 + s.strokes.iter().map(|k| k.pts.len() * 28 + 32).sum::<usize>()
+        });
     if bytes > CACHE_MAX_BYTES {
         *guard = None;
     }
@@ -174,6 +182,26 @@ pub extern "C" fn wasm_free(ptr: *mut u8, len: i32) {
     }
     let layout = std::alloc::Layout::from_size_align(len as usize, 16).unwrap();
     unsafe { std::alloc::dealloc(ptr, layout) };
+}
+
+/// Set (or, with `len <= 0`, clear) the mesh used by `uv_aware` paints: the
+/// add-on's mesh blob (layout in `surface::Mesh::parse`). Returns 0 on
+/// success, 1 when the blob is malformed (the mesh is then cleared).
+#[no_mangle]
+pub extern "C" fn wasm_set_mesh(ptr: *const u8, len: i32) -> i32 {
+    let mut slot = MESH.lock().unwrap_or_else(|e| e.into_inner());
+    *slot = None;
+    if ptr.is_null() || len <= 0 {
+        return 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    match surface::Mesh::parse(bytes) {
+        Ok(m) => {
+            *slot = Some((hash_words(0xcbf2_9ce4_8422_2325, bytes), std::sync::Arc::new(m)));
+            0
+        }
+        Err(_) => 1,
+    }
 }
 
 /// Paint a BGRA image in-place semantics: reads BGRA from `in_ptr`
@@ -222,6 +250,7 @@ pub extern "C" fn wasm_paint(
             look_scale: 0.0,
             out_size: 0,
             normal_tangent: false,
+            uv_aware: false,
         }
     } else {
         match serde_json::from_str(&json) {
@@ -243,7 +272,7 @@ pub extern "C" fn wasm_paint(
             }
             None => (in_bytes, w, h),
         };
-        pipeline::paint_stage(src, &[], sw, sh, &p)
+        pipeline::paint_stage(src, &[], sw, sh, &p, None)
     };
     with_stage(key, &p, build, |stage, hgt| {
         let painted = pipeline::finish_single(stage, hgt, &p);
@@ -332,6 +361,7 @@ pub extern "C" fn wasm_paint_multi(
             look_scale: 0.0,
             out_size: 0,
             normal_tangent: false,
+            uv_aware: false,
         }
     } else {
         match serde_json::from_str(&json) {
@@ -348,8 +378,15 @@ pub extern "C" fn wasm_paint_multi(
     if let Err(e) = pipeline::validate_multi(frames[0], &frames[1..], w, h) {
         return write_err(out_ptr, frame * k, e);
     }
-    let key = stage_key(2, w, h, k, &p, blob);
-    with_stage(key, &p, || pipeline::paint_stage(frames[0], &frames[1..], w, h, &p), |stage, hgt| {
+    // surface painting needs the mesh from wasm_set_mesh; without one the
+    // paint is the classic flat-texture one
+    let mesh = if p.uv_aware { MESH.lock().unwrap_or_else(|e| e.into_inner()).clone() } else { None };
+    let mut key = stage_key(2, w, h, k, &p, blob);
+    if let Some((mesh_hash, _)) = &mesh {
+        key = hash_words(key, &mesh_hash.to_le_bytes());
+    }
+    let mesh = mesh.as_ref().map(|(_, m)| &**m);
+    with_stage(key, &p, || pipeline::paint_stage(frames[0], &frames[1..], w, h, &p, mesh), |stage, hgt| {
         let painted = pipeline::finish_multi(stage, hgt, &p, kinds.as_deref());
         // out_size: area-downscale each painted frame to the requested long edge
         let (ow, oh) = out_dims(w, h, p.out_size);

@@ -32,7 +32,7 @@ function toast(text, ms = 5000) {
 $("toast").onclick = () => { $("toast").hidden = true; };
 
 /* ---------- persisted settings (Blender bridge on/off) ---------- */
-const settings = { addonBlender: false, sendAnimated: false, sendHeight: true };
+const settings = { addonBlender: false, sendAnimated: false, sendHeight: true, uvAware: true };
 try { Object.assign(settings, JSON.parse(localStorage.getItem("isophote_settings") || "{}")); } catch { /* corrupt: defaults */ }
 const saveSettings = () => { try { localStorage.setItem("isophote_settings", JSON.stringify(settings)); } catch { /* private mode */ } };
 // the add-on opens the site with ?bridge=1 -> force the bridge on
@@ -133,6 +133,7 @@ function installSource(s) {
   cancelAnimationFrame(rafId);
   const oldSource = source, oldResult = result;
   source = s; result = null;
+  s.uvAware = settings.uvAware;
   activeKind = s.kinds[0];
   previewAuto = false;
   dirty = true;
@@ -154,8 +155,8 @@ async function loadFile(file) {
   } catch (e) { toast(e.message || String(e)); }
 }
 
-async function loadQueue(kinds, blobs, normalSpace) {
-  installSource(await makeSource(blobs, kinds, true, normalSpace));
+async function loadQueue(kinds, blobs, normalSpace, mesh) {
+  installSource(await makeSource(blobs, kinds, true, normalSpace, mesh));
   await ensureFinal();
 }
 
@@ -203,6 +204,12 @@ const anim = createAnim({
 const blender = createBlender({
   source: () => source, result: () => result, activeKind: () => activeKind,
   setKind, loadQueue, ensureFinal, anim, toast, sendHeight: () => $("sendHeight").checked,
+  uvAware: () => settings.uvAware,
+  setUvAware: (on) => {
+    settings.uvAware = on;
+    saveSettings();
+    if (source) { source.uvAware = on; requestPaint(); }
+  },
 });
 blender.setEnabled(settings.addonBlender);
 
@@ -234,7 +241,7 @@ document.addEventListener("click", (e) => {
 $("sendAnimated").checked = settings.sendAnimated;
 $("sendAnimated").onchange = (e) => { settings.sendAnimated = e.target.checked; saveSettings(); };
 $("sendHeight").checked = settings.sendHeight;
-$("sendHeight").onchange = (e) => { settings.sendHeight = e.target.checked; saveSettings(); };
+$("sendHeight").onchange = (e) => { settings.sendHeight = e.target.checked; saveSettings(); viewer.refresh(); };
 $("sendBtn").onclick = () => { sendMenu.hidden = true; blender.send($("sendAnimated").checked); };
 $("addonBlender").checked = settings.addonBlender;
 $("addonBlender").onchange = (e) => {
@@ -316,6 +323,7 @@ window.addEventListener("keydown", (e) => {
   else if (e.key === "1") viewer.setMode("orig");
   else if (e.key === "2") viewer.setMode("split");
   else if (e.key === "3") viewer.setMode("result");
+  else if (e.key === "4") viewer.setMode("3d");
 });
 window.addEventListener("keyup", (e) => { if (e.key === "\\") viewer.hold(false); });
 window.addEventListener("blur", () => viewer.hold(false));
