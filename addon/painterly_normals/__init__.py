@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Painterly Normals",
     "author": "La Ire Deu",
-    "version": (0, 7, 0),
+    "version": (0, 7, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Painterly",
     "description": "Bake normal map from texture, restyle it into painterly brush strokes with isophote in your browser, apply to material.",
@@ -147,19 +147,19 @@ class PN_OT_apply_animated_from_isophote(bpy.types.Operator):
         try:
             for i, png_b64 in enumerate(anim):
                 raw = base64.b64decode(png_b64)
-                src = os.path.join(tmp, f"{base}_anim_{i:03d}.png")
+                src = os.path.join(tmp, f"{base}_anim_{i + 1:03d}.png")
                 with open(src, "wb") as f:
                     f.write(raw)
                 final = src
                 if s.renormalize:
                     res = {"path": None, "error": None}
-                    _renormalize_file(src, res, f"{base}_anim_{i:03d}")
+                    _renormalize_file(src, res, f"{base}_anim_{i + 1:03d}")
                     if res.get("error"):
                         self.report({'ERROR'}, f"Renormalize failed: {res['error']}")
                         return {'CANCELLED'}
                     final = res["path"]
                 # move into the anim folder with a stable sequence name
-                seq = os.path.join(norm_dir, f"{base}_anim_{i:03d}.png")
+                seq = os.path.join(norm_dir, f"{base}_anim_{i + 1:03d}.png")
                 if final != seq:
                     shutil.move(final, seq)
                 paths.append(seq)
@@ -171,8 +171,9 @@ class PN_OT_apply_animated_from_isophote(bpy.types.Operator):
         img = bpy.data.images.load(paths[0], check_existing=False)
         img.source = 'SEQUENCE'
         img.colorspace_settings.name = 'Non-Color'
-        # sequence expects frame files named with the END number; the loaded
-        # first frame sets the pattern
+        # Blender shows file number N on scene frame N when the sequence starts at
+        # frame 1, so the files are numbered from 001 (000-based names lose the
+        # first frame and leave the last one missing = pink)
         _apply_animated_map(mat, img, start_frame=1, duration=len(paths), kind='normal',
                             normal_space=_result_normal_space())
         s.status = f"Applied animated ({len(paths)} frames)"
@@ -204,18 +205,18 @@ class PN_OT_apply_animated_from_isophote(bpy.types.Operator):
                         self.report({'ERROR'},
                                     "Corrupted multi anim (frame kind mismatch).")
                         return {'CANCELLED'}
-                    src = os.path.join(tmp, f"{base}_{kind}_anim_{i:03d}.png")
+                    src = os.path.join(tmp, f"{base}_{kind}_anim_{i + 1:03d}.png")
                     with open(src, "wb") as f:
                         f.write(base64.b64decode(frame_kinds[ki]))
                     final = src
                     if kind == 'normal' and s.renormalize:
                         res = {"path": None, "error": None}
-                        _renormalize_file(src, res, f"{base}_{kind}_anim_{i:03d}")
+                        _renormalize_file(src, res, f"{base}_{kind}_anim_{i + 1:03d}")
                         if res.get("error"):
                             self.report({'ERROR'}, f"Renormalize failed: {res['error']}")
                             return {'CANCELLED'}
                         final = res["path"]
-                    seq = os.path.join(kind_dir, f"{base}_{kind}_anim_{i:03d}.png")
+                    seq = os.path.join(kind_dir, f"{base}_{kind}_anim_{i + 1:03d}.png")
                     if final != seq:
                         shutil.move(final, seq)
                     if i == 0:
