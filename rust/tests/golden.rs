@@ -40,7 +40,7 @@ fn to_bgr(bgra: &[u8]) -> Vec<u8> {
 #[allow(clippy::too_many_arguments)]
 fn params(len: i32, bw: i32, layers: i32, relief: f64, radius: i32, smooth: i32, seed: u64) -> Params {
     Params { brush_len: len, brush_w: bw, layers, relief, base_radius: radius, flow_smooth: smooth, seed,
-    max_size: None, impasto: 0.0, impasto_knife: false, boil: 0.0, boil_frame: 0,
+    max_size: None, impasto: 0.0, impasto_brush: 0, boil: 0.0, boil_frame: 0,
     look_scale: 0.0, out_size: 0, normal_tangent: false, uv_aware: false, shape_follow: 0.0 }
 }
 

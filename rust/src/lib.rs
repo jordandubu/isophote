@@ -74,13 +74,13 @@ static LAST_HEIGHT_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 const CACHE_MAX_BYTES: usize = 128 << 20;
 
 /// Last paint stage + impasto height, keyed by everything that shapes the
-/// painting except impasto strength/knife/out_size/kinds (those only change
+/// painting except impasto strength/brush/out_size/kinds (those only change
 /// the final shading or output size, so tweaking them skips the repaint).
 struct StageCache {
     key: u64,
     stage: pipeline::PaintStage,
-    /// (knife, height field) for the last impasto look computed on this stage
-    height: Option<(bool, Vec<f32>)>,
+    /// (brush, height field) for the last impasto brush computed on this stage
+    height: Option<(u32, Vec<f32>)>,
 }
 
 static CACHE: std::sync::Mutex<Option<StageCache>> = std::sync::Mutex::new(None);
@@ -130,8 +130,8 @@ fn stage_key(tag: u8, w: usize, h: usize, k: usize, p: &pipeline::Params, input:
 }
 
 /// Run `f` on the cached stage for `key` (built with `build` on a miss) and,
-/// when `p.impasto > 0`, the impasto height for `p.impasto_knife` (computed
-/// once per stage and look).
+/// when `p.impasto > 0`, the impasto height for `p.impasto_brush` (computed
+/// once per stage and brush).
 fn with_stage<R>(
     key: u64,
     p: &pipeline::Params,
@@ -144,9 +144,9 @@ fn with_stage<R>(
         *guard = Some(StageCache { key, stage: build(), height: None });
     }
     let c = guard.as_mut().unwrap();
-    if p.impasto > 0.0 && c.height.as_ref().map_or(true, |(knife, _)| *knife != p.impasto_knife) {
-        let hf = pipeline::stage_height(&c.stage, p.impasto_knife, p.look());
-        c.height = Some((p.impasto_knife, hf));
+    if p.impasto > 0.0 && c.height.as_ref().map_or(true, |(brush, _)| *brush != p.impasto_brush) {
+        let hf = pipeline::stage_height(&c.stage, p.impasto_brush, p.look());
+        c.height = Some((p.impasto_brush, hf));
     }
     let hgt = if p.impasto > 0.0 { c.height.as_ref().map(|(_, v)| &v[..]) } else { None };
     let r = f(&c.stage, hgt);
@@ -244,7 +244,7 @@ pub extern "C" fn wasm_paint(
             seed: 42,
             max_size: None,
             impasto: 0.0,
-            impasto_knife: false,
+            impasto_brush: 0,
             boil: 0.0,
             boil_frame: 0,
             look_scale: 0.0,
@@ -356,7 +356,7 @@ pub extern "C" fn wasm_paint_multi(
             seed: 42,
             max_size: None,
             impasto: 0.0,
-            impasto_knife: false,
+            impasto_brush: 0,
             boil: 0.0,
             boil_frame: 0,
             look_scale: 0.0,

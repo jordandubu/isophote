@@ -1005,10 +1005,10 @@ pub fn rasterize(map: &SurfMap, strokes: &[SurfStroke], look: f64) -> Coverage {
 
 /// `pipeline::impasto_height` on the surface (same stroke profile and
 /// layering; pixel units).
-pub fn impasto_height(map: &SurfMap, strokes: &[SurfStroke], knife: bool, look: f64) -> Vec<f32> {
+pub fn impasto_height(map: &SurfMap, strokes: &[SurfStroke], brush: u32, look: f64) -> Vec<f32> {
     let (w, h) = (map.w, map.h);
     let lk = look as f32;
-    let st = pipeline::impasto_style(knife);
+    let st = pipeline::impasto_style(brush);
     let mut height = vec![0f32; w * h];
     let mut scr = Scratch::new(w * h);
     let mut hits: Vec<Hit> = Vec::new();

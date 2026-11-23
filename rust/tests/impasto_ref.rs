@@ -211,7 +211,7 @@ fn natural(w: usize, h: usize, len: i32, width: i32, look: f64) -> Vec<Stroke> {
 
 fn check(name: &str, w: usize, h: usize, strokes: &[Stroke], knife: bool, look: f64) {
     assert!(!strokes.is_empty(), "{name}: no strokes");
-    let new = impasto_height(w, h, strokes, knife, look);
+    let new = impasto_height(w, h, strokes, knife as u32, look);
     let old = impasto_height_ref(w, h, strokes, knife, look);
     let mean_old = old.iter().map(|v| *v as f64).sum::<f64>() / old.len() as f64;
     let mean_diff = new.iter().zip(&old).map(|(a, b)| (a - b).abs() as f64).sum::<f64>() / old.len() as f64;

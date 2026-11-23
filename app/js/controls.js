@@ -41,11 +41,12 @@ export function buildPanel(root, store, { onCopy, onPaste }) {
     return el;
   }
 
-  function toggle(def) {
-    const cb = h("input", { type: "checkbox" });
-    cb.addEventListener("change", () => store.apply({ [def.key]: cb.checked }));
-    syncers.push(() => { cb.checked = !!store.values[def.key]; });
-    return h("label", { class: "check" }, cb, def.label);
+  function select(def) {
+    const sel = h("select", { class: "chsel", "aria-label": def.label,
+      onchange: () => store.apply({ [def.key]: sel.value }) },
+      def.options.map((o) => h("option", { value: o.id }, o.label)));
+    syncers.push(() => { sel.value = store.values[def.key]; });
+    return h("div", { class: "slider", title: def.help }, h("div", { class: "row" }, h("label", {}, def.label)), sel);
   }
 
   function section(id, title, kids, open = true) {
@@ -74,7 +75,7 @@ export function buildPanel(root, store, { onCopy, onPaste }) {
   ]));
 
   for (const g of GROUPS) {
-    const kids = SETTINGS.filter((s) => s.group === g.id).map((s) => (s.type === "toggle" ? toggle(s) : slider(s)));
+    const kids = SETTINGS.filter((s) => s.group === g.id).map((s) => (s.type === "select" ? select(s) : slider(s)));
     root.append(section(g.id, g.label, kids, g.id !== "anim"));
   }
 

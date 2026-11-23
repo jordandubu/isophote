@@ -14,7 +14,7 @@ const bold = { len: 44, width: 26, layers: 2, flow_smooth: 8, base_radius: 8, re
 const mk = (o, impasto, seed = 42, knife = false) => ({
   brush_len: Math.round(o.len * s), brush_w: Math.round(o.width * s), layers: o.layers, relief: o.relief,
   base_radius: Math.round(o.base_radius * s), flow_smooth: Math.round(o.flow_smooth * s), seed,
-  max_size: 1024, out_size: 1024, look_scale: 1, impasto, impasto_knife: knife,
+  max_size: 1024, out_size: 1024, look_scale: 1, impasto, impasto_brush: knife ? 1 : 0,
 });
 
 async function inst(bytes) { return (await WebAssembly.instantiate(bytes, { env: {} })).instance.exports; }

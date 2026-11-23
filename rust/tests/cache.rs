@@ -17,28 +17,29 @@ fn synth(w: usize, h: usize, salt: usize) -> Vec<u8> {
     v
 }
 
-fn params(impasto: f64, knife: bool, seed: u64) -> Params {
+fn params(impasto: f64, brush: u32, seed: u64) -> Params {
     Params { brush_len: 30, brush_w: 8, layers: 2, relief: 0.1, base_radius: 3, flow_smooth: 4, seed,
-    max_size: None, impasto, impasto_knife: knife, boil: 0.0, boil_frame: 0,
+    max_size: None, impasto, impasto_brush: brush, boil: 0.0, boil_frame: 0,
     look_scale: 0.0, out_size: 0, normal_tangent: false, uv_aware: false, shape_follow: 0.0 }
 }
 
 fn json(p: &Params, kinds: bool) -> String {
     format!(
         "{{\"brush_len\":{},\"brush_w\":{},\"layers\":{},\"relief\":{},\"base_radius\":{},\"flow_smooth\":{},\
-         \"seed\":{},\"impasto\":{},\"impasto_knife\":{}{}}}",
-        p.brush_len, p.brush_w, p.layers, p.relief, p.base_radius, p.flow_smooth, p.seed, p.impasto, p.impasto_knife,
+         \"seed\":{},\"impasto\":{},\"impasto_brush\":{}{}}}",
+        p.brush_len, p.brush_w, p.layers, p.relief, p.base_radius, p.flow_smooth, p.seed, p.impasto, p.impasto_brush,
         if kinds { ",\"kinds\":[\"color\",\"normal\"]" } else { "" }
     )
 }
 
-const SEQ: [(f64, bool, u64); 6] = [
-    (0.5, false, 7),
-    (1.0, false, 7), // strength change: cache hit
-    (1.0, true, 7),  // knife toggle: cache hit, new height
-    (0.0, false, 7), // impasto off: cache hit, no shading
-    (1.0, false, 8), // new seed: miss
-    (1.0, false, 7), // back to the first seed: miss, still correct
+const SEQ: [(f64, u32, u64); 7] = [
+    (0.5, 0, 7),
+    (1.0, 0, 7), // strength change: cache hit
+    (1.0, 1, 7), // palette knife: cache hit, new height
+    (1.0, 4, 7), // rake: cache hit, new height
+    (0.0, 0, 7), // impasto off: cache hit, no shading
+    (1.0, 0, 8), // new seed: miss
+    (1.0, 0, 7), // back to the first seed: miss, still correct
 ];
 
 #[test]

@@ -21,9 +21,9 @@ pub struct Params {
     /// the Blender Bump node.
     #[serde(default)]
     pub impasto: f64,
-    /// Impasto look: false = bristle strokes, true = palette knife (flat slabs).
+    /// Impasto brush: index into `BRUSHES` (0 = bristle, 1 = palette knife, ...).
     #[serde(default)]
-    pub impasto_knife: bool,
+    pub impasto_brush: u32,
     /// Animation boil: share (0..1) of strokes repainted on frame `boil_frame`.
     #[serde(default)]
     pub boil: f64,
@@ -1146,18 +1146,27 @@ pub(crate) struct ImpastoStyle {
     pub blur: f32,
     pub lip: f32,
     pub deplete: f32,
+    /// bristle spacing in px (x look): one groove knot per `knot` px of stroke width
+    pub knot: f32,
+    /// cross profile: false = flat slab with steep shoulders, true = rounded
+    pub round: bool,
 }
 
-const BRISTLE: ImpastoStyle = ImpastoStyle {
-    t_k: 0.7, keep: 0.35, rim: 0.5, groove0: 0.18, groove1: 0.55, rag: 1.0, blur: 0.8, lip: 0.3, deplete: 0.4,
-};
-const KNIFE: ImpastoStyle = ImpastoStyle {
-    t_k: 0.8, keep: 0.30, rim: 0.7, groove0: 0.04, groove1: 0.15, rag: 0.5, blur: 0.7, lip: 0.5, deplete: 0.25,
-};
+/// The brushes, indexed by `Params::impasto_brush` (same order as BRUSHES in
+/// app/js/schema.js): bristle, palette knife, dry brush, filbert, rake, loaded.
+/// Bristle and palette knife are the original two looks; their numbers are frozen.
+const BRUSHES: [ImpastoStyle; 6] = [
+    ImpastoStyle { t_k: 0.7, keep: 0.35, rim: 0.5, groove0: 0.18, groove1: 0.55, rag: 1.0, blur: 0.8, lip: 0.3, deplete: 0.4, knot: 2.2, round: false },
+    ImpastoStyle { t_k: 0.8, keep: 0.30, rim: 0.7, groove0: 0.04, groove1: 0.15, rag: 0.5, blur: 0.7, lip: 0.5, deplete: 0.25, knot: 2.2, round: false },
+    ImpastoStyle { t_k: 0.85, keep: 0.50, rim: 0.2, groove0: 0.55, groove1: 1.0, rag: 2.0, blur: 0.5, lip: 0.0, deplete: 0.5, knot: 2.2, round: false },
+    ImpastoStyle { t_k: 0.8, keep: 0.35, rim: 0.0, groove0: 0.05, groove1: 0.2, rag: 0.3, blur: 1.2, lip: 0.1, deplete: 0.3, knot: 2.2, round: true },
+    ImpastoStyle { t_k: 0.75, keep: 0.35, rim: 0.2, groove0: 0.6, groove1: 0.85, rag: 1.2, blur: 0.6, lip: 0.2, deplete: 0.35, knot: 6.0, round: false },
+    ImpastoStyle { t_k: 1.0, keep: 0.50, rim: 1.0, groove0: 0.1, groove1: 0.3, rag: 0.6, blur: 0.9, lip: 0.9, deplete: 0.1, knot: 2.2, round: false },
+];
 
-/// Bristle strokes or palette-knife slabs.
-pub(crate) fn impasto_style(knife: bool) -> &'static ImpastoStyle {
-    if knife { &KNIFE } else { &BRISTLE }
+/// Style of brush `brush`; an unknown index paints with the bristle brush.
+pub(crate) fn impasto_style(brush: u32) -> &'static ImpastoStyle {
+    BRUSHES.get(brush as usize).unwrap_or(&BRUSHES[0])
 }
 
 /// exp(-z^2) by table (1024 intervals over |z| < 4.25, linear interpolation,
@@ -1213,7 +1222,7 @@ pub(crate) struct StrokeProfile {
 impl StrokeProfile {
     /// `half` = footprint half-width, `total` = polyline length, `lk` = look scale.
     pub(crate) fn new(st: &'static ImpastoStyle, seed: u32, half: f32, total: f32, lk: f32) -> Self {
-        let kn = (((2.0 * half / (2.2 * lk)).round()) as usize).clamp(3, 24);
+        let kn = (((2.0 * half / (st.knot * lk)).round()) as usize).clamp(3, 24);
         let mut gb = [0f32; 24];
         let mut ge = [0f32; 24];
         for i in 0..kn {
@@ -1265,7 +1274,8 @@ impl StrokeProfile {
             return 0.0;
         }
         let au = u.abs();
-        let cross = (1.0 - au.powi(6)) * (1.0 + st.rim * gauss(tab, (au - 0.78) * self.inv_rim));
+        let body = if st.round { 1.0 - au * au } else { 1.0 - au.powi(6) };
+        let cross = body * (1.0 + st.rim * gauss(tab, (au - 0.78) * self.inv_rim));
         let edge = smooth01((half - sd.abs()) * self.inv_edge);
         let q = ac * self.inv_total;
         let lip = st.lip * gauss(tab, rem * self.inv_lip);
@@ -1285,9 +1295,9 @@ impl StrokeProfile {
 /// segment scans the parallelogram of its own rectangle (extended past a joint
 /// by the bend wedge) and records the nearest segment per pixel; the profile
 /// is then evaluated on those pixels only.
-pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], knife: bool, look: f64) -> Vec<f32> {
+pub fn impasto_height(w: usize, h: usize, strokes: &[Stroke], brush: u32, look: f64) -> Vec<f32> {
     let lk = look as f32;
-    let st = if knife { &KNIFE } else { &BRISTLE };
+    let st = impasto_style(brush);
     let mut height = vec![0f32; w * h];
     // Scratch over the stroke bbox. Invariant: every `best2` entry is f32::MAX
     // between strokes (reset through `touched`).
@@ -1746,10 +1756,10 @@ fn paint_stage_surface(
 }
 
 /// Impasto height (px) of a stage, whichever way its strokes were laid.
-pub fn stage_height(stage: &PaintStage, knife: bool, look: f64) -> Vec<f32> {
+pub fn stage_height(stage: &PaintStage, brush: u32, look: f64) -> Vec<f32> {
     match &stage.surf {
-        Some(s) => crate::surface::impasto_height(&s.map, &s.strokes, knife, look),
-        None => impasto_height(stage.w, stage.h, &stage.strokes, knife, look),
+        Some(s) => crate::surface::impasto_height(&s.map, &s.strokes, brush, look),
+        None => impasto_height(stage.w, stage.h, &stage.strokes, brush, look),
     }
 }
 
@@ -1823,7 +1833,7 @@ pub fn finish_multi<'a>(
 pub fn paint_bgra(bgra: &[u8], w: usize, h: usize, p: &Params) -> (Vec<u8>, String) {
     // resize handled by JS (canvas); here we assume already-resized
     let stage = paint_stage(bgra, &[], w, h, p, None);
-    let hgt = (p.impasto > 0.0).then(|| stage_height(&stage, p.impasto_knife, p.look()));
+    let hgt = (p.impasto > 0.0).then(|| stage_height(&stage, p.impasto_brush, p.look()));
     (finish_single(&stage, hgt.as_deref(), p).into_owned(), String::new())
 }
 
@@ -1859,6 +1869,6 @@ pub fn paint_bgra_multi(
 ) -> Result<Vec<Vec<u8>>, String> {
     validate_multi(ref_bgra, chans, w, h)?;
     let stage = paint_stage(ref_bgra, chans, w, h, p, None);
-    let hgt = (p.impasto > 0.0).then(|| stage_height(&stage, p.impasto_knife, p.look()));
+    let hgt = (p.impasto > 0.0).then(|| stage_height(&stage, p.impasto_brush, p.look()));
     Ok(finish_multi(&stage, hgt.as_deref(), p, kinds).into_iter().map(Cow::into_owned).collect())
 }

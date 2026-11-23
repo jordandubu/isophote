@@ -19,6 +19,17 @@ export const GROUPS = [
   { id: "anim", label: "Animation" },
 ];
 
+// Impasto brushes. The position in this list is the index sent to the core:
+// keep the order of BRUSHES in rust/src/pipeline.rs.
+export const BRUSHES = [
+  { id: "bristle", label: "Bristle" },
+  { id: "knife", label: "Palette knife (flat slabs)" },
+  { id: "dry", label: "Dry brush (scratchy)" },
+  { id: "filbert", label: "Filbert (soft, rounded)" },
+  { id: "rake", label: "Rake (coarse grooves)" },
+  { id: "loaded", label: "Loaded (thick, heavy ridges)" },
+];
+
 export const SETTINGS = [
   { key: "sscale", group: "brush", label: "Stroke scale", min: -4, max: 4, step: 0.05, def: 0,
     help: "Scales every stroke dimension together. 1× is the default look.",
@@ -39,7 +50,8 @@ export const SETTINGS = [
     help: "Strength of the canvas texture lighting. 0 = flat.", fmt: fixed(2) },
   { key: "impasto", group: "surface", label: "Impasto (paint ridges)", min: 0, max: 2, step: 0.1, def: 0.1,
     help: "Turns strokes into thick slabs of paint that catch light. 0 = off.", fmt: fixed(2) },
-  { key: "knife", group: "surface", type: "toggle", label: "Palette knife (flat slabs)", def: true },
+  { key: "brush", group: "surface", type: "select", label: "Brush shape", options: BRUSHES, def: "knife",
+    help: "The relief each stroke leaves. Shows when Impasto is above 0." },
 
   { key: "imgscale", group: "output", label: "Output size", min: 0, max: 5, step: 1, def: 1,
     help: "Long edge of the painted image. MAX = same size as the source.",
@@ -64,10 +76,10 @@ export const ANIM_KEYS = SETTINGS.filter((s) => s.group === "anim").map((s) => s
 export const LOOK_KEYS = PAINT_KEYS.filter((k) => k !== "seed" && k !== "imgscale");
 export const PRESETS = {
   default: { label: "Default" },
-  art:    { label: "Art",     len: 40, width: 9,  layers: 2, flow_smooth: 8, base_radius: 6, relief: 0.10, impasto: 0,  knife: false },
-  medium: { label: "Medium",  len: 30, width: 4,  layers: 3, flow_smooth: 8, base_radius: 6, relief: 0.15, impasto: 0,  knife: false },
-  bold:   { label: "Impasto", len: 44, width: 26, layers: 2, flow_smooth: 8, base_radius: 8, relief: 0.10, impasto: 1,  knife: false },
-  pastel: { label: "Pastel",  len: 30, width: 5,  layers: 3, flow_smooth: 8, base_radius: 9, relief: 0.00, impasto: 0,  knife: false },
+  art:    { label: "Art",     len: 40, width: 9,  layers: 2, flow_smooth: 8, base_radius: 6, relief: 0.10, impasto: 0,  brush: "bristle" },
+  medium: { label: "Medium",  len: 30, width: 4,  layers: 3, flow_smooth: 8, base_radius: 6, relief: 0.15, impasto: 0,  brush: "bristle" },
+  bold:   { label: "Impasto", len: 44, width: 26, layers: 2, flow_smooth: 8, base_radius: 8, relief: 0.10, impasto: 1,  brush: "bristle" },
+  pastel: { label: "Pastel",  len: 30, width: 5,  layers: 3, flow_smooth: 8, base_radius: 9, relief: 0.00, impasto: 0,  brush: "bristle" },
 };
 
 export function presetPatch(id) {
@@ -108,12 +120,14 @@ export function importSettings(obj) {
   for (const s of SETTINGS) {
     if (s.group === "anim" || !(s.key in obj)) continue;
     let x = obj[s.key];
-    if (s.type === "toggle") { patch[s.key] = !!x; continue; }
+    if (s.type === "select") { if (s.options.some((o) => o.id === x)) patch[s.key] = x; continue; }
     if (s.key === "sscale") x = sscaleToPos(+x);
     else if (s.key === "imgscale") x = IMGSCALE_LABELS.indexOf(x);
     else x = +x;
     if (!Number.isFinite(x) || x < 0 && s.key === "imgscale") continue;
     patch[s.key] = clampSnap(s, x);
   }
+  // settings copied before the brush list existed carry a "knife" on/off instead
+  if (!("brush" in patch) && "knife" in obj) patch.brush = obj.knife ? "knife" : "bristle";
   return patch;
 }

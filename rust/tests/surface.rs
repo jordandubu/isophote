@@ -82,7 +82,7 @@ fn world_image(map: &SurfMap) -> Vec<u8> {
 fn params(uv_aware: bool) -> Params {
     Params {
         brush_len: 30, brush_w: 8, layers: 2, relief: 0.0, base_radius: 3, flow_smooth: 4, seed: 7,
-        max_size: None, impasto: 1.0, impasto_knife: false, boil: 0.0, boil_frame: 0,
+        max_size: None, impasto: 1.0, impasto_brush: 0, boil: 0.0, boil_frame: 0,
         look_scale: 0.0, out_size: 0, normal_tangent: false, uv_aware, shape_follow: 0.0,
     }
 }
@@ -180,7 +180,7 @@ fn impasto_is_continuous_across_the_seam() {
         let p = params(uv_aware);
         let stage = paint_stage(&img, &[], W, W, &p, uv_aware.then_some(&mesh));
         assert_eq!(stage.surf.is_some(), uv_aware);
-        let hgt = stage_height(&stage, false, 1.0);
+        let hgt = stage_height(&stage, 0, 1.0);
         if uv_aware {
             // painted gutter texels repeat their twin
             for i in 0..W * W {
@@ -229,7 +229,7 @@ fn wasm_entry_paints_on_the_mesh() {
     assert_eq!(wasm_set_mesh(b.as_ptr(), b.len() as i32), 0);
     let p = params(true);
     let stage = paint_stage(&img, &[], W, W, &p, Some(&mesh));
-    let hgt = stage_height(&stage, false, 1.0);
+    let hgt = stage_height(&stage, 0, 1.0);
     let want: Vec<u8> = finish_multi(&stage, Some(&hgt), &p, Some(&kinds)).iter().flat_map(|f| f.iter().copied()).collect();
     assert!(run() == want, "uv_aware paint differs from the surface pipeline");
 

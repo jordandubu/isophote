@@ -1,7 +1,7 @@
 // engine.js — everything between the settings and the wasm worker:
 // paint geometry, source images, input scaling, the cancellable worker
 // client, and PNG helpers.
-import { IMGSCALE_PX, sscaleFromPos } from "./schema.js";
+import { IMGSCALE_PX, BRUSHES, sscaleFromPos } from "./schema.js";
 
 export const LOOK_REF = 1024;      // long edge at which the default brushwork is defined
 export const DRAFT_LONG = 512;     // long edge of the fast preview painted while dragging
@@ -51,7 +51,7 @@ export function coreParams(v, g) {
     out_size: g.outLong,
     look_scale: g.look,
     impasto: v.impasto || 0,
-    impasto_knife: !!v.knife,
+    impasto_brush: Math.max(0, BRUSHES.findIndex((b) => b.id === v.brush)),
   };
 }
 
