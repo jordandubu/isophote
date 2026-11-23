@@ -265,6 +265,7 @@ export async function paint(client, source, v, { draft = false, frame = null } =
   const req = { op: source.multi ? "multi" : "paint", params };
   if (source.multi && source.mesh && source.uvAware) {
     params.uv_aware = true;
+    params.shape_follow = source.shapeFollow || 0;
     req.mesh = { key: "mesh:" + source.id, buf: source.mesh.buf };
   }
   const inp = inputsFor(source, g, draft);

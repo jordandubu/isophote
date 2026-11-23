@@ -18,11 +18,9 @@ fn synth(w: usize, h: usize, salt: usize) -> Vec<u8> {
 }
 
 fn params(impasto: f64, knife: bool, seed: u64) -> Params {
-    Params {
-        brush_len: 30, brush_w: 8, layers: 2, relief: 0.1, base_radius: 3, flow_smooth: 4, seed,
-        max_size: None, impasto, impasto_knife: knife, boil: 0.0, boil_frame: 0,
-        look_scale: 0.0, out_size: 0, normal_tangent: false, uv_aware: false,
-    }
+    Params { brush_len: 30, brush_w: 8, layers: 2, relief: 0.1, base_radius: 3, flow_smooth: 4, seed,
+    max_size: None, impasto, impasto_knife: knife, boil: 0.0, boil_frame: 0,
+    look_scale: 0.0, out_size: 0, normal_tangent: false, uv_aware: false, shape_follow: 0.0 }
 }
 
 fn json(p: &Params, kinds: bool) -> String {

@@ -48,6 +48,11 @@ pub struct Params {
     /// supplies a mesh; false or no mesh = classic flat-texture strokes.
     #[serde(default)]
     pub uv_aware: bool,
+    /// With `uv_aware`: 0..1, how far the stroke direction bends toward the
+    /// mesh's curvature direction (strokes wrap around the form); 0 = follow
+    /// the image only.
+    #[serde(default)]
+    pub shape_follow: f32,
 }
 
 impl Params {
@@ -1708,7 +1713,8 @@ fn paint_stage_surface(
     surface::fill_gutter(&map, &mut ref_bgr, 3);
     let base = kuwahara(&ref_bgr, w, h, p.base_radius);
     let gray = gray_from_bgr(&ref_bgr, w, h);
-    let flow = smooth_flow(flow_field(&gray, w, h, 2.5 * look), p.flow_smooth);
+    let mut flow = smooth_flow(flow_field(&gray, w, h, 2.5 * look), p.flow_smooth);
+    surface::steer_flow(&map, &mut flow, p.shape_follow);
     let n_strokes = (((w * h) as f64 / (140.0 * look * look)) as i32).max(1);
     let mut strokes =
         surface::generate_strokes(&ref_bgr, &flow, &map, n_strokes, p.brush_len, p.brush_w, p.layers, 0.6, p.seed, look);

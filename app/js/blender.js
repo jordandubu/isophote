@@ -28,9 +28,17 @@ export function createBlender(app) {
   const uvLabel = h("label", { class: "check", hidden: true,
     title: "Strokes, impasto and lighting continue across UV seams (uses the mesh sent by the add-on). Untick for the classic flat-texture strokes." },
     uvBox, " Seamless strokes across UV seams");
+  // stroke direction bends toward the mesh's curvature (strokes wrap around the form); needs seamless strokes
+  const pushShape = () => app.setShapeFollow(shapeBox.checked, shapeAmt.value / 100);
+  const shapeBox = h("input", { type: "checkbox", onchange: pushShape });
+  const shapeLabel = h("label", { class: "check", hidden: true,
+    title: "Strokes wrap around the form: where the mesh curves clearly one way, the stroke direction bends toward the curvature direction. Needs seamless strokes. Never changes the geometry." },
+    shapeBox, " Follow the shape");
+  const shapeAmt = h("input", { type: "range", min: 0, max: 100, step: 5, hidden: true, "aria-label": "How strongly strokes follow the shape",
+    title: "How strongly strokes follow the shape (0% = image only)", oninput: pushShape });
   const section = h("details", { class: "sec", id: "sec-blender", open: true },
     h("summary", {}, "Blender", dot),
-    h("div", { class: "secbody" }, sel, uvLabel));
+    h("div", { class: "secbody" }, sel, uvLabel, shapeLabel, shapeAmt));
   section.hidden = true;
   $("blenderSlot").append(section);
 
@@ -58,6 +66,12 @@ export function createBlender(app) {
     sel.value = app.activeKind();
     uvLabel.hidden = !(src && src.mesh);
     uvBox.checked = app.uvAware();
+    const sh = app.shapeFollow();
+    shapeBox.checked = sh.on;
+    shapeAmt.value = Math.round(sh.amt * 100);
+    shapeLabel.hidden = shapeAmt.hidden = !(src && src.mesh);
+    shapeBox.disabled = !app.uvAware();
+    shapeAmt.disabled = !sh.on || !app.uvAware();
   }
 
   async function send(animated) {

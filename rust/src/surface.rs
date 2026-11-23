@@ -111,6 +111,162 @@ impl Mesh {
     }
 }
 
+/// Per triangle: the unit tangent along which the surface curves most (the
+/// way a brush wraps around a form: around a cylinder, not along it) and how
+/// clearly one direction dominates, 0..1 (0 on planes, spheres and saddles).
+/// The shape operator of every triangle is fitted to its corner normals
+/// (`dn = S e` over the three edges, least squares), then smoothed twice over
+/// the vertex rings, area weighted, with vertices welded by position.
+pub fn shape_flow(mesh: &Mesh) -> (Vec<V3>, Vec<f32>) {
+    use std::collections::HashMap;
+    type Sym = [f32; 6]; // xx yy zz xy xz yz
+    let nt = mesh.tri_vert.len();
+    let corners = |t: usize| -> [V3; 3] {
+        let v = mesh.tri_vert[t];
+        [mesh.vpos[v[0] as usize], mesh.vpos[v[1] as usize], mesh.vpos[v[2] as usize]]
+    };
+    // tangent frame of a triangle: u along the first edge, v = n x u, area
+    let frame = |p: &[V3; 3]| -> (V3, V3, f32) {
+        let c = cross(sub(p[1], p[0]), sub(p[2], p[0]));
+        let area = 0.5 * dot(c, c).sqrt();
+        let u = unit(sub(p[1], p[0]));
+        (u, cross(unit(c), u), area)
+    };
+    let outer = |a: V3, b: V3, s: f32, t: &mut Sym| {
+        t[0] += s * a[0] * b[0];
+        t[1] += s * a[1] * b[1];
+        t[2] += s * a[2] * b[2];
+        t[3] += s * 0.5 * (a[0] * b[1] + a[1] * b[0]);
+        t[4] += s * 0.5 * (a[0] * b[2] + a[2] * b[0]);
+        t[5] += s * 0.5 * (a[1] * b[2] + a[2] * b[1]);
+    };
+    let apply = |t: &Sym, v: V3| -> V3 {
+        [
+            t[0] * v[0] + t[3] * v[1] + t[4] * v[2],
+            t[3] * v[0] + t[1] * v[1] + t[5] * v[2],
+            t[4] * v[0] + t[5] * v[1] + t[2] * v[2],
+        ]
+    };
+    let mut tens: Vec<Sym> = vec![[0.0; 6]; nt];
+    let mut area = vec![0f32; nt];
+    for t in 0..nt {
+        let p = corners(t);
+        let (u, v, a) = frame(&p);
+        area[t] = a;
+        if a <= 0.0 {
+            continue;
+        }
+        // normal equations of E a + F b = c, F a + G b = d over the 3 edges
+        let (mut m, mut r) = ([[0f32; 3]; 3], [0f32; 3]);
+        for i in 0..3 {
+            let j = (i + 1) % 3;
+            let e = sub(p[j], p[i]);
+            let dn = sub(mesh.tri_nrm[t][j], mesh.tri_nrm[t][i]);
+            let (a, b, c, d) = (dot(e, u), dot(e, v), dot(dn, u), dot(dn, v));
+            m[0][0] += a * a;
+            m[0][1] += a * b;
+            m[1][0] += a * b;
+            m[1][1] += a * a + b * b;
+            m[1][2] += a * b;
+            m[2][1] += a * b;
+            m[2][2] += b * b;
+            r[0] += a * c;
+            r[1] += b * c + a * d;
+            r[2] += b * d;
+        }
+        let det = |m: &[[f32; 3]; 3]| {
+            m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+        };
+        let d0 = det(&m);
+        if d0.abs() < 1e-30 {
+            continue;
+        }
+        let mut x = [0f32; 3];
+        for (k, xk) in x.iter_mut().enumerate() {
+            let mut mk = m;
+            for row in 0..3 {
+                mk[row][k] = r[row];
+            }
+            *xk = det(&mk) / d0;
+        }
+        let mut s: Sym = [0.0; 6];
+        outer(u, u, x[0], &mut s);
+        outer(u, v, x[1], &mut s);
+        outer(v, u, x[1], &mut s);
+        outer(v, v, x[2], &mut s);
+        tens[t] = s;
+    }
+    // weld by position, then smooth: vertex = area-weighted mean of its triangles,
+    // triangle = mean of its vertices
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for p in &mesh.vpos {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let radius = 0.5 * dot(sub(hi, lo), sub(hi, lo)).sqrt().max(1e-12);
+    let q = 1.0 / (radius * 1e-5);
+    let mut ids: HashMap<[i64; 3], usize> = HashMap::new();
+    let vid: Vec<[usize; 3]> = (0..nt)
+        .map(|t| {
+            let p = corners(t);
+            let mut o = [0usize; 3];
+            for c in 0..3 {
+                let k = [(p[c][0] * q).round() as i64, (p[c][1] * q).round() as i64, (p[c][2] * q).round() as i64];
+                let n = ids.len();
+                o[c] = *ids.entry(k).or_insert(n);
+            }
+            o
+        })
+        .collect();
+    for _ in 0..2 {
+        let mut vt: Vec<Sym> = vec![[0.0; 6]; ids.len()];
+        let mut va = vec![0f32; ids.len()];
+        for t in 0..nt {
+            for &v in &vid[t] {
+                for k in 0..6 {
+                    vt[v][k] += area[t] * tens[t][k];
+                }
+                va[v] += area[t];
+            }
+        }
+        for t in 0..nt {
+            let mut s: Sym = [0.0; 6];
+            for &v in &vid[t] {
+                for k in 0..6 {
+                    s[k] += vt[v][k] / va[v].max(1e-20) / 3.0;
+                }
+            }
+            tens[t] = s;
+        }
+    }
+    // principal curvatures in the triangle's own tangent plane
+    let eps = 0.1 / radius;
+    let mut dir = vec![[0f32; 3]; nt];
+    let mut wgt = vec![0f32; nt];
+    for t in 0..nt {
+        let (u, v, a) = frame(&corners(t));
+        if a <= 0.0 {
+            dir[t] = u;
+            continue;
+        }
+        let (su, sv) = (apply(&tens[t], u), apply(&tens[t], v));
+        let (e, f, g) = (dot(u, su), dot(u, sv), dot(v, sv));
+        let (mean, rad) = (0.5 * (e + g), (0.25 * (e - g) * (e - g) + f * f).sqrt());
+        let (kmax, kmin) = (mean + rad, mean - rad);
+        let mut th = 0.5 * (2.0 * f).atan2(e - g); // direction of kmax
+        if kmin.abs() > kmax.abs() {
+            th += std::f32::consts::FRAC_PI_2; // wrap around the form: the stronger |k|
+        }
+        dir[t] = unit(add(mul(u, th.cos()), mul(v, th.sin())));
+        let (big, small) = (kmax.abs().max(kmin.abs()), kmax.abs().min(kmin.abs()));
+        wgt[t] = ((big - small) / (big + small + eps)).clamp(0.0, 1.0);
+    }
+    (dir, wgt)
+}
+
 // ---------------------------------------------------------------- texel map
 
 /// One triangle as affine functions of the pixel coordinates (x right, y down).
@@ -149,6 +305,10 @@ pub struct SurfMap {
     pub upp: f32,
     /// number of island texels (0 = nothing to paint on)
     pub islands: usize,
+    /// per triangle: unit tangent of the strongest curvature (see `shape_flow`)
+    pub geo_dir: Vec<V3>,
+    /// per triangle: how clearly that direction dominates, 0..1
+    pub geo_w: Vec<f32>,
 }
 
 impl SurfMap {
@@ -273,7 +433,8 @@ pub fn build_map(mesh: &Mesh, w: usize, h: usize, margin: usize) -> SurfMap {
         }
     }
     let upp = if area2s > 0.0 { (area3 / area2s).sqrt() as f32 } else { 0.0 };
-    let mut map = SurfMap { w, h, tri, twin, gedge: Vec::new(), tris, edges: Vec::new(), upp, islands };
+    let (geo_dir, geo_w) = shape_flow(mesh);
+    let mut map = SurfMap { w, h, tri, twin, gedge: Vec::new(), tris, edges: Vec::new(), upp, islands, geo_dir, geo_w };
     if islands == 0 {
         map.gedge = gedge;
         return map;
@@ -447,6 +608,37 @@ pub fn build_map(mesh: &Mesh, w: usize, h: usize, margin: usize) -> SurfMap {
     }
     map.gedge = gedge;
     map
+}
+
+/// Bend the flow toward the mesh's curvature direction: per island texel the
+/// flow (as a world vector) is blended with the triangle's `geo_dir` by
+/// `follow * geo_w`, so strokes wrap around the form where it is clearly
+/// curved one way and keep following the image elsewhere. Flow angles are
+/// pixel-space, as `trace` reads them.
+pub fn steer_flow(map: &SurfMap, flow: &mut Flow, follow: f32) {
+    if follow <= 0.0 {
+        return;
+    }
+    for i in 0..map.w * map.h {
+        let ti = map.tri[i];
+        if ti == NONE {
+            continue;
+        }
+        let ti = ti as usize;
+        let m = (follow * map.geo_w[ti]).clamp(0.0, 1.0);
+        if m <= 0.0 {
+            continue;
+        }
+        let t = &map.tris[ti];
+        let a = flow.angle[i].to_radians();
+        let f = unit(add(mul(t.px, a.cos()), mul(t.py, a.sin())));
+        let mut g = map.geo_dir[ti];
+        if dot(f, g) < 0.0 {
+            g = mul(g, -1.0);
+        }
+        let b = unit(add(mul(f, 1.0 - m), mul(g, m)));
+        flow.angle[i] = dot(t.r1, b).atan2(dot(t.r0, b)).to_degrees().rem_euclid(180.0);
+    }
 }
 
 /// Copy every gutter texel's `c` values from its twin.

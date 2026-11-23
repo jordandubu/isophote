@@ -251,6 +251,7 @@ pub extern "C" fn wasm_paint(
             out_size: 0,
             normal_tangent: false,
             uv_aware: false,
+            shape_follow: 0.0,
         }
     } else {
         match serde_json::from_str(&json) {
@@ -362,6 +363,7 @@ pub extern "C" fn wasm_paint_multi(
             out_size: 0,
             normal_tangent: false,
             uv_aware: false,
+            shape_follow: 0.0,
         }
     } else {
         match serde_json::from_str(&json) {
@@ -384,6 +386,7 @@ pub extern "C" fn wasm_paint_multi(
     let mut key = stage_key(2, w, h, k, &p, blob);
     if let Some((mesh_hash, _)) = &mesh {
         key = hash_words(key, &mesh_hash.to_le_bytes());
+        key = hash_words(key, &p.shape_follow.to_bits().to_le_bytes());
     }
     let mesh = mesh.as_ref().map(|(_, m)| &**m);
     with_stage(key, &p, || pipeline::paint_stage(frames[0], &frames[1..], w, h, &p, mesh), |stage, hgt| {

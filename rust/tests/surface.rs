@@ -83,7 +83,7 @@ fn params(uv_aware: bool) -> Params {
     Params {
         brush_len: 30, brush_w: 8, layers: 2, relief: 0.0, base_radius: 3, flow_smooth: 4, seed: 7,
         max_size: None, impasto: 1.0, impasto_knife: false, boil: 0.0, boil_frame: 0,
-        look_scale: 0.0, out_size: 0, normal_tangent: false, uv_aware,
+        look_scale: 0.0, out_size: 0, normal_tangent: false, uv_aware, shape_follow: 0.0,
     }
 }
 
@@ -238,4 +238,78 @@ fn wasm_entry_paints_on_the_mesh() {
     let flat: Vec<u8> = paint_bgra_multi(&img, &[], W, W, &p, Some(&kinds)).unwrap().concat();
     assert!(run() == flat, "without a mesh the paint must be the classic one");
     assert!(flat != want);
+}
+
+/// Closed-ish tube (axis z, radius 1, length 2) or uv-sphere (`sphere`), one
+/// UV island, radial corner normals.
+fn round_mesh(sphere: bool) -> Mesh {
+    let (nu, nv) = (48usize, 24usize);
+    let at = |i: usize, j: usize| -> ([f32; 3], [f32; 3], [f32; 2]) {
+        let a = std::f32::consts::TAU * (i % nu) as f32 / nu as f32;
+        let (p, n) = if sphere {
+            let b = std::f32::consts::PI * (0.04 + 0.92 * j as f32 / nv as f32);
+            let n = [b.sin() * a.cos(), b.sin() * a.sin(), b.cos()];
+            (n, n)
+        } else {
+            ([a.cos(), a.sin(), 2.0 * j as f32 / nv as f32 - 1.0], [a.cos(), a.sin(), 0.0])
+        };
+        (p, n, [0.05 + 0.9 * i as f32 / nu as f32, 0.05 + 0.9 * j as f32 / nv as f32])
+    };
+    let mut m = Mesh { vpos: Vec::new(), tri_vert: Vec::new(), tri_uv: Vec::new(), tri_nrm: Vec::new() };
+    for j in 0..nv {
+        for i in 0..nu {
+            let quad = [(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)];
+            let base = m.vpos.len() as u32;
+            for &(a, b) in &quad {
+                m.vpos.push(at(a, b).0);
+            }
+            for tri in [[0usize, 1, 2], [0, 2, 3]] {
+                m.tri_vert.push([base + tri[0] as u32, base + tri[1] as u32, base + tri[2] as u32]);
+                m.tri_uv.push([at(quad[tri[0]].0, quad[tri[0]].1).2, at(quad[tri[1]].0, quad[tri[1]].1).2, at(quad[tri[2]].0, quad[tri[2]].1).2]);
+                m.tri_nrm.push([at(quad[tri[0]].0, quad[tri[0]].1).1, at(quad[tri[1]].0, quad[tri[1]].1).1, at(quad[tri[2]].0, quad[tri[2]].1).1]);
+            }
+        }
+    }
+    m
+}
+
+#[test]
+fn curvature_direction_wraps_a_tube_and_is_undecided_on_a_sphere() {
+    let (dir, w) = shape_flow(&round_mesh(false));
+    for t in 0..dir.len() {
+        assert!(dir[t][2].abs() < 0.1, "tube triangle {t}: direction {:?} runs along the axis", dir[t]);
+        assert!(w[t] > 0.7, "tube triangle {t}: weight {}", w[t]);
+    }
+    let (_, w) = shape_flow(&round_mesh(true));
+    let mean = w.iter().sum::<f32>() / w.len() as f32;
+    assert!(mean < 0.15, "sphere weight {mean}");
+}
+
+#[test]
+fn shape_follow_turns_strokes_around_the_tube() {
+    let mesh = round_mesh(false);
+    let map = build_map(&mesh, W, W, 16);
+    // flow along the tube axis (pixel-space +y = v = world z)
+    let make = || Flow { angle: vec![90.0; W * W], coherence: vec![1.0; W * W], w: W, h: W };
+    let along = |flow: &Flow| -> f32 {
+        let (mut s, mut n) = (0f32, 0f32);
+        for i in 0..W * W {
+            if map.tri[i] == NONE {
+                continue;
+            }
+            let t = &map.tris[map.tri[i] as usize];
+            let a = flow.angle[i].to_radians();
+            let d = [t.px[0] * a.cos() + t.py[0] * a.sin(), t.px[1] * a.cos() + t.py[1] * a.sin(), t.px[2] * a.cos() + t.py[2] * a.sin()];
+            s += d[2].abs() / (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            n += 1.0;
+        }
+        s / n
+    };
+    let mut off = make();
+    steer_flow(&map, &mut off, 0.0);
+    let mut on = make();
+    steer_flow(&map, &mut on, 1.0);
+    let (a_off, a_on) = (along(&off), along(&on));
+    assert!(a_off > 0.99, "unsteered flow should stay along the axis: {a_off}");
+    assert!(a_on < 0.15, "full follow should wrap around the tube: {a_on}");
 }

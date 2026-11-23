@@ -32,7 +32,7 @@ function toast(text, ms = 5000) {
 $("toast").onclick = () => { $("toast").hidden = true; };
 
 /* ---------- persisted settings (Blender bridge on/off) ---------- */
-const settings = { addonBlender: false, sendAnimated: false, sendHeight: true, uvAware: true };
+const settings = { addonBlender: false, sendAnimated: false, sendHeight: true, uvAware: true, shapeOn: false, shapeAmt: 0.7 };
 try { Object.assign(settings, JSON.parse(localStorage.getItem("isophote_settings") || "{}")); } catch { /* corrupt: defaults */ }
 const saveSettings = () => { try { localStorage.setItem("isophote_settings", JSON.stringify(settings)); } catch { /* private mode */ } };
 // the add-on opens the site with ?bridge=1 -> force the bridge on
@@ -134,6 +134,7 @@ function installSource(s) {
   const oldSource = source, oldResult = result;
   source = s; result = null;
   s.uvAware = settings.uvAware;
+  s.shapeFollow = settings.shapeOn ? settings.shapeAmt : 0;
   activeKind = s.kinds[0];
   previewAuto = false;
   dirty = true;
@@ -209,6 +210,12 @@ const blender = createBlender({
     settings.uvAware = on;
     saveSettings();
     if (source) { source.uvAware = on; requestPaint(); }
+  },
+  shapeFollow: () => ({ on: settings.shapeOn, amt: settings.shapeAmt }),
+  setShapeFollow: (on, amt) => {
+    settings.shapeOn = on; settings.shapeAmt = amt;
+    saveSettings();
+    if (source) { source.shapeFollow = on ? amt : 0; requestPaint(); }
   },
 });
 blender.setEnabled(settings.addonBlender);
