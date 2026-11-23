@@ -1319,11 +1319,6 @@ class PN_scene_settings(bpy.types.PropertyGroup):
         description="Apply as an animated image sequence (requires a "
                     "'Send animated' painting from isophote)",
     )
-    strokes_coherent: BoolProperty(
-        name="Same Brushstrokes", default=True,
-        description="Same brushstrokes across channels (recommended). "
-                    "Off: each channel painted independently with the same seed",
-    )
     status: StringProperty(
         name="Status", default="",
     )
@@ -1386,7 +1381,6 @@ class PN_PT_to_isophote(bpy.types.Panel):
         send = layout.row()
         send.scale_y = 1.8
         send.operator(PN_OT_send_to_isophote.bl_idname, text="Send to Isophote")
-        layout.prop(s, "strokes_coherent")
         layout.prop(s, "tex_name", text="Name")
         layout.prop(s, "tex_size")
         layout.prop(s, "normal_space")
