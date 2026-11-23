@@ -126,7 +126,7 @@ export function createViewer() {
     const on3d = eff === "3d";
     gl.hidden = !on3d;
     // the mesh wears what would be sent: bump from the height map only when it is sent
-    if (on3d && res) view3d.show(res, { tangent: src.normalSpace === "tangent", useHeight: $("sendHeight").checked });
+    if (on3d && res) view3d.show(res, { kind, tangent: src.normalSpace === "tangent", useHeight: $("sendHeight").checked });
   }
   segBtns.forEach((b) => b.addEventListener("click", () => setMode(b.dataset.mode)));
   function setMode(m) {
@@ -168,7 +168,7 @@ export function createViewer() {
       applyMode();
     },
     setResult(r) { res = r; draw(); applyMode(); apply(); },
-    setKind(k) { kind = k; draw(); },
+    setKind(k) { kind = k; draw(); applyMode(); },
     currentBitmap() { return res ? res.bitmap(kind) : null; },
     setMode, get mode() { return mode; },
     hold(on) { held = on; applyMode(); },

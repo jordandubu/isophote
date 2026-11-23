@@ -21,8 +21,9 @@ precision highp float;
 in vec3 vPos;
 in vec3 vNrm;
 in vec2 vUv;
-uniform sampler2D uColor, uNormal, uRough, uMetal, uOrm, uEmis, uHeight;
+uniform sampler2D uColor, uNormal, uRough, uMetal, uOrm, uEmis, uHeight, uFlat;
 uniform int uHas;
+uniform int uShowFlat;  // 1: show uFlat alone, unlit (a single channel picked in the dropdown)
 uniform int uTangent;   // 1: the normal map is tangent-space, 0: object-space
 uniform mat3 uObjN;     // object -> world normal matrix
 uniform float uBump;    // world height of a white height texel
@@ -31,6 +32,7 @@ uniform vec3 uLight;
 out vec4 o;
 void main() {
   vec2 uv = vec2(vUv.x, 1.0 - vUv.y);                // bitmaps upload top row first
+  if (uShowFlat == 1) { o = vec4(texture(uFlat, uv).rgb, 1.0); return; }
   vec3 N = normalize(vNrm);
   if (!gl_FrontFacing) N = -N;
   if ((uHas & 2) != 0) {
@@ -134,10 +136,10 @@ export function createView3d(canvas) {
   }
   gl.useProgram(prog);
   const U = {};
-  for (const n of ["uViewProj", "uHas", "uTangent", "uObjN", "uBump", "uEye", "uLight"]) U[n] = gl.getUniformLocation(prog, n);
+  for (const n of ["uViewProj", "uHas", "uShowFlat", "uTangent", "uObjN", "uBump", "uEye", "uLight"]) U[n] = gl.getUniformLocation(prog, n);
   const aniso = gl.getExtension("EXT_texture_filter_anisotropic");
-  // one texture per slot, 1x1 until a result is shown (every sampler stays complete)
-  const tex = SLOTS.map(([, , , name], unit) => {
+  // 1x1 until a result is shown (every sampler stays complete)
+  const makeTex = (name, unit) => {
     const t = gl.createTexture();
     gl.activeTexture(gl.TEXTURE0 + unit);
     gl.bindTexture(gl.TEXTURE_2D, t);
@@ -150,13 +152,17 @@ export function createView3d(canvas) {
     gl.generateMipmap(gl.TEXTURE_2D);
     gl.uniform1i(gl.getUniformLocation(prog, name), unit);
     return t;
-  });
+  };
+  // one texture per slot, plus the single channel shown unlit
+  const tex = SLOTS.map(([, , , name], unit) => makeTex(name, unit));
+  const flatTex = makeTex("uFlat", SLOTS.length);
   gl.enable(gl.DEPTH_TEST);
 
   let vao = null, bufs = [], count = 0;
   let center = [0, 0, 0], radius = 1, uvWorld = 1, objN = normalMatrix([1, 0, 0, 0, 1, 0, 0, 0, 1]);
   let target = [0, 0, 0], yaw = 0, pitch = 0, dist = 1;
   let shown = null, has = 0, heightScale = 0, tangent = false, useHeight = false;
+  let flatKind = null, showFlat = false;
   let raf = 0;
 
   const dirty = () => { if (!raf) raf = requestAnimationFrame(render); };
@@ -189,6 +195,7 @@ export function createView3d(canvas) {
     ]);
     gl.uniformMatrix4fv(U.uViewProj, false, mul4(proj, view));
     gl.uniform1i(U.uHas, useHeight && !tangent ? has : has & ~64);
+    gl.uniform1i(U.uShowFlat, showFlat ? 1 : 0);
     gl.uniform1i(U.uTangent, tangent ? 1 : 0);
     gl.uniformMatrix3fv(U.uObjN, false, objN);
     gl.uniform1f(U.uBump, uvWorld * heightScale * IMPASTO_DEPTH);
@@ -209,7 +216,7 @@ export function createView3d(canvas) {
   // mesh: parseMesh() result (engine.js) or null
   function setMesh(mesh) {
     if (vao) { gl.deleteVertexArray(vao); bufs.forEach((b) => gl.deleteBuffer(b)); }
-    vao = null; bufs = []; count = 0; shown = null; has = 0;
+    vao = null; bufs = []; count = 0; shown = null; has = 0; showFlat = false;
     if (!mesh) { dirty(); return; }
     const n = mesh.ntri * 3;
     const pos = new Float32Array(n * 3);
@@ -250,7 +257,10 @@ export function createView3d(canvas) {
   }
 
   // result: engine.js Result; uploads its bitmaps now (the caller may close them afterwards).
-  // opts: { tangent: the normal map is tangent-space, useHeight: bump from the impasto height }
+  // opts: { kind: channel picked in the dropdown, tangent: the normal map is tangent-space,
+  //         useHeight: bump from the impasto height }
+  // The reference channel (result.kinds[0], top of the dropdown) shows the lit material built
+  // from every map; any other channel is shown alone, unlit, exactly as on the 2D canvas.
   function show(result, opts) {
     if (result !== shown) {
       shown = result;
@@ -265,9 +275,19 @@ export function createView3d(canvas) {
         has |= bit;
       });
       heightScale = result.heightScale || 0;
+      flatKind = null;
     }
     tangent = !!opts.tangent;
     useHeight = !!opts.useHeight;
+    const flat = opts.kind !== result.kinds[0] && result.kinds.includes(opts.kind) ? opts.kind : null;
+    if (flat && flat !== flatKind) {
+      gl.activeTexture(gl.TEXTURE0 + SLOTS.length);
+      gl.bindTexture(gl.TEXTURE_2D, flatTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, result.bitmap(flat));
+      gl.generateMipmap(gl.TEXTURE_2D);
+      flatKind = flat;
+    }
+    showFlat = !!flat;
     dirty();
   }
 
