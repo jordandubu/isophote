@@ -26,7 +26,7 @@ export const SETTINGS = [
     parse: (t) => sscaleToPos(parseFloat(t)) },
   { key: "len", group: "brush", label: "Stroke length", min: 10, max: 90, step: 1, def: 40,
     help: "How far each stroke walks along the contours." },
-  { key: "width", group: "brush", label: "Stroke width", min: 2, max: 30, step: 1, def: 9,
+  { key: "width", group: "brush", label: "Stroke width", min: 2, max: 30, step: 1, def: 5,
     help: "Brush thickness." },
   { key: "layers", group: "brush", label: "Layers", min: 1, max: 6, step: 1, def: 2,
     help: "Paint passes. More layers = denser coverage." },
@@ -35,13 +35,13 @@ export const SETTINGS = [
 
   { key: "base_radius", group: "surface", label: "Underpaint smoothing", min: 2, max: 16, step: 1, def: 6,
     help: "Edge-preserving flatten of the base layer under the strokes." },
-  { key: "relief", group: "surface", label: "Canvas weave", min: 0, max: 0.6, step: 0.05, def: 0.1,
+  { key: "relief", group: "surface", label: "Canvas weave", min: 0, max: 0.6, step: 0.05, def: 0.05,
     help: "Strength of the canvas texture lighting. 0 = flat.", fmt: fixed(2) },
-  { key: "impasto", group: "surface", label: "Impasto (paint ridges)", min: 0, max: 2, step: 0.1, def: 0,
+  { key: "impasto", group: "surface", label: "Impasto (paint ridges)", min: 0, max: 2, step: 0.1, def: 0.1,
     help: "Turns strokes into thick slabs of paint that catch light. 0 = off.", fmt: fixed(2) },
-  { key: "knife", group: "surface", type: "toggle", label: "Palette knife (flat slabs)", def: false },
+  { key: "knife", group: "surface", type: "toggle", label: "Palette knife (flat slabs)", def: true },
 
-  { key: "imgscale", group: "output", label: "Output size", min: 0, max: 5, step: 1, def: 2,
+  { key: "imgscale", group: "output", label: "Output size", min: 0, max: 5, step: 1, def: 1,
     help: "Long edge of the painted image. MAX = same size as the source.",
     fmt: (v) => IMGSCALE_LABELS[Math.min(v, IMGSCALE_LABELS.length - 1)], readonly: true },
   { key: "seed", group: "output", label: "Seed", min: 1, max: 200, step: 1, def: 42, dice: true,
@@ -59,23 +59,29 @@ export const DEFAULTS = Object.fromEntries(SETTINGS.map((s) => [s.key, s.def]));
 export const PAINT_KEYS = SETTINGS.filter((s) => s.group !== "anim").map((s) => s.key);
 export const ANIM_KEYS = SETTINGS.filter((s) => s.group === "anim").map((s) => s.key);
 
+// A preset is a whole look: the keys it names, every other look key at its default.
+// "default" names nothing, so it IS the defaults. Output size and seed are not part of a look.
+export const LOOK_KEYS = PAINT_KEYS.filter((k) => k !== "seed" && k !== "imgscale");
 export const PRESETS = {
-  art:    { label: "Art",     len: 40, width: 9,  layers: 2, flow_smooth: 8, base_radius: 6, relief: 0.10, impasto: 0 },
-  medium: { label: "Medium",  len: 30, width: 4,  layers: 3, flow_smooth: 8, base_radius: 6, relief: 0.15, impasto: 0 },
-  bold:   { label: "Impasto", len: 44, width: 26, layers: 2, flow_smooth: 8, base_radius: 8, relief: 0.10, impasto: 1 },
-  pastel: { label: "Pastel",  len: 30, width: 5,  layers: 3, flow_smooth: 8, base_radius: 9, relief: 0.00, impasto: 0 },
+  default: { label: "Default" },
+  art:    { label: "Art",     len: 40, width: 9,  layers: 2, flow_smooth: 8, base_radius: 6, relief: 0.10, impasto: 0,  knife: false },
+  medium: { label: "Medium",  len: 30, width: 4,  layers: 3, flow_smooth: 8, base_radius: 6, relief: 0.15, impasto: 0,  knife: false },
+  bold:   { label: "Impasto", len: 44, width: 26, layers: 2, flow_smooth: 8, base_radius: 8, relief: 0.10, impasto: 1,  knife: false },
+  pastel: { label: "Pastel",  len: 30, width: 5,  layers: 3, flow_smooth: 8, base_radius: 9, relief: 0.00, impasto: 0,  knife: false },
 };
-
-export function activePreset(v) {
-  for (const [id, p] of Object.entries(PRESETS)) {
-    if (Object.keys(p).every((k) => k === "label" || v[k] === p[k])) return id;
-  }
-  return null;
-}
 
 export function presetPatch(id) {
   const { label, ...patch } = PRESETS[id];
-  return patch;
+  return { ...Object.fromEntries(LOOK_KEYS.map((k) => [k, DEFAULTS[k]])), ...patch };
+}
+
+// the preset the current values match exactly, or null = custom
+export function activePreset(v) {
+  for (const id of Object.keys(PRESETS)) {
+    const p = presetPatch(id);
+    if (LOOK_KEYS.every((k) => v[k] === p[k])) return id;
+  }
+  return null;
 }
 
 export const byKey = Object.fromEntries(SETTINGS.map((s) => [s.key, s]));

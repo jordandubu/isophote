@@ -134,6 +134,8 @@ main { flex: 1; display: flex; min-height: 0; }
   font-size: 12.5px; cursor: pointer; transition: all .12s; }
 .chip:hover { color: var(--txt); }
 .chip.on { background: var(--accent); color: #fff; border-color: transparent; }
+.chip.static { cursor: default; }
+.chip.static:not(.on):hover { color: var(--txt2); }
 .slider { padding: 7px 0 5px; }
 .slider .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 2px; min-height: 26px; }
 .slider label { font-size: 12.5px; color: var(--txt); }

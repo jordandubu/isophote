@@ -57,9 +57,12 @@ export function buildPanel(root, store, { onCopy, onPaste }) {
 
   const chips = Object.entries(PRESETS).map(([id, p]) =>
     h("button", { class: "chip", type: "button", "data-p": id, onclick: () => store.apply(presetPatch(id)) }, p.label));
+  // no preset matches = custom: selected automatically, nothing to click
+  const customChip = h("span", { class: "chip static", title: "The settings differ from every preset" }, "Custom");
+  chips.push(customChip);
   syncers.push(() => {
     const on = activePreset(store.values);
-    chips.forEach((c) => c.classList.toggle("on", c.dataset.p === on));
+    chips.forEach((c) => c.classList.toggle("on", c === customChip ? on === null : c.dataset.p === on));
   });
   const resetAll = () => store.apply(Object.fromEntries(PAINT_KEYS.filter((k) => k !== "seed").map((k) => [k, DEFAULTS[k]])));
   root.append(section("look", "Look", [
